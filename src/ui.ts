@@ -1,7 +1,11 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
-const colorEnabled = Boolean(stdout.isTTY && !process.env.NO_COLOR && process.env.TERM !== "dumb");
+const colorEnabled = Boolean(
+  stdout.isTTY
+  || (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0")
+  || process.env.CLICOLOR_FORCE === "1"
+) && !process.env.NO_COLOR && process.env.TERM !== "dumb";
 const ansiPattern = /\u001B\[[0-?]*[ -/]*[@-~]/g;
 const oscPattern = /\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g;
 

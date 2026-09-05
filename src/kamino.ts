@@ -1,6 +1,7 @@
 import BN from "bn.js";
 import { Decimal } from "decimal.js";
 import {
+  DEFAULT_RECENT_SLOT_DURATION_MS,
   KaminoMarket,
   PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -56,7 +57,7 @@ export async function deriveAssociatedTokenAccount(params: {
 
 export async function loadMarket(rpc: Rpc<SolanaRpcApi>, marketValue: string): Promise<KaminoMarket> {
   const marketAddress = address(marketValue);
-  const market = await KaminoMarket.load(rpc, marketAddress, 350, PROGRAM_ID);
+  const market = await KaminoMarket.load(rpc, marketAddress, DEFAULT_RECENT_SLOT_DURATION_MS, PROGRAM_ID);
   if (!market) throw new Error(`Kamino market not found: ${marketAddress}`);
   return market;
 }

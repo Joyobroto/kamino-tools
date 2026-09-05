@@ -4,3 +4,6 @@ dist/
 *.log
 strategy.local.json
 wallet*.json
+
+# Runtime JSONL event/opportunity logs written by the Docker watchers
+data/

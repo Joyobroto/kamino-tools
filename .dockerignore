@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.env.example
+data
+*.log
+docs
+test
+dist
+Dockerfile
+docker-compose.yml
+.dockerignore
