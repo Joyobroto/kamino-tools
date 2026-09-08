@@ -8,8 +8,8 @@ import {
   startupAlert,
   testAlert,
   executionAlert,
-  swapAlert,
   profitAlert,
+  nearMissDigestAlert,
   TelegramAlerter,
 } from "../src/alerts/telegram.js";
 
@@ -45,17 +45,19 @@ test("trackerEventToAlert maps DUE events", () => {
   assert.ok(alert!.lines.some((l) => l.includes("Health: 0.9900")));
 });
 
-test("trackerEventToAlert distinguishes liquidated vs managed takers", () => {
-  const liquidated = trackerEventToAlert({ type: "taken", obligation: "ABC", satSeconds: 68, wasDue: true, dueSince: "2026-09-04T00:00:00Z" });
+test("trackerEventToAlert reports only real liquidations (console-following)", () => {
+  const liquidated = trackerEventToAlert({ type: "taken", obligation: "ABC", satSeconds: 68, wasDue: true, dueSince: "2026-09-04T00:00:00Z", lastHealth: 0.998, debtUsd: 50859.99, debtSymbol: "USDC" });
   const managed = trackerEventToAlert({ type: "taken", obligation: "ABC", satSeconds: 120, wasDue: false, dueSince: undefined });
   assert.equal(liquidated!.kind, "taken-liquidated");
-  assert.equal(managed!.kind, "taken-gone");
+  assert.equal(liquidated!.title, "⚡ LIQUIDATED BY OTHERS");
   assert.ok(liquidated!.lines.some((l) => l.includes("68s")));
+  assert.ok(liquidated!.lines.some((l) => l.includes("50859.99 USDC")));
+  // Band exits (healed/managed) are suppressed — no alert, matching the console.
+  assert.equal(managed, null);
 });
 
 test("phase 2 vocabulary builders produce structured alerts", () => {
   assert.equal(executionAlert({ obligation: "X", debt: "103.07 FDUSD", attempt: 1 }).kind, "execution");
-  assert.equal(swapAlert({ route: "USDS→FDUSD (Jupiter)", amountUsd: 104.27, minOut: "103.20" }).kind, "swap");
   const profit = profitAlert({ signature: "sig123", grossUsd: 1.05, feesUsd: 0.02, netUsd: 1.03 });
   assert.equal(profit.kind, "profit");
   assert.ok(profit.lines.some((l) => l.includes("solscan.io/tx/sig123")));
@@ -103,4 +105,28 @@ test("surge and startup alerts build", () => {
   assert.equal(surgeAlert(true, 23, 1.44).kind, "surge-on");
   assert.equal(surgeAlert(false, 0, 1.1).kind, "surge-off");
   assert.equal(startupAlert(60, 10).kind, "startup");
+});
+
+test("watching and healed tracker events are suppressed from Telegram", () => {
+  assert.equal(trackerEventToAlert({ type: "watching", candidate: { obligation: "ABC", healthFactor: 1.01, largestDebt: { amountUsd: 200, symbol: "USDC" } } }), null);
+  assert.equal(trackerEventToAlert({ type: "healed", obligation: "ABC", lastHealth: 1.05 }), null);
+});
+
+test("near-miss digest ranks by estimated profit and formats", () => {
+  const digest = nearMissDigestAlert(
+    [
+      { obligation: "Top1xxxxxxxxxxxxxxxxxxxx", healthFactor: 1.001, largestDebt: { amountUsd: 500, symbol: "USDC" }, estimatedProfitUsd: 484, rank: 1 },
+      { obligation: "Top2yyyyyyyyyyyyyyyyyyyy", healthFactor: 1.02, largestDebt: { amountUsd: 200, symbol: "SOL" }, estimatedProfitUsd: 45, rank: 2 },
+      { obligation: "Top3zzzzzzzzzzzzzzzzzzzz", healthFactor: 1.09, largestDebt: { amountUsd: 90, symbol: "mSOL" }, estimatedProfitUsd: 19, rank: 3 },
+    ],
+    15,
+  );
+  assert.equal(digest.kind, "near-miss");
+  assert.ok(digest.title.includes("15 min digest"));
+  assert.equal(digest.lines.length, 3);
+  assert.ok(digest.lines[0]!.includes("#1"));
+  assert.ok(digest.lines[0]!.includes("Top1"));
+  assert.ok(digest.lines[0]!.includes("484"));
+  assert.ok(digest.lines[1]!.includes("#2"));
+  assert.ok(digest.lines[2]!.includes("#3"));
 });

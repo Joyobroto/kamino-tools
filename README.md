@@ -356,6 +356,32 @@ npm run cli -- execute \
 
 Tanpa `--yes`, command `execute` berhenti sebelum menyusun transaksi mainnet.
 
+### 💰 Treasure watcher (arb track)
+
+Mendeteksi pool baru yang salah harga lintas venue (read-only). Harga dihitung dari **saldo vault live on-chain** — bukan cache aggregator yang terbukti bisa stale 200.000x. Filter: likuiditas dua arah (anti ghost), mint authority renounced + tanpa freeze (anti honeypot), dan diskon ≥5% vs harga referensi Jupiter.
+
+```bash
+# satu pass (prime baseline)
+npm run cli -- treasure-scan
+
+# watch mode + JSONL + Telegram alert otomatis
+npm run cli -- treasure-scan \
+  --watch \
+  --interval 45 \
+  --min-vault 1000 \
+  --min-ratio 1.05 \
+  --log data/treasure_events.jsonl
+```
+
+Contoh output:
+
+```text
+TREASURE SCAN  12:55:03  pools=7 real=1 opps=1 errors=0
+[1] VENUE=pumpswap POOL=EaPkdue2qR4h… DISCOUNT=8.3% PRICE=934.65 nSOL REF=1.02 µSOL LIQ=198.94M base + 185.94 SOL
+```
+
+Venue yang di-watch: pumpswap, meteora-damm-v2, meteora-damm, raydium-clmm, orca-whirlpool (layout terverifikasi on-chain per 2026-09-05). Listing pool memakai `getProgramAccountsV2` Helius (paginasi) — venue berat (meteora-damm-v2, 1.45M pool) di-diff tiap 8 pass. Riset lengkap: `docs/ARB_TREASURE_RESEARCH.md`. Command legacy `arb-scan` (round-trip quote) masih tersedia untuk spot-check manual.
+
 ### 📊 Output JSON
 
 Tambahkan `--json` untuk automation:
@@ -484,7 +510,12 @@ npm start
 | `src/transaction.ts` | Versioned transaction, signing, simulation, confirmation |
 | `src/amount.ts` | Parse/format token base units |
 | `src/ui.ts` | Banner, warna, tabel, prompt, plan/simulation panels |
-| `test/` | Unit tests amount, config, strategy, UI, dan serializer |
+| `src/strategies/liquidation/` | Screener full-market, hot tracker, surge defense (watcher Phase 1) |
+| `src/strategies/arb/` | Treasure watcher: venue layouts terverifikasi on-chain, pool feed GPA-diff, vault-truth pricing, ghost filter, opportunity math |
+| `src/alerts/telegram.ts` | Alerter Telegram (liquidation + treasure vocabulary) |
+| `test/` | Unit tests amount, config, strategy, UI, serializer, screener, tracker, telegram, arb/treasure |
+| `research/` | Probe scripts riset empiris (reproducibility, bukan bagian app) |
+| `docs/` | Build plans, competitor intel, websocket design, treasure research |
 
 ## ⚠️ Batasan
 

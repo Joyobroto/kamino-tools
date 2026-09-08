@@ -194,13 +194,14 @@ network — `test/telegram.test.ts`). Disabled automatically when env vars are a
   so the counter can progress. Telegram noise dropped accordingly.
 - Set an explicit band back anytime: `--min-debt 100 --max-debt 5000`.
 
-## ARB engine — planned parallel track
+## ARB engine — pivot executed (2026-09-05)
 
-LionX forensic (docs/COMPETITOR_INTEL.md) proved our competitor is a DEX-to-DEX arbitrage machine
-(Raydium CLMM/CPMM + Orca, custom routers, USDC settlement, own capital, ~$0.10–0.35/tx at 260tx/hr).
-We plan our own version as a parallel track: quote scanner → small-size executor → inventory loop →
-(optional) flash-loan scaling. Full plan: [docs/ARB_ENGINE_PLAN.md](ARB_ENGINE_PLAN.md).
-Runs alongside the liquidation watcher; all infra (backoff, alerter, simulate rail, Docker) is shared.
+LionX forensic (docs/COMPETITOR_INTEL.md) proved the competitor is an orderflow-insertion operator,
+not a pool-to-pool arb we can out-quote; the quote-scanner Sprint 1 was closed after Gate G1 failed
+empirically. The track pivoted to the **treasure watcher** (mispriced NEW pools, vault-truth pricing,
+5 venues) — BUILT & LIVE in Docker (`treasure-watcher`). Full findings: docs/ARB_TREASURE_RESEARCH.md;
+plan: [docs/ARB_ENGINE_PLAN.md](ARB_ENGINE_PLAN.md). Runs alongside the liquidation watcher;
+all infra (backoff, alerter, simulate rail, Docker) is shared.
 
 ## 👉 NEXT TO DO (in order)
 

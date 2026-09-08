@@ -1,20 +1,71 @@
 # ARB Engine Development Plan — "LionX Versi Kita"
 
-> Status: **Sprint 1 BUILT & LIVE (2026-09-04)** — `arb-scan` scanner running in Docker (`arb-scanner` service) alongside the liquidation watcher. Read-only, zero risk.
-> Reference competitor: `LionX7R69tL1EEcpRkJ9jRuwV7bi4jFoKmZZnxiVK6y` — reverse-engineered playbook below.
+> Status update (2026-09-05, evening): **quote-scanner thesis CLOSED, treasure-watcher LIVE.**
+> Gate G1 (≥10 opps/day at ≥5bps on majors) failed empirically — the majors' spreads are consumed by
+> orderflow-insertion operators (see docs/COMPETITOR_INTEL.md "smoking gun" section). The `arb-scan`
+> command + its Docker service have been RETIRED; the CLI command remains for manual spot checks.
+> The arb track pivoted to the **treasure watcher** (mispriced NEW pools, vault-truth pricing):
+> docs/ARB_TREASURE_RESEARCH.md + `treasure-scan` command + `treasure-watcher` Docker service (LIVE).
 > Principle: **modal sendiri dulu, flash-loan opsional belakangan.** Kita tiru yang terbukti menghasilkan, bukan yang eksotis.
 
-## Sprint 1 — DELIVERED
+## Sprint 1 — RETIRED (quote scanner)
 
-- `src/strategies/arb/types.ts` — mint allowlist (USDC/USDT/USDS/FDUSD/USDG/PYUSD/WSOL/JitoSOL/JupSOL, no memecoins), decimals, scan options/events
-- `src/strategies/arb/spread.ts` — pure math: round-trip bps, profit units→USD, execution gate (`isActionable` with fixed-cost model), ranking
-- `src/strategies/arb/quotes.ts` — Jupiter lite API (`lite-api.jup.ag/swap/v1/quote`; the SDK's default `quote-api.jup.ag` host is DNS-blocked from this server — discovered empirically, plain fetch works), 429-backoff (reuses hardened `isRateLimitError` semantics), SOL price derived from quotes (no oracle dep)
-- `src/strategies/arb/scanner.ts` — pair loop (base→intermediate→base), event emission
-- CLI: `npm run cli -- arb-scan [--size --min-spread --bases --intermediates --watch --interval --log --json]`
-- Docker: `arb-scanner` service (30s passes, floor 3bps, $100 size, logs to `data/arb_opportunities.jsonl`)
-- Tests: `test/arb.test.ts` — spread math, mint-consistency validation, actionability gates, end-to-end scanner with mocked fetch (60/60 total suite green)
+Built 2026-09-04, ran ~20h in Docker, produced 11 opportunities total (6 above 5bps) — below the
+G1 gate by an order of magnitude. Root cause understood via LionX forensic + Uyar121 playbook
+research: classical quote-visible arb on majors is picked clean before it becomes routeable.
+Deliverables kept (reusable): `quotes.ts` (Jupiter lite + backoff), `spread.ts` (round-trip math),
+`types.ts`. Scanner code retained in `scanner.ts` for the `arb-scan` CLI; Docker service removed.
 
-**First live readings (2026-09-04, calm market):** major pairs (USDC↔WSOL↔USDT↔LSDs) quote 0–0.5bps round-trip at $100–500 size — efficient and below cost, exactly as expected in calm conditions. Spread hunting needs dislocation events; the scanner now watches for them 24/7. Gate G1 stays data-driven.
+## Sprint 1c — LST depeg verdict engine (BUILT & SIMULATION-PROVEN, 2026-09-06)
+
+The "no guessing" loop the whole engine exists for: any detected discrepancy is now provable
+atomically with ZERO capital before a single lamport is broadcast.
+
+**Flow (`npm run cli -- lst-execute --symbol JitoSOL --size 500`):**
+1. Kamino oracle rate (Pyth, from the Main-market reserve — same source the flash loan repays against)
+2. Jupiter 2-leg plan: borrow LST → sell for SOL (market) → buy LST back → repay principal+fee
+3. Both legs fetched as real `/swap-instructions`, embedded into the flash-borrow/repay sandwich
+   (ALT-compressed v0 tx, duplicate-instruction dedupe, reserve-ATA filter)
+4. **Mainnet simulation runs the whole sandwich** — the verdict is the sim result:
+   repay succeeds ⇔ the depeg is real and executable
+5. Broadcast stays gated behind `--yes` + `--min-profit` (still deliberately hard-locked)
+
+**Empirical first results (calm market, 2026-09-06):**
+- JitoSOL: oracle 1.299782 vs market 1.2996-1.2997 SOL → spread 1-4bps → round-trip returns
+  LESS than the borrow → **plan correctly fails fast**: "spread too thin; needs a real depeg"
+- JupSOL: oracle 1.207663 vs market ≈1.2076 → same efficient-market verdict
+- The simulation previously reached FlashRepay and failed with `insufficient funds` on exactly
+  the thin-spread case — proving the failure mode is caught atomically (no partial state,
+  no capital burned; simulation is free)
+- On a real depeg day (oracle/market gap ≥ ~15bps + swap costs), the same command prints
+  quoted P&L, worst-case P&L, and `EXECUTABLE YES/NO`
+
+**The full pipeline stack now:** watcher detects → oracle-vs-market spread → depth-probed →
+2-leg plan (profit-gated, fail-fast) → atomic flash-loan sandwich → mainnet simulation →
+only then broadcast. Every stage is measurable; nothing is guessed.
+
+## Sprint 1b — Treasure watcher (BUILT & LIVE, 2026-09-05)
+
+Replacement strategy validated by on-chain research (docs/ARB_TREASURE_RESEARCH.md):
+
+- Detect **newly created pools** (GPA diff, ~200/hour, 5 venues: pumpswap, DAMMv2, DLMM, CLMM, Whirlpool)
+- Price from **live vault balances only** (aggregator caches proven up to 200,000x stale)
+- Ghost-liquidity filter (ANB case: "$240K pool" held $8.51), honeypot guard (mint/freeze authority)
+- Compare pool price vs Jupiter reference → alert ≥5% discount → Telegram + JSONL
+- First live results: fresh pumpswap pools list 5–9% below Jupiter reference (migration pattern)
+- **Depth-gate update (2026-09-06):** forensic re-check showed 46/46 first-night events were
+  mirages — Jupiter's "reference" for fresh mints routes through sniper-seeded dust pools
+  (<$1). The scanner now probe-sells the reference (`checkReferenceDepth`, $100 probe,
+  ≥80% out) before alerting. All pumpfun-migration discounts fail this gate (expected);
+  a real two-market treasure would pass it.
+
+Files: `venues.ts` (verified pool layouts), `pools.ts` (feed + vault pricing), `treasure.ts`
+(ghost filter + opportunity math), `scanner.ts` (`scanTreasurePass`), CLI `treasure-scan`,
+Docker `treasure-watcher`. Tests: venue decode, SPL account decode, mint safety, ghost filter,
+opportunity math, price formatters (70/70 green).
+
+**Validation gate (2 weeks of JSONL):** how often, how big, how long does the discount persist?
+Executable size = f(vault SOL side) — flash-loan Sprint 2 stays gated on that data.
 
 ## 0. What LionX actually does (forensic, 2026-09-04 — docs/COMPETITOR_INTEL.md)
 
@@ -31,14 +82,12 @@
 
 ## 1. Strategy scope (what we build, in order)
 
-### Sprint 1 — Quote scanner (read-only, zero risk) ← START HERE
-**Goal:** bukti ada spread yang bisa diambil, SEBELUM nulis eksekusi.
+### ~~Sprint 1 — Quote scanner~~ → CLOSED (G1 failed; replaced by Sprint 1b treasure watcher above)
 
-- Poll Jupiter Quote API v6 (`@jup-ag/api` sudah ada di node_modules, FREE, rate-limit 60 req/s public / lebih kalau daftar) untuk pasangan top-N likuid.
-- Compute: `spread_bps = (bestRouteOut/in − 1) × 10_000` untuk route A→B→A (triangular) dan A→B langsung antar-quote-session (temporal arb: quote t0 vs quote t1).
-- Filter: spread > 5bps (biaya: fee ix 5000 lamports ≈ 0.005¢ + slippage), likuiditas pool > $10K.
-- Output: `npm run cli -- arb-scan` — table + JSONL `arb_opportunities.jsonl` (pair, route, spread, est profit per $X size).
-- **Gate:** kalau dalam 3–7 hari scanner nggak nemu spread ≥ 5bps yang berulang → stop, fokus liquidation saja.
+**Goal (original):** bukti ada spread yang bisa diambil, SEBELUM nulis eksekusi.
+
+- ~~Poll Jupiter Quote API~~ (kept for reference quotes + SOL price)
+- **Result:** majors 0–0.5bps round-trip; orderflow operators consume the rest pre-quote. Gate G1 FAILED → pivot.
 
 ### Sprint 2 — Executor (modal sendiri, size kecil)
 **Goal:** eksekusi atomic A→B→A dalam SATU tx (bukan dua tx — itu yang bikin LionX untung: no leg risk).
@@ -64,12 +113,17 @@
 
 ```
 src/strategies/arb/
-  ├─ quotes.ts        # Jupiter quote fetch + normalize (pair, route, outAmount, priceImpact)
-  ├─ spread.ts        # pure math: spread_bps, triangular detect, min-out calc, profit floor
-  ├─ scanner.ts       # poll loop + JSONL logging (arb-scan command)
-  ├─ executor.ts      # tx assembly (compute budget + hops + min-outs), simulate-first
-  └─ inventory.ts     # ledger + P&L + route blacklist
-test/arb.test.ts      # spread math, route validation, min-out gate — all pure
+  ├─ venues.ts        # pool layouts verified on-chain (pumpswap, DAMMv2, DLMM, CLMM, Whirlpool)
+  ├─ pools.ts         # GPA-diff new-pool feed + vault-truth pricing (JSON-RPC client with backoff)
+  ├─ treasure.ts      # ghost filter, mint safety, opportunity math, price formatters
+  ├─ quotes.ts        # Jupiter lite quote fetch + normalize (reference prices)
+  ├─ spread.ts        # pure math: round-trip bps, profit floor (legacy arb-scan, reusable)
+  ├─ types.ts         # mint allowlist + round-trip types (legacy, reusable)
+  ├─ scanner.ts       # scanArbPass (spot checks) + scanTreasurePass (live watcher)
+  ├─ executor.ts      # tx assembly (compute budget + hops + min-outs), simulate-first — Sprint 2
+  └─ inventory.ts     # ledger + P&L + route blacklist — Sprint 3
+test/arb.test.ts      # spread math, venue decode, ghost filter, opportunity math, formatters
+docs/ARB_TREASURE_RESEARCH.md  # empirical findings that drove the pivot
 docs/ARB_ENGINE_PLAN.md  (this file)
 ```
 

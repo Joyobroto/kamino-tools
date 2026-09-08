@@ -109,3 +109,54 @@ export function instructionSummary(instruction: Instruction, index: number): { i
     dataBytes: instruction.data?.length ?? 0,
   };
 }
+
+/** Shape of Jupiter swap-instructions (from /swap-instructions, already base64 data). */
+export interface ExternalInstruction {
+  programId: string;
+  accounts: Array<{ pubkey: string; isSigner: boolean; isWritable: boolean }>;
+  data: string;
+}
+
+/**
+ * Converts Jupiter swap instructions into kit Instructions in memory — same
+ * validation the strategy loader applies, so anything rejected here would also
+ * be rejected as a hand-written strategy JSON.
+ */
+export function externalInstructionsToStrategy(
+  swapInstructions: ExternalInstruction[],
+  computeBudgetInstructions: ExternalInstruction[],
+  owner: TransactionSigner,
+): LoadedStrategy {
+  const toInstruction = (input: ExternalInstruction): Instruction => {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(input.programId)) throw new Error(`Invalid program address ${input.programId}`);
+    if (typeof input.data !== "string") throw new Error(`Instruction for ${input.programId} is missing data`);
+    const accountSigner = (pubkey: string): AccountSignerMeta | null =>
+      pubkey === owner.address ? { address: address(owner.address), role: AccountRole.WRITABLE_SIGNER, signer: owner } : null;
+    return {
+      programAddress: address(input.programId),
+      accounts: input.accounts.map((account) => {
+        const signer = account.isSigner ? accountSigner(account.pubkey) : null;
+        if (account.isSigner && !signer) {
+          throw new Error(`Swap requires unsupported signer ${account.pubkey}; only the configured wallet may sign`);
+        }
+        return (
+          signer ?? {
+            address: address(account.pubkey),
+            role: account.isWritable ? AccountRole.WRITABLE : AccountRole.READONLY,
+          }
+        );
+      }),
+      data: Uint8Array.from(Buffer.from(input.data, "base64")),
+    };
+  };
+  for (const instruction of computeBudgetInstructions) {
+    if (instruction.programId !== COMPUTE_BUDGET_PROGRAM) {
+      throw new Error(`Compute-budget slot received non-compute-budget program ${instruction.programId}`);
+    }
+  }
+  return {
+    name: "lst-depeg-atomic",
+    preInstructions: computeBudgetInstructions.map(toInstruction),
+    instructions: swapInstructions.map(toInstruction),
+  };
+}

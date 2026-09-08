@@ -1,3 +1,5 @@
+import { formatCompact, formatSolPrice } from "../strategies/arb/treasure.js";
+
 export interface TelegramAlertConfig {
   /** i.e. 7123456789 */
   chatId: string;
@@ -38,7 +40,11 @@ export type TelegramAlertKind =
   | "execution"
   | "swap"
   | "profit"
-  | "watching";
+  | "watching"
+  | "near-miss"
+  | "treasure"
+  | "blocked"
+  | "digest";
 
 export interface TelegramAlert {
   kind: TelegramAlertKind;
@@ -200,45 +206,63 @@ export function trackerEventToAlert(event: TrackerLikeEvent): TelegramAlert | nu
       lines: [
         ...candidateLines(event.candidate),
         `Health crossed below 1.0 (was ${event.fromHealth.toFixed(4)})`,
-      ],
-    };
-  }
+    ],
+  };
+}
+
   if (event.type === "watching") {
-    return {
-      kind: "watching",
-      title: "◉ WATCHING (hot-tracked)",
-      lines: candidateLines(event.candidate),
-    };
+    // Suppressed from Telegram: hot-track spam (new near-miss entries every scan).
+    // Visible in console only. The near-miss digest (see nearMissDigestAlert) is
+    // the Telegram signal for this tier.
+    return null;
   }
   if (event.type === "taken") {
-    if (event.wasDue) {
-      return {
-        kind: "taken-liquidated",
-        title: "✗ TAKEN (liquidated)",
-        lines: [
-          `Obligation: ${event.obligation}`,
-          `DUE duration: ${event.satSeconds}s`,
-          `Someone liquidated it (not us)`,
-        ],
-      };
+    // Telegram follows the console: only surface real LIQUIDATIONS (candidates that
+    // went DUE and were taken by another liquidator). Healed/managed band exits stay
+    // in the JSONL only — no alert, no console line.
+    if (!event.wasDue) return null;
+    const lines = [
+      `Obligation: ${event.obligation}`,
+      `We tracked it DUE for ${event.satSeconds}s, then another bot took it.`,
+    ];
+    if (event.lastHealth !== undefined) {
+      lines.push(`Last health seen: ${event.lastHealth.toFixed(4)}`);
     }
+    if (event.debtUsd !== undefined && event.debtSymbol) {
+      lines.push(`Debt: ${event.debtUsd.toFixed(2)} ${event.debtSymbol}`);
+    }
+    lines.push(`Missed execution window.`);
     return {
-      kind: "taken-gone",
-      title: "✗ GONE (managed/healed)",
-      lines: [
-        `Obligation: ${event.obligation}`,
-        `Left the band after ${event.satSeconds}s`,
-      ],
+      kind: "taken-liquidated",
+      title: "⚡ LIQUIDATED BY OTHERS",
+      lines,
     };
   }
   if (event.type === "healed") {
-    return {
-      kind: "healed",
-      title: "✓ HEALED",
-      lines: [`Obligation: ${event.obligation}`, `Back to ${event.lastHealth.toFixed(4)}`],
-    };
+    // Suppressed from Telegram: noise. Console only.
+    return null;
   }
   return null;
+}
+
+/**
+ * Top-N near-miss digest — the one Telegram signal for the watch tier.
+ * Throttled by the caller (default 15 min); only the closest-to-DUE positions.
+ */
+export function nearMissDigestAlert(
+  top: Array<CandidateLike & { rank: number }>,
+  intervalMin: number,
+): TelegramAlert {
+  return {
+    kind: "near-miss",
+    title: `🎯 TOP ${top.length} NEAR-MISS (${intervalMin} min digest)`,
+    lines: top.map((entry) => {
+      const tag = entry.rank === 1 ? "🔴" : entry.rank === 2 ? "🟠" : "🟡";
+      const profit = (entry.estimatedProfitUsd ?? 0).toFixed(2);
+      const health = entry.healthFactor.toFixed(4);
+      return `${tag} #${entry.rank} ${entry.obligation.slice(0, 8)}… hf=${health} debt:$${entry.largestDebt.amountUsd.toFixed(0)} ${entry.largestDebt.symbol} est-profit:$${profit}`;
+    }),
+  };
 }
 
 function candidateLines(candidate: CandidateLike): string[] {
@@ -261,7 +285,7 @@ export type TrackerLikeEvent =
   | { type: "spotted"; candidate: CandidateLike }
   | { type: "promoted"; candidate: CandidateLike; fromHealth: number }
   | { type: "watching"; candidate: CandidateLike }
-  | { type: "taken"; obligation: string; satSeconds: number; wasDue: boolean; dueSince: string | undefined }
+  | { type: "taken"; obligation: string; satSeconds: number; wasDue: boolean; dueSince: string | undefined; lastHealth?: number; debtUsd?: number; debtSymbol?: string }
   | { type: "healed"; obligation: string; lastHealth: number };
 
 export function surgeAlert(on: boolean, dueCount: number, band: number): TelegramAlert {
@@ -294,6 +318,59 @@ export function testAlert(): TelegramAlert {
   };
 }
 
+export function treasureAlert(opportunity: {
+  venue: string;
+  poolAddress: string;
+  baseMint: string;
+  ratio: number;
+  poolPriceInSol: number;
+  referencePriceInSol: number | null;
+  vaultSolUi: number;
+  vaultBaseUi: number;
+}): TelegramAlert {
+  const discountPct = ((1 - opportunity.ratio) * 100).toFixed(1);
+  const refLine = opportunity.referencePriceInSol
+    ? `Reference: ${formatSolPrice(opportunity.referencePriceInSol)}`
+    : "Reference: none (unlisted — manual review)";
+  return {
+    kind: "treasure",
+    title: `💰 TREASURE: ${discountPct}% discount`,
+    lines: [
+      `Venue: ${opportunity.venue}`,
+      `Pool: ${opportunity.poolAddress}`,
+      `Base mint: ${opportunity.baseMint}`,
+      `Pool price: ${formatSolPrice(opportunity.poolPriceInSol)}`,
+      refLine,
+      `Vault: ${formatCompact(opportunity.vaultBaseUi)} base + ${opportunity.vaultSolUi.toFixed(2)} SOL`,
+    ],
+  };
+}
+
+export function lstAlert(result: {
+  symbol: string;
+  mint: string;
+  spreadBps: number;
+  direction: "discount" | "premium";
+  probeUsd: number;
+  referenceLabel: string;
+}): TelegramAlert {
+  const pct = (result.spreadBps / 100).toFixed(2);
+  const arrow = result.direction === "discount" ? "📉" : "📈";
+  return {
+    kind: "treasure",
+    title: `${arrow} LST ${result.direction.toUpperCase()}: ${pct}%`,
+    lines: [
+      `LST: ${result.symbol} (${result.mint})`,
+      `Spread: ${result.spreadBps}bps vs ${result.direction === "discount" ? "redemption-side" : "market"} reference`,
+      `Reference: ${result.referenceLabel}`,
+      `Probe: $${result.probeUsd} executable (depth-verified)`,
+      result.direction === "discount"
+        ? "Play: flashBorrow SOL → buy LST → unstake/sell → repay (validate unstake leg first)"
+        : "Play: flashBorrow LST asset (Kamino) → sell high → buy back lower → repay",
+    ],
+  };
+}
+
 export function adlAlert(candidate: { obligation: string; currentLtvPct: number; adlTargetLtvPct: number; marginCallAgeHours: number }): TelegramAlert {
   return {
     kind: "adl",
@@ -316,13 +393,6 @@ export function executionAlert(params: { obligation: string; debt: string; attem
   };
 }
 
-export function swapAlert(params: { route: string; amountUsd: number; minOut: string }): TelegramAlert {
-  return {
-    kind: "swap",
-    title: "⇄ SWAP LEG",
-    lines: [`Route: ${params.route}`, `Amount: $${params.amountUsd.toFixed(2)}`, `Min-out: ${params.minOut}`],
-  };
-}
 
 export function profitAlert(params: { signature: string; grossUsd: number; feesUsd: number; netUsd: number }): TelegramAlert {
   return {
@@ -333,5 +403,93 @@ export function profitAlert(params: { signature: string; grossUsd: number; feesU
       `Tx: ${params.signature}`,
       `Solscan: https://solscan.io/tx/${params.signature}`,
     ],
+  };
+}
+
+/** Broadcast attempt failed on-chain — the "gas burned" signal (follows executor.send catch). */
+export function liquidationFailedAlert(params: {
+  obligation: string;
+  stage: string;
+  reason: string;
+  gasBurnedUsd?: number;
+}): TelegramAlert {
+  const lines = [
+    `Obligation: ${params.obligation}`,
+    `Stage: ${params.stage}`,
+    `Reason: ${params.reason.slice(0, 300)}`,
+  ];
+  if (params.gasBurnedUsd !== undefined && params.gasBurnedUsd > 0) {
+    lines.push(`Gas burned: ~$${params.gasBurnedUsd.toFixed(4)}`);
+  } else {
+    lines.push("No SOL spent (caught pre-send)");
+  }
+  return { kind: "execution", title: "❌ LIQUIDATION FAILED", lines };
+}
+
+/** Daily loss cap tripped — bot paused until UTC midnight (mirrors the safe-start pattern). */
+export function budgetPausedAlert(params: { dailyLossUsd: number; capUsd: number }): TelegramAlert {
+  return {
+    kind: "blocked",
+    title: "🛑 BUDGET GUARD — PAUSED",
+    lines: [
+      `Daily loss: $${params.dailyLossUsd.toFixed(2)} reached the cap ($${params.capUsd.toFixed(2)}).`,
+      "Liquidation firing is paused until the rolling window clears.",
+      "Shadow monitoring continues — no further broadcast attempts.",
+    ],
+  };
+}
+
+/** Periodic heartbeat — the one place to see the whole system's health at a glance. */
+export function heartbeatAlert(params: {
+  uptimeMinutes: number;
+  cycles: number;
+  nearMissCount: number;
+  dueAttempted: number;
+  dueFired: number;
+  liquidatedByOthers: number;
+  walletSol: number;
+}): TelegramAlert {
+  return {
+    kind: "digest",
+    title: "💓 LIQ ENGINE HEARTBEAT",
+    lines: [
+      `Uptime: ${params.uptimeMinutes}m | Cycles: ${params.cycles}`,
+      `Near-miss tracked: ${params.nearMissCount}`,
+      `DUE attempts: ${params.dueAttempted} (fired: ${params.dueFired})`,
+      `Lost to others (LIQUIDATED): ${params.liquidatedByOthers}`,
+      `Wallet: ${params.walletSol.toFixed(4)} SOL`,
+    ],
+  };
+}
+
+/** Executor attempted a play and it cleared every guard — visible even in shadow mode. */
+export function dueAttemptAlert(params: {
+  obligation: string;
+  health: number;
+  repayUsd: number;
+  repaySymbol: string;
+  withdrawSymbol: string;
+  worstProfitUsd: number;
+  timingsMs: Record<string, number>;
+  shadow: boolean;
+  priorityLane?: string;
+  tipUsd?: number;
+}): TelegramAlert {
+  const timing = Object.entries(params.timingsMs)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  const lane = params.priorityLane && params.priorityLane !== "base-fee"
+    ? ` | FASTLANE: ${params.priorityLane}${params.tipUsd ? ` ($${params.tipUsd.toFixed(2)})` : ""}`
+    : "";
+  return {
+    kind: "execution",
+    title: params.shadow ? "🔍 DUE — SIMULATED (SHADOW)" : "🔥 DUE — FIRING LIVE",
+    lines: [
+      `Obligation: ${params.obligation}`,
+      `Health: ${params.health.toFixed(4)}`,
+      `Repay: $${params.repayUsd.toFixed(2)} ${params.repaySymbol} → seize ${params.withdrawSymbol}`,
+      `Worst-case profit: $${params.worstProfitUsd.toFixed(2)}${lane}`,
+      timing ? `Latency: ${timing}` : "",
+    ].filter(Boolean),
   };
 }

@@ -15,7 +15,7 @@ export type TrackerEvent =
   | { type: "spotted"; at: string; candidate: LiquidatableCandidate }
   | { type: "promoted"; at: string; candidate: LiquidatableCandidate; fromHealth: number }
   | { type: "watching"; at: string; candidate: LiquidatableCandidate }
-  | { type: "taken"; at: string; obligation: string; firstSpottedAt: string; satSeconds: number; wasDue: boolean; dueSince: string | undefined }
+  | { type: "taken"; at: string; obligation: string; firstSpottedAt: string; satSeconds: number; wasDue: boolean; dueSince: string | undefined; lastHealth?: number; debtUsd?: number; debtSymbol?: string }
   | { type: "healed"; at: string; obligation: string; lastHealth: number };
 
 export interface HotThresholds {
@@ -186,6 +186,9 @@ export class HotTracker {
             satSeconds: Math.max(0, Math.round((Date.parse(at) - Date.parse(existing.firstSpottedAt)) / 1000)),
             wasDue,
             dueSince: existing.dueSince,
+            lastHealth: existing.lastSeenHealth,
+            debtUsd: existing.candidate.largestDebt.amountUsd,
+            debtSymbol: existing.candidate.largestDebt.symbol,
           });
           this.tracked.delete(candidate.obligation);
         } else {
@@ -210,6 +213,9 @@ export class HotTracker {
           satSeconds: Math.max(0, Math.round((Date.parse(at) - Date.parse(entry.firstSpottedAt)) / 1000)),
           wasDue: entry.lastSeenHealth < 1,
           dueSince: entry.dueSince,
+          lastHealth: entry.lastSeenHealth,
+          debtUsd: entry.candidate.largestDebt.amountUsd,
+          debtSymbol: entry.candidate.largestDebt.symbol,
         });
         this.tracked.delete(obligation);
       }

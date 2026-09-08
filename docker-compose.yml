@@ -9,10 +9,10 @@ services:
     env_file:
       - .env
     environment:
-      # Seconds between scans (override via .env; must be >=1)
-      - WATCH_INTERVAL=${WATCH_INTERVAL:-60}
       # Force ANSI colors in logs even without a TTY
       - FORCE_COLOR=1
+      # Persistent ALT state lives on the /data volume (survives rebuilds)
+      - LIQ_ALT_STATE=/data/liq_alt.json
     volumes:
       # Persist JSONL event log across container restarts/rebuilds
       - ./data:/data
@@ -20,38 +20,19 @@ services:
       node --disable-warning=ExperimentalWarning --import tsx src/cli.ts scan
       --watch
       --interval ${WATCH_INTERVAL:-60}
+      --hot-interval 10
       --log /data/opportunities.jsonl
+      --ledger /data/liq_autofire_ledger.jsonl
+      --stop-file /data/liq_autofire.stop
+      --min-profit ${LIQ_MIN_PROFIT:-0.05}
+      --slippage-bps ${LIQ_SLIPPAGE_BPS:-50}
+      --priority-mode ${LIQ_PRIORITY_MODE:-auto}
+      --fast
+      --execute
+      --broadcast
     healthcheck:
       test: ["CMD", "node", "-e", "process.exit(0)"]
       interval: 60s
       timeout: 10s
       start_period: 120s
-      retries: 3
-
-  arb-scanner:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: kamino-watcher:latest
-    container_name: arb-scanner
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      # Force ANSI colors in logs even without a TTY
-      - FORCE_COLOR=1
-    volumes:
-      - ./data:/data
-    command: >
-      node --disable-warning=ExperimentalWarning --import tsx src/cli.ts arb-scan
-      --watch
-      --interval ${ARB_INTERVAL:-30}
-      --size ${ARB_SIZE:-100}
-      --min-spread ${ARB_MIN_SPREAD:-3}
-      --log /data/arb_opportunities.jsonl
-    healthcheck:
-      test: ["CMD", "node", "-e", "process.exit(0)"]
-      interval: 60s
-      timeout: 10s
-      start_period: 60s
       retries: 3
