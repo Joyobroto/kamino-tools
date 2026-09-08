@@ -301,11 +301,16 @@ export function surgeAlert(on: boolean, dueCount: number, band: number): Telegra
       };
 }
 
-export function startupAlert(cyclesPerHour: number, hotIntervalSec: number): TelegramAlert {
+export function startupAlert(options: { cyclesPerHour: number; hotIntervalSec: number; armed?: boolean; wsLive?: boolean; broadcast?: boolean }): TelegramAlert {
   return {
     kind: "startup",
     title: "🟢 Kamino Watcher Started",
-    lines: [`Full scans: every ${Math.round(3600 / cyclesPerHour)}s`, `Hot ticks: every ${hotIntervalSec}s`, "Read-only — no transactions will be sent"],
+    lines: [
+      `Full scans: every ${Math.round(3600 / options.cyclesPerHour)}s`,
+      `Hot ticks: every ${options.hotIntervalSec}s`,
+      `WS deltas: ${options.wsLive ? "live" : "off"}`,
+      options.broadcast ? "🔴 ARMED — broadcasting liquidations" : options.armed ? "⚡ Executor ON (shadow)" : "Read-only — no transactions",
+    ],
   };
 }
 

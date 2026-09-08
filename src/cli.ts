@@ -928,7 +928,7 @@ program
     }
     console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] watching every ${intervalMs / 1000}s (hot ${hotIntervalMs / 1000}s, band ${hotBand}) — Ctrl+C to stop`));
     if (alerter.enabled) {
-      alerter.push(startupAlert(Math.round(3_600_000 / intervalMs), hotIntervalMs / 1000));
+      alerter.push(startupAlert({ cyclesPerHour: Math.round(3_600_000 / intervalMs), hotIntervalSec: hotIntervalMs / 1000, broadcast: options.broadcast }));
       console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] telegram alerts enabled (chat ${process.env.TELEGRAM_CHAT_ID})`));
     }
     // Periodic Telegram heartbeat — the eval surface for "is the system alive and

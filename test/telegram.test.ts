@@ -104,7 +104,7 @@ test("alerter retries once on failure", async () => {
 test("surge and startup alerts build", () => {
   assert.equal(surgeAlert(true, 23, 1.44).kind, "surge-on");
   assert.equal(surgeAlert(false, 0, 1.1).kind, "surge-off");
-  assert.equal(startupAlert(60, 10).kind, "startup");
+  assert.equal(startupAlert({ cyclesPerHour: 60, hotIntervalSec: 10 }).kind, "startup");
 });
 
 test("watching and healed tracker events are suppressed from Telegram", () => {
