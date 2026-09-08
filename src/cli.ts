@@ -29,6 +29,7 @@ import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm
 import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket } from "./strategies/liquidation/screener.js";
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
+import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
 import { buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
 import { getAccountsInLut } from "@kamino-finance/klend-sdk";
 import type { KaminoReserve } from "@kamino-finance/klend-sdk";
@@ -111,6 +112,7 @@ interface ScanOptions {
   stopFile: string;
   fast: boolean;
   priorityMode: string;
+  ws?: string;
 }
 
 function validateScanConfig(config: LiquidationScanConfig): void {
@@ -580,6 +582,7 @@ program
   .option("--stop-file <path>", "executor kill-switch file", "data/liq_autofire.stop")
   .option("--fast", "FAST mode: single simulation, skip the CU-pinned re-sim roundtrip (~1-2s faster)", false)
   .option("--priority-mode <mode>", "FASTLANE priority fee: off | fixed | auto (auto scales the bid with the prize, capped at 2% of worst-case profit)", "auto")
+  .option("--ws <url>", "WebSocket endpoint for real-time obligation deltas (default: derived from --rpc)", "")
   .action(async (options: ScanOptions) => {
     const scanConfig: LiquidationScanConfig = {
       minDebtUsd: Number(options.minDebt),
@@ -956,6 +959,39 @@ program
     let fullScanPromise: Promise<void> | null = null;
     let nextFullScan = 0;
     let nextHotTick = 0;
+    // ── Realtime detection rail: programNotifications on the obligation stream ──
+    // WS deltas are the LOW-LATENCY path (per-account changes arrive within ~1 slot
+    // vs the 10s hot loop / 60s full scan). A cached health < 1 here is a signal to
+    // go straight to executeDue — every later stage (fresh hydration, guards, sim,
+    // broadcast) is owned by the executor, so we never execute on stale slate.
+    const wsUrl = options.ws || options.rpc.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    let wsHandle: LiquidationWsHandle | undefined;
+    if (options.watch && !options.json) {
+      const wsLogged = new Map<string, number>();
+      subscribeLiquidationSlices({
+        wsUrl,
+        marketAddress: options.market,
+        onSlice: (slice) => {
+          if (slice.cachedHealth >= 1) return;
+          const obligation = slice.pubkey.toString();
+          const lastLogged = wsLogged.get(obligation) ?? 0;
+          if (Date.now() - lastLogged < 30_000) return;
+          wsLogged.set(obligation, Date.now());
+          console.log(`${color.bold(color.red("⚡ WS DUE"))} ${shortAddress(obligation)}  health ${slice.cachedHealth.toFixed(4)}`);
+          executeDue(obligation);
+        },
+        onReady: () => {
+          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live (${wsUrl})`));
+        },
+        onError: (error: unknown) => {
+          console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
+        },
+      }).then((handle) => {
+        wsHandle = handle;
+      }).catch((error: unknown) => {
+        if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws subscribe failed: ${error instanceof Error ? error.message : String(error)}`));
+      });
+    }
     while (true) {
       const now = Date.now();
       if (now >= nextFullScan && !fullScanPromise) {
