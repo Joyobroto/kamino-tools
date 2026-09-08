@@ -1,4 +1,3 @@
-import { formatCompact, formatSolPrice } from "../strategies/arb/treasure.js";
 
 export interface TelegramAlertConfig {
   /** i.e. 7123456789 */
@@ -315,59 +314,6 @@ export function testAlert(): TelegramAlert {
     kind: "test",
     title: "🔔 Kamino Alert Test",
     lines: ["If you can read this, alerts are wired up correctly."],
-  };
-}
-
-export function treasureAlert(opportunity: {
-  venue: string;
-  poolAddress: string;
-  baseMint: string;
-  ratio: number;
-  poolPriceInSol: number;
-  referencePriceInSol: number | null;
-  vaultSolUi: number;
-  vaultBaseUi: number;
-}): TelegramAlert {
-  const discountPct = ((1 - opportunity.ratio) * 100).toFixed(1);
-  const refLine = opportunity.referencePriceInSol
-    ? `Reference: ${formatSolPrice(opportunity.referencePriceInSol)}`
-    : "Reference: none (unlisted — manual review)";
-  return {
-    kind: "treasure",
-    title: `💰 TREASURE: ${discountPct}% discount`,
-    lines: [
-      `Venue: ${opportunity.venue}`,
-      `Pool: ${opportunity.poolAddress}`,
-      `Base mint: ${opportunity.baseMint}`,
-      `Pool price: ${formatSolPrice(opportunity.poolPriceInSol)}`,
-      refLine,
-      `Vault: ${formatCompact(opportunity.vaultBaseUi)} base + ${opportunity.vaultSolUi.toFixed(2)} SOL`,
-    ],
-  };
-}
-
-export function lstAlert(result: {
-  symbol: string;
-  mint: string;
-  spreadBps: number;
-  direction: "discount" | "premium";
-  probeUsd: number;
-  referenceLabel: string;
-}): TelegramAlert {
-  const pct = (result.spreadBps / 100).toFixed(2);
-  const arrow = result.direction === "discount" ? "📉" : "📈";
-  return {
-    kind: "treasure",
-    title: `${arrow} LST ${result.direction.toUpperCase()}: ${pct}%`,
-    lines: [
-      `LST: ${result.symbol} (${result.mint})`,
-      `Spread: ${result.spreadBps}bps vs ${result.direction === "discount" ? "redemption-side" : "market"} reference`,
-      `Reference: ${result.referenceLabel}`,
-      `Probe: $${result.probeUsd} executable (depth-verified)`,
-      result.direction === "discount"
-        ? "Play: flashBorrow SOL → buy LST → unstake/sell → repay (validate unstake leg first)"
-        : "Play: flashBorrow LST asset (Kamino) → sell high → buy back lower → repay",
-    ],
   };
 }
 

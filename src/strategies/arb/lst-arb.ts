@@ -18,9 +18,12 @@
  * reports show the exact P&L. No broadcast happens in this module.
  */
 
-import { fetchQuote } from "./quotes.js";
-import { WSOL_MINT } from "./treasure.js";
-import type { LstEntry } from "./lst.js";
+const WSOL_MINT = "So11111111111111111111111111111111111111112"; // was arb/treasure.js
+export interface LstEntry {
+  symbol: string;
+  mint: string;
+  decimals: number;
+}
 
 const SWAP_INSTRUCTIONS_URL = "https://lite-api.jup.ag/swap/v1/swap-instructions";
 const QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote";

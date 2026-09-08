@@ -14,8 +14,17 @@
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { safeJsonStringify } from "../../ui.js";
-import type { LstEntry } from "./lst.js";
-import type { ExecutionOutcome } from "./execute.js";
+export interface LstEntry {
+  symbol: string;
+  mint: string;
+  decimals: number;
+}
+/** Executor verdict shape (mirrors liquidation/execute.ts outcomes). */
+export interface ExecutionOutcome {
+  stage: "plan" | "assemble" | "simulate" | "ready";
+  passed: boolean;
+  reason?: string;
+}
 
 export interface FireDecision {
   allowed: boolean;
