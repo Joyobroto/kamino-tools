@@ -15,9 +15,11 @@ export interface MarketReserveInfo {
   liquidationBonusMax: number;
   availableUsd: number;
   priceValid: boolean;
+  /** The liquidation threshold (% of value) — drives the program's pair-priority. */
+  liquidationThresholdPct: number;
 }
 
-export type MarketReserveMap = Map<string, MarketReserveInfo>;
+export type MarketReserveMap = Map<string, MarketReserveInfo & { __marketCloseFactorPct?: number }>;
 
 export function isVanillaObligation(obligation: KaminoObligation): boolean {
   return obligation.obligationTag === ObligationTypeTag.Vanilla;
@@ -39,9 +41,30 @@ export function healthFactorFromSf(debtSf: bigint, unhealthySf: bigint): number 
   return Number(unhealthySf) / Number(debtSf);
 }
 
-export function estimateLiquidationProfit(debtUsd: number, liquidationBonus: number): number {
-  const bonus = liquidationBonus > 0 ? liquidationBonus : LIQUIDATION_BONUS_FALLBACK;
-  return debtUsd * bonus;
+/**
+ * Estimated liquidation prize, mirroring the PROGRAM's actual economics:
+ *   repay = min(closeFactor × largestDebtPosition, debtPosition)  ← the cap the
+ *   on-chain liquidate enforces (market.state.liquidationMaxDebtCloseFactorPct;
+ *   our market runs 10%), NOT the full debt.
+ *   profit ≈ repay × liquidationBonus (bonus at MIN when just past threshold —
+ *   verified on-chain: borderline positions liquidate at minLiquidationBonusBps).
+ * Also subtract the flash-loan fee (we borrow the repay amount; 0 on fee-free
+ * reserves but 9–30bps on most) and leave swap/slippage costs out (worst case
+ * bounded by amountOutMin on-chain).
+ */
+export function estimateLiquidationProfit(input: {
+  debtUsd: number;
+  liquidationBonus: number;
+  closeFactorPct?: number;
+  flashLoanFeeRate?: number;
+}): number {
+  const bonus = input.liquidationBonus > 0 ? input.liquidationBonus : LIQUIDATION_BONUS_FALLBACK;
+  // The program caps the repay at close-factor × the debt position. Default 100
+  // only when the caller has no market state (unit tests).
+  const closeFactor = Math.max(0, Math.min(100, input.closeFactorPct ?? 100)) / 100;
+  const repayUsd = input.debtUsd * closeFactor;
+  const feeRate = Math.max(0, input.flashLoanFeeRate ?? 0);
+  return repayUsd * bonus - repayUsd * feeRate;
 }
 
 function largestDebtPosition(
@@ -67,6 +90,29 @@ export function obligationToCandidate(
 ): LiquidatableCandidate {
   const stats = obligation.refreshedStats;
   const largestDebt = largestDebtPosition(obligation, marketReserves);
+  // Prize estimate is set HERE (not only in filterLiquidatable) so every rail —
+  // WS onSlice, hot tick, executeDue's own hydration — carries the same estimate.
+  // Without it the --min-prize firewall saw prizeUsd = 0 and silently killed
+  // every event-driven fire.
+  const debtReserveInfo = marketReserves.get(largestDebt.reserve);
+  const marketMeta = marketReserves.get("__market__");
+  const closeFactorPct = marketMeta?.__marketCloseFactorPct ?? 100;
+  // The liquidation bonus is paid in extra COLLATERAL — it comes from the
+  // withdraw reserve's config (docs + program layout), not the debt side.
+  // At screening time the pair isn't chosen yet: use the program's own priority
+  // (lowest liquidation-threshold deposit is seized first) so the estimate matches
+  // what the executor will actually pick.
+  const seizedCollateral = obligation.getDeposits()
+    .map((deposit) => ({ deposit, info: marketReserves.get(deposit.reserveAddress) }))
+    .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info))
+    .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
+  const bonus = seizedCollateral?.info.liquidationBonus ?? 0;
+  const estimatedProfitUsd = estimateLiquidationProfit({
+    debtUsd: largestDebt.amountUsd,
+    liquidationBonus: bonus,
+    ...(closeFactorPct !== 100 ? { closeFactorPct } : {}),
+    ...(debtReserveInfo?.flashLoanFeeRate ? { flashLoanFeeRate: debtReserveInfo.flashLoanFeeRate } : {}),
+  });
   return {
     obligation: obligation.obligationAddress,
     tag: obligation.obligationTag,
@@ -79,6 +125,7 @@ export function obligationToCandidate(
       if (!info) return deposit.reserveAddress.slice(0, 4);
       return info.liquidityMint === WSOL_MINT ? "WSOL" : info.symbol;
     }),
+    estimatedProfitUsd,
   };
 }
 
@@ -104,6 +151,7 @@ export function filterLiquidatable(
   marketReserves: MarketReserveMap,
   options: ScanOptions,
   bonusByReserve?: Map<string, number>,
+  storedHealthByPubkey?: Map<string, number>,
 ): { candidates: LiquidatableCandidate[]; nearMiss: LiquidatableCandidate[]; skipped: FunnelSkipReason } {
   const candidates: LiquidatableCandidate[] = [];
   const nearMiss: LiquidatableCandidate[] = [];
@@ -114,7 +162,15 @@ export function filterLiquidatable(
       skipped.nonVanilla += 1;
       continue;
     }
-    const health = healthFactor(obligation);
+    // DUE / band classification MUST use the live recompute, not the stored scaled-factor
+    // health. The stored debtSf/unhealthySf are snapshots from the obligation's last on-chain
+    // refresh and go stale as prices move (observed: stored 0.99995 vs live 1.35 — the program
+    // rejected every such target with Custom 6016 ObligationHealthy). The program recomputes
+    // health fresh at liquidation, so the hydrated SDK recompute (healthFactor) is the arbiter.
+    // storedHealthByPubkey is used only as fallback when the obligation cannot be hydrated.
+    const health = Number.isFinite(healthFactor(obligation))
+      ? healthFactor(obligation)
+      : storedHealthByPubkey?.get(obligation.obligationAddress.toString()) ?? healthFactor(obligation);
     if (health >= options.healthWatch) {
       skipped.healthy += 1;
       continue;
@@ -122,6 +178,7 @@ export function filterLiquidatable(
     let candidate: LiquidatableCandidate;
     try {
       candidate = obligationToCandidate(obligation, marketReserves);
+      candidate.healthFactor = health;
     } catch {
       skipped.healthy += 1;
       continue;
@@ -145,8 +202,24 @@ export function filterLiquidatable(
       skipped.staleOracle += 1;
       continue;
     }
-    const bonus = bonusByReserve?.get(candidate.largestDebt.reserve) ?? debtReserve.liquidationBonus;
-    const estProfit = estimateLiquidationProfit(debtUsd, bonus);
+    // Bonus: paid in extra COLLATERAL — read from the priority-seized collateral
+    // reserve (lowest liquidation threshold first, the program's own pair rule).
+    // bonusByReserve (scan-side override) still wins when provided.
+    const seizedCollateral = obligation.getDeposits()
+      .map((deposit) => ({ deposit, info: marketReserves.get(deposit.reserveAddress) }))
+      .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info))
+      .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
+    const bonus = bonusByReserve?.get(seizedCollateral?.deposit.reserveAddress ?? candidate.largestDebt.reserve)
+      ?? seizedCollateral?.info.liquidationBonus
+      ?? debtReserve.liquidationBonus;
+    const marketMeta = marketReserves.get("__market__");
+    const closeFactorPct = marketMeta?.__marketCloseFactorPct ?? 100;
+    const estProfit = estimateLiquidationProfit({
+      debtUsd,
+      liquidationBonus: bonus,
+      ...(closeFactorPct !== 100 ? { closeFactorPct } : {}),
+      ...(debtReserve.flashLoanFeeRate ? { flashLoanFeeRate: debtReserve.flashLoanFeeRate } : {}),
+    });
     if (health < 1) {
       if (estProfit < options.profitFloorUsd) {
         skipped.belowFloor += 1;
@@ -175,11 +248,17 @@ export function buildMarketReserveMap(
       getOracleMarketPrice(): { div(value: number | string): { toFixed(digits?: number): string } };
       hasValidOraclePrice(): boolean;
       getFlashLoanFee(): { toString(): string };
-      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number } };
+      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number; liquidationThresholdPct: number } };
     }>;
   },
+  marketCloseFactorPct?: number,
 ): MarketReserveMap {
-  const map = new Map<string, MarketReserveInfo>();
+  const map = new Map<string, MarketReserveInfo & { __marketCloseFactorPct?: number }>();
+  // The market-level close factor travels ON the map (key "__market__") so every
+  // consumer (obligationToCandidate, filterLiquidatable) prices the prize with
+  // the program's real repay cap without threading a param through all callers.
+  const closeFactorPct = marketCloseFactorPct ?? 100;
+  map.set("__market__", { __marketCloseFactorPct: closeFactorPct } as MarketReserveInfo & { __marketCloseFactorPct?: number });
   for (const reserve of market.getReserves()) {
     const flashLoanFeeRate = Number(reserve.getFlashLoanFee().toString());
     const liquidityAvailable = Number(reserve.getLiquidityAvailableAmount().toFixed(0));
@@ -195,6 +274,7 @@ export function buildMarketReserveMap(
       liquidationBonusMax: reserve.state.config.maxLiquidationBonusBps / 10_000,
       availableUsd: liquidityAvailable * oraclePrice,
       priceValid: reserve.hasValidOraclePrice(),
+      liquidationThresholdPct: reserve.state.config.liquidationThresholdPct,
     });
   }
   return map;

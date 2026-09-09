@@ -36,6 +36,7 @@ import { Scope } from "@kamino-finance/scope-sdk";
 import {
   AccountRole,
   address,
+  getBase64EncodedWireTransaction,
   none,
   some,
   type AccountMeta,
@@ -56,10 +57,12 @@ import {
   fetchTokenAccount,
 } from "../../kamino.js";
 import { externalInstructionsToStrategy, type ExternalInstruction } from "../../strategy.js";
-import { createSignedTransactionWithAlt, simulate } from "../../transaction.js";
+import { simulate } from "../../transaction.js";
+import { createSignedTransactionWithAltCached, getCachedScopeConfigurations } from "./hotcache.js";
+import { fetchKswapRoutes } from "./kswap.js";
 import { safeJsonStringify } from "../../ui.js";
 import { buildMarketReserveMap, healthFactor, obligationToCandidate } from "./filters.js";
-import { hydrateShortlist } from "./screener.js";
+import { hydrateShortlist, withBackoff } from "./screener.js";
 import { applySlippage, fetchRawQuote, fetchSwapInstructions } from "../arb/lst-arb.js";
 
 const ATA_PROGRAM = "ATokenGPvbdgxrpT2sgsWoLtT8H9y6hktjssKpsrjqer";
@@ -93,6 +96,11 @@ export interface LiquidationInput {
   microlamportsPerCu?: number;
   /** Prize for auto-scaling (worst-case profit USD); ~$1 = ~0.005 SOL at current prices. */
   prizeUsd?: number;
+  /** Pre-hydrated obligation (e.g. executeDue already hydrated for its live-gate
+   *  check) — skips the duplicate hydrate RPC inside the executor. Staleness is
+   *  bounded by the caller (seconds, not minutes); the tx itself refreshes
+   *  on-chain anyway. */
+  prehydratedObligation?: KaminoObligation;
 }
 
 export type LiquidationOutcome =
@@ -113,8 +121,10 @@ export type LiquidationOutcome =
         estCollateralUsd: number;
         quotedProfitUsd: number;
         worstCaseProfitUsd: number;
+        /** Which swap backend produced the plan: clmm-local | jupiter | kswap/<router>. */
+        swapSource?: string;
       };
-      transaction: Awaited<ReturnType<typeof createSignedTransactionWithAlt>>;
+      transaction: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>>;
       signer: TransactionSigner;
       computeUnitsConsumed: bigint;
       instructions: number;
@@ -251,18 +261,22 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     };
   };
 
-  // 1. Hydrate the obligation fresh (oracles + account state).
+  // 1. Hydrate the obligation fresh (oracles + account state) — or reuse the
+  //    caller's seconds-old hydration (the tx refreshes on-chain regardless).
   let done = mark("hydrate");
-  const ledgerInstant = await getCurrentLedgerInstant(rpc);
-  const hydrated = await hydrateShortlist({
-    rpc,
-    market,
-    ledgerInstant,
-    pubkeys: [obligationAddress],
-    onProgress: () => {},
-  });
+  let obligation = input.prehydratedObligation;
+  if (!obligation) {
+    const ledgerInstant = await getCurrentLedgerInstant(rpc);
+    const hydrated = await hydrateShortlist({
+      rpc,
+      market,
+      ledgerInstant,
+      pubkeys: [obligationAddress],
+      onProgress: () => {},
+    });
+    obligation = hydrated[0];
+  }
   done();
-  const obligation = hydrated[0];
   if (!obligation) return { stage: "plan", passed: false, reason: "obligation account not found", timings };
   if (obligation.obligationTag !== 0) return { stage: "plan", passed: false, reason: "non-vanilla obligation (skip)" , timings };
   const health = healthFactor(obligation);
@@ -270,7 +284,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     return { stage: "plan", passed: false, reason: `health ${health.toFixed(4)} — not liquidatable right now` , timings };
   }
 
-  const marketReserves = buildMarketReserveMap(market);
+  const marketReserves = buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100);
 
   // ── Pair selection (Kamino docs best practice) ──
   // The program ENFORCES priority rules: the target pair must be the
@@ -318,11 +332,14 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     return { stage: "plan", passed: false, reason: `flash borrow ${repayAmountBaseUnits} > available ${available}` , timings };
   }
 
-  // 3. Estimate the collateral the program will redeem for us (min bonus, minus
-  //    the protocol liquidation fee, with a haircut so the Jupiter swap never
-  //    needs more than we receive — docs best practice).
+  // 3. Estimate the collateral the program will redeem for us — the LIQUIDATION
+  //    BONUS comes from the WITHDRAW (collateral) reserve's config, not the debt
+  //    side (docs: the bonus is paid in extra collateral, so the collateral
+  //    reserve governs it; e.g. tBTC collateral = 5% min bonus vs 1% on majors).
+  //    Conservative floor: minLiquidationBonusBps (just-past-threshold positions
+  //    liquidate at the min — verified on-chain 2026-09-03).
   const collPriceBase = usdPerBaseUnit(withdrawReserve);
-  const bonus = repayInfo.liquidationBonus || 0.01;
+  const bonus = Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000 || 0.01;
   const protocolFeePct = Number(withdrawReserve.state.config.protocolLiquidationFeePct ?? 0);
   const estCollateralBaseUnits = estimateCollateralForRepay({
     repayAmountBaseUnits,
@@ -333,20 +350,11 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   });
   if (estCollateralBaseUnits <= 0n) return { stage: "plan", passed: false, reason: "collateral estimate rounds to zero" , timings };
 
-  // 4. Quote the collateral → debt swap (single leg, like the incumbent).
+  // 4+5. Quote the collateral→debt swap AND derive/fetch the ATAs in PARALLEL —
+  //      KSwap (Kamino's official router, docs-blessed) serves quotes AND embeddable
+  //      swap instructions in ONE call; the three ATA state fetches are independent.
+  //      Jupiter quote+swap-instructions remains the fallback (2 sequential HTTP).
   done = mark("quote");
-  const quote = await fetchRawQuote({
-    inputMint: withdrawReserve.getLiquidityMint().toString(),
-    outputMint: repayReserve.getLiquidityMint().toString(),
-    amount: estCollateralBaseUnits.toString(),
-    slippageBps: input.slippageBps,
-  });
-  done();
-  if (!quote) return { stage: "plan", passed: false, reason: "collateral→debt route unquotable on Jupiter" , timings };
-  const swapOut = BigInt(quote.outAmount);
-  const swapOutMin = applySlippage(swapOut, input.slippageBps);
-
-  // 5. Assemble.
   const signer = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
 
   // ATAs: debt-liquidity (userSourceLiquidity + flash ATA), collateral-liquidity
@@ -372,12 +380,124 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       tokenProgram: withdrawReserve.getLiquidityTokenProgram(),
     }),
   );
-  const setupInstructions: Instruction[] = [];
-  const [debtAtaState, collAtaState, cTokenAtaState] = await Promise.all([
-    fetchTokenAccount(rpc, debtAta.toString()),
-    fetchTokenAccount(rpc, collAta.toString()),
-    fetchTokenAccount(rpc, cTokenAta.toString()),
+
+  interface SwapPlan {
+    swapInstructions: ExternalInstruction[];
+    lookupTables: Address[];
+    swapOut: bigint;
+    swapOutMin: bigint;
+    source: string;
+  }
+  // Primary: the Jupiter pair (measured ~165ms, +0.5% better price than KSwap).
+  // KSwap (Kamino's official router) is the FALLBACK — redundancy on the fire
+  // path: if Jupiter is down/slow mid-race we still quote via api.kamino.finance.
+  const buildJupiterPlan = async (): Promise<SwapPlan | null> => {
+    const quote = await fetchRawQuote({
+      inputMint: withdrawReserve.getLiquidityMint().toString(),
+      outputMint: repayReserve.getLiquidityMint().toString(),
+      amount: estCollateralBaseUnits.toString(),
+      slippageBps: input.slippageBps,
+    });
+    if (!quote) return null;
+    const plan = await fetchSwapInstructions(quote, signer.address.toString());
+    if (!plan) return null;
+    return {
+      swapInstructions: plan.swapInstructions,
+      lookupTables: plan.addressLookupTableAddresses.map((a: string) => address(a)),
+      swapOut: BigInt(quote.outAmount),
+      swapOutMin: applySlippage(BigInt(quote.outAmount), input.slippageBps),
+      source: "jupiter",
+    };
+  };
+  const buildKswapPlan = async (): Promise<SwapPlan | null> => {
+    const kswap = await fetchKswapRoutes({
+      rpcUrl: input.rpcUrl,
+      wsUrl: input.rpcUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:"),
+      tokenIn: withdrawReserve.getLiquidityMint(),
+      tokenOut: repayReserve.getLiquidityMint(),
+      amountBaseUnits: estCollateralBaseUnits,
+      slippageBps: input.slippageBps,
+      executor: signer.address,
+    });
+    if (!kswap?.best) return null;
+    return {
+      swapInstructions: kswap.best.swapInstructions.map((ix) => instructionToExternal(ix)),
+      lookupTables: kswap.best.lookupTableAddresses,
+      swapOut: kswap.best.amountOut,
+      swapOutMin: kswap.best.amountOutGuaranteed,
+      source: `kswap/${kswap.best.routerType}`,
+    };
+  };
+  // PRIMARY: the LOCAL Raydium CLMM quoter (phase 3) — zero HTTP on the fire path.
+  // Warm quote ~3-5ms vs Jupiter ~80-150ms; validated within 0.017% of Jupiter live
+  // and the instruction passes mainnet simulation. Falls back to Jupiter/KSwap when
+  // the pair has no CLMM pool or the cache is cold mid-race.
+  const buildLocalClmmPlan = async (): Promise<SwapPlan | null> => {
+    try {
+      const { getClmmQuoter, web3InstructionToExternal } = await import("./clmm.js");
+      const BNImport = (await import("bn.js")).default;
+      const { PublicKey } = await import("@solana/web3.js");
+      const quoter = getClmmQuoter(input.rpcUrl);
+      const tokenIn = new PublicKey(withdrawReserve.getLiquidityMint().toString());
+      const tokenOut = new PublicKey(repayReserve.getLiquidityMint().toString());
+      const amountIn = new BNImport(estCollateralBaseUnits.toString());
+      const quote = await quoter.quoteExactIn({ tokenIn, tokenOut, amountIn, slippageBps: input.slippageBps });
+      if (!quote || !quote.allTradeConfirmed()) return null;
+      const swap = await quoter.buildSwapInstruction({
+        tokenIn,
+        tokenOut,
+        ownerTokenIn: new PublicKey(collAta.toString()),
+        ownerTokenOut: new PublicKey(debtAta.toString()),
+        amountIn,
+        amountOutMin: new BNImport(quote.amountOutMinBigInt().toString()),
+        payer: new PublicKey(signer.address.toString()),
+      });
+      if (!swap) return null;
+      // Raydium's mainnet CLMM lookup table (pool/vault/tick-array accounts) —
+      // the CLMM swap ix is account-heavy; without ALT compression the tx busts
+      // the 1232-byte packet. The table is public and near-static.
+      const RAYDIUM_CLMM_ALT = "AcL1Vo8oy1ULiavEcjSUcwfBSForXMudcZvDZy5nzJkU";
+      return {
+        swapInstructions: [web3InstructionToExternal(swap.instruction)],
+        lookupTables: [address(RAYDIUM_CLMM_ALT)],
+        swapOut: quote.amountOutBigInt(),
+        swapOutMin: quote.amountOutMinBigInt(),
+        source: `clmm-local/${swap.poolId.toBase58().slice(0, 6)}`,
+      };
+    } catch {
+      return null;
+    }
+  };
+  done();
+  // Selection order: LOCAL CLMM (zero HTTP) → Jupiter (1 pair of HTTP) → KSwap.
+  // The CLMM plan races the Jupiter plan with a hard 350ms budget: warm CLMM
+  // (~3-5ms local math) always wins; a cold CLMM (pool discovery ~1s) forfeits to
+  // the already-parallel Jupiter plan instead of stalling the fire path.
+  const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | null> => {
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), ms));
+    return Promise.race([promise, timeout]);
+  };
+  const [clmmPlan, jupPlan, debtAtaState, collAtaState, cTokenAtaState] = await Promise.all([
+    withTimeout(buildLocalClmmPlan(), 350),
+    buildJupiterPlan().catch(() => null),
+    withBackoff(() => fetchTokenAccount(rpc, debtAta.toString()), "ata fetch"),
+    withBackoff(() => fetchTokenAccount(rpc, collAta.toString()), "ata fetch"),
+    withBackoff(() => fetchTokenAccount(rpc, cTokenAta.toString()), "ata fetch"),
   ]);
+  let swapPlan: SwapPlan | null = clmmPlan ?? jupPlan;
+  if (!swapPlan) {
+    done = mark("kswapFallback");
+    swapPlan = await buildKswapPlan().catch(() => null);
+    done();
+  }
+  if (!swapPlan) return { stage: "plan", passed: false, reason: "collateral→debt route unquotable (clmm+jupiter+kswap all failed)" , timings };
+  const activeSwapPlan: SwapPlan = swapPlan;
+  const swapOut = activeSwapPlan.swapOut;
+  const swapOutMin = activeSwapPlan.swapOutMin;
+  timings.swapSource = 0; // marker — see timingsMs source below
+  (timings as Record<string, unknown>).swapSource = activeSwapPlan.source;
+
+  const setupInstructions: Instruction[] = [];
   if (!debtAtaState) {
     setupInstructions.push(
       await createAtaInstruction({
@@ -435,8 +555,9 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   try {
     // scope-sdk v13 bundles its own kit v7 types; our kit 2.3 RPC is runtime-compatible
     // (verified on mainnet) — the cast bridges the brand-type gap.
-    const scope = new Scope("mainnet-beta", rpc as never);
-    const scopeConfigurations = await scope.getAllConfigurations();
+    // getAllConfigurations is served from the hot cache (governance-static map) —
+    // saves a sequential RPC round-trip on every fire.
+    const scopeConfigurations = await getCachedScopeConfigurations(rpc);
     const feedsInPlay = new Set(
       uniqueReserveAddresses
         .map((addr) => market.getReserveByAddress(address(addr))?.state.config.tokenInfo.scopeConfiguration.priceFeed)
@@ -445,9 +566,11 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     );
     for (const [configPubkey, config] of scopeConfigurations) {
       if (!feedsInPlay.has(String(config.oraclePrices))) continue;
+      const { Scope } = await import("@kamino-finance/scope-sdk");
+      const scope = new Scope("mainnet-beta", rpc as never);
       const tokenIds = [...new Set(getTokenIdsForScopeRefresh(market, uniqueReserveAddresses.map((a) => address(a))).get(address(String(config.oraclePrices))) ?? [])];
       if (!tokenIds.length) continue;
-      const refreshIx = await scope.refreshPriceListIx({ config: configPubkey }, tokenIds);
+      const refreshIx = await scope.refreshPriceListIx({ config: configPubkey as never }, tokenIds);
       if (refreshIx) preInstructions.push(refreshIx as Instruction);
     }
   } catch {
@@ -502,25 +625,30 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     market.programId,
   );
 
+  // Swap instructions from the chosen plan — deduped into the external-instruction
+  // shape the flash-loan builder expects. Applied per-plan (the size-guard fallback
+  // re-dedupes the Jupiter plan through the same helper).
   done = mark("swapIx");
-  const swapPlan = await fetchSwapInstructions(quote, signer.address.toString());
+  const fingerprint = (instruction: ExternalInstruction): string => `${instruction.programId}|${instruction.data}`;
+  const dedupeSwapIxs = (instructions: ExternalInstruction[]): ExternalInstruction[] => {
+    const out: ExternalInstruction[] = [];
+    for (const instruction of instructions) {
+      if (out.some((existing) => fingerprint(existing) === fingerprint(instruction))) continue;
+      out.push(instruction);
+    }
+    return out;
+  };
+  const merged = dedupeSwapIxs(activeSwapPlan.swapInstructions);
+  const budgetMerged: ExternalInstruction[] = [];
   done();
-  if (!swapPlan) return { stage: "assemble", passed: false, reason: "Jupiter swap-instructions unavailable" , timings };
-  const fingerprint = (instruction: { programId: string; data: string; accounts: Array<{ pubkey: string; isWritable: boolean }> }): string =>
-    `${instruction.programId}|${instruction.data}|${instruction.accounts.map((a) => `${a.pubkey}:${a.isWritable}`).join(",")}`;
-  const merged: typeof swapPlan.swapInstructions = [];
-  for (const instruction of [...swapPlan.swapInstructions]) {
-    if (merged.some((existing) => fingerprint(existing) === fingerprint(instruction))) continue;
-    merged.push(instruction);
-  }
-  const budgetMerged: typeof swapPlan.computeBudgetInstructions = [];
-  for (const instruction of [...swapPlan.computeBudgetInstructions]) {
-    const existingIndex = budgetMerged.findIndex(
-      (existing) => existing.programId === instruction.programId && existing.data.slice(0, 8) === instruction.data.slice(0, 8),
-    );
-    if (existingIndex >= 0) budgetMerged.splice(existingIndex, 1);
-    budgetMerged.push(instruction);
-  }
+
+  // CU LIMIT: the swap backend must always pin a compute-unit limit. Our chain is
+  // refresh×N + flash + liquidate + swap + repay (~15-25 ixs) — the node default
+  // (200k × ix-count, capped 1.4M) is unreliable; the docs' own builder pins
+  // extraComputeBudget=1_400_000. The re-sim pass below tightens this to the
+  // measured consumption +25%.
+  const cuLimitIx = getSetComputeUnitLimitInstruction({ units: 1_400_000 });
+  budgetMerged.unshift(instructionToExternal(cuLimitIx));
 
   // FASTLANE: bid the block space. Replaces/sets the CU price ix so the tx
   // outbids base-fee traffic in the race for the next block. Jupiter's own
@@ -548,33 +676,64 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //   RefreshPriceList → RefreshReserve(debt) → RefreshReserve(coll) → RefreshObligation
   //   → FlashBorrow(debt) → RefreshReserve(debt AGAIN — clears flash's mark_stale)
   //   → Liquidate → Swap → FlashRepay
-  const strategy = externalInstructionsToStrategy(
-    [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...merged],
-    budgetMerged,
-    signer,
-  );
+  // (the chain is assembled per-swap-plan inside buildSwapChain below)
 
   done = mark("assemble");
-  const build = await buildFlashLoan({
-    market,
-    reserve: repayReserve,
-    signer,
-    tokenAccount,
-    amountBaseUnits: repayAmountBaseUnits,
-    strategy: {
-      ...strategy,
-      preInstructions: [...preInstructions, refreshObligationIx, ...strategy.preInstructions],
-    },
-    setupInstructions,
-  });
+  const buildSwapChain = (plan: SwapPlan) =>
+    buildFlashLoan({
+      market,
+      reserve: repayReserve,
+      signer,
+      tokenAccount,
+      amountBaseUnits: repayAmountBaseUnits,
+      strategy: {
+        ...externalInstructionsToStrategy(
+          [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...plan.swapInstructions],
+          budgetMerged,
+          signer,
+        ),
+        preInstructions: [...preInstructions, refreshObligationIx],
+      },
+      setupInstructions,
+    });
+  const build = await buildSwapChain(activeSwapPlan);
 
-  const transaction = await createSignedTransactionWithAlt(
+  const buildPlanWithSizeGuard = async (plan: SwapPlan, fallbackPlan: SwapPlan | null): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; plan: SwapPlan; txTooLarge: boolean }> => {
+    const built = await buildSwapChain(plan);
+    const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]).catch(() => null);
+    const wire = tx ? Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length : Number.POSITIVE_INFINITY;
+    if (wire > 1232) return { build: built, plan, txTooLarge: true };
+    return { build: built, plan, txTooLarge: false };
+  };
+
+  // CLMM-first with a size guard: the CLMM swap ix is account-heavy; when the pair's
+  // pool accounts aren't covered by Raydium's ALT the packet busts 1232B. In that
+  // case fall back to the (already-fetched) Jupiter plan instead of losing the fire.
+  let chosenPlan = activeSwapPlan;
+  let buildFinal = build;
+  if (activeSwapPlan.source.startsWith("clmm-local") && jupPlan) {
+    const guarded = await buildPlanWithSizeGuard(activeSwapPlan, jupPlan);
+    if (guarded.txTooLarge) {
+      const fallbackBuild = await buildSwapChain(jupPlan);
+      buildFinal = fallbackBuild;
+      chosenPlan = jupPlan;
+      timings.swapFallback = 0;
+      (timings as Record<string, unknown>).swapFallback = "clmm→jupiter (packet)";
+    } else {
+      buildFinal = guarded.build;
+    }
+  }
+  const activePlan = chosenPlan;
+  const activeSwapOut = activePlan === activeSwapPlan ? swapOut : activePlan.swapOut;
+  const activeSwapOutMin = activePlan === activeSwapPlan ? swapOutMin : activePlan.swapOutMin;
+
+  const transaction = await createSignedTransactionWithAltCached(
     rpc,
     input.rpcUrl,
     signer,
-    build.instructions,
+    buildFinal.instructions,
     [
-      ...swapPlan.addressLookupTableAddresses.map((a) => address(a)),
+      ...activePlan.lookupTables,
       ...(input.lookupTableAddresses ?? []),
     ],
   );
@@ -583,7 +742,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
 
   // Simulate.
   done = mark("simulate");
-  const simulation = await simulate(rpc, transaction);
+  const simulation = await withBackoff(() => simulate(rpc, transaction), "simulate");
   done();
   const logs = simulation.value?.logs ?? [];
   const simErr = simulation.value?.err;
@@ -607,28 +766,30 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     const cuLimit = consumedUnits + (consumedUnits >> 2n); // +25%
     const cuLimitIx = getSetComputeUnitLimitInstruction({ units: Number(cuLimit) });
     const pinnedBudget = [...budgetMerged, instructionToExternal(cuLimitIx)];
-    const pinnedStrategy = externalInstructionsToStrategy(
-      [instructionToExternal(refreshObligationIx), instructionToExternal(liquidationIx), ...merged],
-      pinnedBudget,
-      signer,
-    );
     const pinnedBuild = await buildFlashLoan({
       market,
       reserve: repayReserve,
       signer,
       tokenAccount,
       amountBaseUnits: repayAmountBaseUnits,
-      strategy: { ...pinnedStrategy, preInstructions: [...preInstructions, ...pinnedStrategy.preInstructions] },
+      strategy: {
+        ...externalInstructionsToStrategy(
+          [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...dedupeSwapIxs(activePlan.swapInstructions)],
+          pinnedBudget,
+          signer,
+        ),
+        preInstructions: [...preInstructions, refreshObligationIx],
+      },
       setupInstructions,
     }).catch(() => null);
     if (pinnedBuild) {
-      const pinnedTx = await createSignedTransactionWithAlt(
+      const pinnedTx = await createSignedTransactionWithAltCached(
         rpc,
         input.rpcUrl,
         signer,
         pinnedBuild.instructions,
         [
-          ...swapPlan.addressLookupTableAddresses.map((a) => address(a)),
+          ...activeSwapPlan.lookupTables,
           ...(input.lookupTableAddresses ?? []),
         ],
       );
@@ -649,9 +810,9 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   }
 
   // Guards: worst-case net profit (swap min-out − repay − flash fee) ≥ floor.
-  const feeBaseUnits = build.feeBaseUnits;
-  const netBaseUnits = swapOutMin - repayAmountBaseUnits - feeBaseUnits;
-  const quotedNetBaseUnits = swapOut - repayAmountBaseUnits - feeBaseUnits;
+  const feeBaseUnits = buildFinal.feeBaseUnits;
+  const netBaseUnits = activeSwapOutMin - repayAmountBaseUnits - feeBaseUnits;
+  const quotedNetBaseUnits = activeSwapOut - repayAmountBaseUnits - feeBaseUnits;
   const usdPerDebtUnit = Number(debtPriceBase.toFixed(12));
   const worstCaseProfitUsd = (Number(netBaseUnits) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnit;
   const quotedProfitUsd = (Number(quotedNetBaseUnits) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnit;
@@ -678,11 +839,12 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       estCollateralUsd: Number(new Decimal(estCollateralBaseUnits.toString()).mul(collPriceBase).toFixed(4)),
       quotedProfitUsd,
       worstCaseProfitUsd,
+      ...(activePlan.source ? { swapSource: activePlan.source } : {}),
     },
     transaction: finalTransaction,
     signer,
     computeUnitsConsumed: consumedUnits,
-    instructions: build.instructions.length,
+    instructions: buildFinal.instructions.length,
     timings,
     priorityLane: priority.lane,
     tipUsd: priority.tipUsd,

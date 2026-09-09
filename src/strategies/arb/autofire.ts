@@ -43,6 +43,8 @@ export interface AutofireOptions {
   slippageBps: number;
   /** Minimum worst-case profit in USD to fire. */
   minProfitUsd: number;
+  /** Minimum estimated prize before spending any RPC (dust firewall). */
+  minPrizeUsd?: number;
   /** Seconds between polls when no opportunity is present. */
   intervalSec: number;
   /** Seconds to wait after a fired tx before re-arming (let the market settle). */

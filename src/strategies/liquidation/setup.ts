@@ -16,6 +16,7 @@ export async function liquidationAltKeys(input: {
   market: KaminoMarket;
   reserves: KaminoReserve[];
   authority: Address;
+  rpcUrl: string;
 }): Promise<Address[]> {
   const { market, reserves, authority } = input;
   const keys = new Map<string, Address>();
@@ -62,6 +63,28 @@ export async function liquidationAltKeys(input: {
       }),
     );
   }
+
+  // Phase-3: CLMM pool accounts for the hot collateral↔debt mint pairs —
+  // the local-CLMM swap backend's instructions compress against OUR ALT so
+  // the liquidation tx stays inside the 1232-byte packet. Tick arrays drift
+  // with price; the executor's size guard falls back to Jupiter when the
+  // pool moves beyond the cached arrays, so staleness never breaks a fire.
+  try {
+    const inputMints = new Set(reserves.map((r) => r.getLiquidityMint().toString()));
+    const { clmmAltKeys } = await import("./clmm.js");
+    // Every unordered reserve-mint pair (the pool PDA normalizes order).
+    const mintList = [...inputMints];
+    const pairs: Array<{ mintA: string; mintB: string }> = [];
+    for (let i = 0; i < mintList.length; i++) {
+      for (let j = i + 1; j < mintList.length; j++) pairs.push({ mintA: mintList[i]!, mintB: mintList[j]! });
+    }
+    if (pairs.length) {
+      const clmmKeys = await clmmAltKeys(input.rpcUrl, pairs.slice(0, 21));
+      for (const key of clmmKeys) put(key);
+    }
+  } catch {
+    // CLMM keys are best-effort — klend-side ALT coverage is what's critical.
+  }
   return [...keys.values()];
 }
 
@@ -95,6 +118,8 @@ export async function buildLiquidationSetup(input: {
   market: KaminoMarket;
   reserves: KaminoReserve[];
   signer: TransactionSigner;
+  /** The rpc ENDPOINT STRING (kit Rpc.url is a function — unusable as string). */
+  rpcUrl: string;
   /** Existing ALT to extend instead of creating a new one. */
   existingLookupTable?: Address;
   /** Keys already in the ALT (skip re-appending them). */
@@ -144,7 +169,7 @@ export async function buildLiquidationSetup(input: {
 
   // Tx 2..n: extend the ALT in small chunks. An ALT cannot hold duplicate keys,
   // so skip anything already present when reusing.
-  const keys = await liquidationAltKeys({ market, reserves, authority: signer.address });
+  const keys = await liquidationAltKeys({ market, reserves, authority: signer.address, rpcUrl: input.rpcUrl });
   const existing = new Set((input.existingKeys ?? []).map((a) => a.toString()));
   const toAdd = keys.filter((k) => !existing.has(k.toString()));
   const CHUNK = 20;

@@ -44,7 +44,7 @@ export function isRateLimitError(error: unknown): boolean {
   return false;
 }
 
-async function withBackoff<T>(operation: () => Promise<T>, label: string): Promise<T> {
+export async function withBackoff<T>(operation: () => Promise<T>, label: string): Promise<T> {
   let delay = 1_000;
   for (let attempt = 1; ; attempt += 1) {
     try {
@@ -172,10 +172,74 @@ export interface PreloadedMarket {
 
 const MARKET_CACHE_TTL_MS = 60_000;
 
+// Single-flight: every caller (scan cycle, hot tick, executeDue, executeLiquidationOnce)
+// hits preloadMarket whenever the 60s cache is stale; without dedup those concurrent loads
+// each fire their own loadMarket (~dozens of RPC calls) and self-inflict 429 storms on the
+// shared Helius key. Track one in-flight promise per (rpc, market) so N callers share it.
+const preloadInFlight = new Map<string, Promise<PreloadedMarket>>();
+const preloadCache = new Map<string, PreloadedMarket>();
+
+// Single-flight getCurrentLedgerInstant too: every hot tick and every executor refresh
+// fetches it; when the key throttles each caller previously spawned its OWN backoff chain
+// (the duplicated "hot ledger instant attempt N" lines). Callers share one in-flight fetch.
+const ledgerInstantInFlight = new Map<string, Promise<Awaited<ReturnType<typeof getCurrentLedgerInstant>>>>();
+let ledgerInstantLast = { at: 0, value: undefined as Awaited<ReturnType<typeof getCurrentLedgerInstant>> | undefined };
+
+async function fetchLedgerInstant(rpc: Rpc<SolanaRpcApi>, label: string): Promise<Awaited<ReturnType<typeof getCurrentLedgerInstant>>> {
+  const now = Date.now();
+  if (ledgerInstantLast.value && now - ledgerInstantLast.at < 500) return ledgerInstantLast.value;
+  const endpoint = (rpc as unknown as { url?: string } | null)?.url ?? "rpc";
+  const inFlight = ledgerInstantInFlight.get(endpoint);
+  if (inFlight) {
+    try {
+      const value = await inFlight;
+      if (value && now - ledgerInstantLast.at > 5000) ledgerInstantLast = { at: Date.now(), value };
+      return value;
+    } catch {
+      // a failed shared fetch must not poison followers — fall through to our own attempt
+    }
+  }
+  const promise = (async () => {
+    try {
+      const value = await withBackoff(() => getCurrentLedgerInstant(rpc), label);
+      ledgerInstantLast = { at: Date.now(), value };
+      return value;
+    } finally {
+      ledgerInstantInFlight.delete(endpoint);
+    }
+  })();
+  ledgerInstantInFlight.set(endpoint, promise);
+  return promise;
+}
+
+function preloadKey(rpc: Rpc<SolanaRpcApi>, marketAddress: string): string {
+  const endpoint = (rpc as unknown as { url?: string } | null)?.url
+    ?? (rpc as unknown as { constructor?: { name?: string } })?.constructor?.name
+    ?? "rpc";
+  return `${endpoint}|${marketAddress}`;
+}
+
 export async function preloadMarket(rpc: Rpc<SolanaRpcApi>, marketAddress: string): Promise<PreloadedMarket> {
-  const { loadMarket } = await import("../../kamino.js");
-  const market = await withBackoff(() => loadMarket(rpc, marketAddress), "market load");
-  return { market, marketAddress, marketReserves: buildMarketReserveMap(market), loadedAt: Date.now() };
+  const key = preloadKey(rpc, marketAddress);
+  const fresh = preloadCache.get(key);
+  if (fresh && Date.now() - fresh.loadedAt < MARKET_CACHE_TTL_MS) return fresh;
+
+  const inFlight = preloadInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const promise = (async () => {
+    try {
+      const { loadMarket } = await import("../../kamino.js");
+      const market = await withBackoff(() => loadMarket(rpc, marketAddress), "market load");
+      const loaded: PreloadedMarket = { market, marketAddress, marketReserves: buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100), loadedAt: Date.now() };
+      preloadCache.set(key, loaded);
+      return loaded;
+    } finally {
+      preloadInFlight.delete(key);
+    }
+  })();
+  preloadInFlight.set(key, promise);
+  return promise;
 }
 
 export async function scanOnce(params: ScreenerDeps & {
@@ -201,7 +265,7 @@ export async function scanOnce(params: ScreenerDeps & {
     .filter((entry) => adlPubkeys.has(entry.pubkey.toString()) || sliceNeedsHydration(entry, effectiveOptions))
     .sort((a, b) => healthFactorFromSf(a.debtSf, a.unhealthySf) - healthFactorFromSf(b.debtSf, b.unhealthySf));
 
-  const ledgerInstant = await withBackoff(() => getCurrentLedgerInstant(rpc), "ledger instant");
+  const ledgerInstant = await fetchLedgerInstant(rpc, "ledger instant");
   const hydrated = await hydrateShortlist({
     rpc,
     market,
@@ -210,7 +274,14 @@ export async function scanOnce(params: ScreenerDeps & {
     onProgress: params.onProgress ?? (() => {}),
   });
 
-  const { candidates, nearMiss, skipped } = filterLiquidatable(hydrated, marketReserves, effectiveOptions);
+  // Pass the program's stored scaled-factor health through for DUE gating (see filters.ts).
+  const storedHealthByPubkey = new Map<string, number>();
+  for (const entry of snapshot) {
+    const health = healthFactorFromSf(entry.debtSf, entry.unhealthySf);
+    storedHealthByPubkey.set(entry.pubkey.toString(), health);
+  }
+
+  const { candidates, nearMiss, skipped } = filterLiquidatable(hydrated, marketReserves, effectiveOptions, undefined, storedHealthByPubkey);
 
   // ADL-marked candidates: hydrated full detail, enriched with target LTV / margin-call age
   const hydratedByAddress = new Map(hydrated.map((o) => [o.obligationAddress.toString(), o]));
@@ -259,16 +330,18 @@ export async function scanOnce(params: ScreenerDeps & {
  * Fast targeted refresh for the hot watch: hydrates only the given obligation
  * addresses with fresh oracles and converts them to candidates (health, debt,
  * collateral). Returns [] when nothing is tracked. Skips non-vanilla obligations.
+ * The raw hydrated KaminoObligation objects (keyed by address) come back alongside
+ * the candidates so the executor can skip its duplicate hydrate RPC.
  */
 export async function refreshTrackedObligations(params: {
   rpc: Rpc<SolanaRpcApi>;
   preloaded: PreloadedMarket;
   pubkeys: Address[];
-}): Promise<LiquidatableCandidate[]> {
+}): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation> }> {
   const { rpc, preloaded, pubkeys } = params;
-  if (!pubkeys.length) return [];
+  if (!pubkeys.length) return { candidates: [], obligations: new Map() };
   const market = freshPreloaded(preloaded) ? preloaded.market : (await preloadMarket(rpc, preloaded.marketAddress)).market;
-  const ledgerInstant = await withBackoff(() => getCurrentLedgerInstant(rpc), "hot ledger instant");
+  const ledgerInstant = await fetchLedgerInstant(rpc, "hot ledger instant");
   const hydrated = await hydrateShortlist({
     rpc,
     market,
@@ -276,8 +349,9 @@ export async function refreshTrackedObligations(params: {
     pubkeys,
     onProgress: () => {},
   });
-  return hydrated
-    .filter((obligation) => obligation.obligationTag === 0)
+  const vanilla = hydrated.filter((obligation) => obligation.obligationTag === 0);
+  const obligations = new Map(vanilla.map((obligation) => [obligation.obligationAddress.toString(), obligation]));
+  const candidates = vanilla
     .map((obligation) => {
       try {
         return obligationToCandidate(obligation, preloaded.marketReserves);
@@ -286,6 +360,7 @@ export async function refreshTrackedObligations(params: {
       }
     })
     .filter((candidate): candidate is LiquidatableCandidate => candidate !== null);
+  return { candidates, obligations };
 }
 
 export function freshPreloaded(preloaded: PreloadedMarket | undefined): boolean {

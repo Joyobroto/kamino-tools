@@ -32,7 +32,7 @@ import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
 import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
 import { buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
 import { getAccountsInLut } from "@kamino-finance/klend-sdk";
-import type { KaminoReserve } from "@kamino-finance/klend-sdk";
+import type { KaminoObligation, KaminoReserve } from "@kamino-finance/klend-sdk";
 import type { ScanEvent, ScanResult, LiquidatableCandidate, AdlCandidate } from "./strategies/liquidation/types.js";
 import { type ScanOptions as LiquidationScanConfig } from "./strategies/liquidation/types.js";
 import {
@@ -105,6 +105,7 @@ interface ScanOptions {
   execute: boolean;
   broadcast: boolean;
   minProfit: string;
+  minPrize: string;
   slippageBps: string;
   maxAttemptsPerDay: string;
   maxLossPerDay: string;
@@ -175,7 +176,12 @@ function printScanPanel(cycle: number, result: ScanResult, scanNearMissBand: num
 
   if (liquidatable.length) {
     console.log(color.bold(color.red(`⚡ DUE FOR LIQUIDATION: ${liquidatable.length}`)));
-    liquidatable.forEach((candidate, index) => console.log(printCandidateLine(candidate, color.red(`[${index + 1}]`))));
+    // Cap the panel — in a dust/spray market dozens of ~$0.50 positions sit DUE every
+    // scan; printing all of them floods the log while adding nothing (the near-miss panel
+    // already caps at 10). Show the biggest prizes first + a truncation line.
+    const sorted = [...liquidatable].sort((a, b) => (b.estimatedProfitUsd ?? 0) - (a.estimatedProfitUsd ?? 0));
+    sorted.slice(0, 15).forEach((candidate, index) => console.log(printCandidateLine(candidate, color.red(`[${index + 1}]`))));
+    if (liquidatable.length > 15) console.log(color.dim(`  … and ${liquidatable.length - 15} more`));
   } else {
     console.log(color.dim("DUE=0"));
   }
@@ -575,6 +581,7 @@ program
   .option("--execute", "arm the in-process executor: DUE positions spotted by this scan (or the hot loop) are attempted immediately (shadow unless --broadcast)", false)
   .option("--broadcast", "actually send liquidation transactions (default: shadow — plan+simulate only)", false)
   .option("--min-profit <usd>", "minimum worst-case net profit in USD for the executor to fire (close factor 10% makes plays smaller)", "0.05")
+  .option("--min-prize <usd>", "minimum estimated prize (candidate.estimatedProfitUsd) before the executor spends ANY RPC — skips dust positions that sit DUE every scan", "1.00")
   .option("--slippage-bps <n>", "slippage tolerance on the executor's collateral→debt swap", "50")
   .option("--max-attempts-per-day <n>", "executor broadcast attempt budget (rolling day)", "12")
   .option("--max-loss-per-day <usd>", "executor fee-burn budget per rolling day", "1.5")
@@ -624,14 +631,47 @@ program
       slippageBps: Number(options.slippageBps),
       minProfitUsd: Number(options.minProfit),
       intervalSec: Math.max(1, Number(options.interval)),
-      cooldownSec: 30,
+      // Global pacing disabled (burst policy, 2026-09-09): the per-obligation
+      // 30s cooldown + daily caps below already bind; a global cooldown would
+      // hold fires 2..N of a same-slot DUE burst while LionX takes them all.
+      cooldownSec: 0,
       maxAttemptsPerDay: Number(options.maxAttemptsPerDay),
       maxLossPerDayUsd: Number(options.maxLossPerDay),
       ledgerPath: options.ledger,
       stopFilePath: options.stopFile,
+      // Prize firewall: skip sub-USD dust before spending any RPC (surge dust-spray
+      // keeps ~40 tiny positions DUE — every one was previously charged a full
+      // assemble pipeline. Big prizes are unaffected; only the $0.50 noise dies.)
+      minPrizeUsd: Number(options.minPrize),
     };
     const executorCooldownMs = 30_000;
     const executorRecentlyTried = new Map<string, number>();
+    // Bounded-concurrency fire lanes: LionX's census shows they fire PARALLEL txs
+    // (3 liquidations in the same slot, one per obligation). A strict FIFO would
+    // serialize a same-slot burst — the 3rd fire waits ~2 fire-lengths and loses.
+    // MAX_FIRE_LANES keeps ≤3 pipelines in flight: parallel enough to match a
+    // same-slot burst, bounded enough to never re-trigger the 429 storm that
+    // unbounded spawning caused (each pipeline is ~10 RPC calls on the shared
+    // key). Guards/budget caps are evaluated INSIDE each lane, so the caps bind
+    // exactly the same; ledger writes are single-line JSONL appends.
+    const MAX_FIRE_LANES = 3;
+    const fireLanes = new Set<Promise<void>>();
+    const fireWaiters: Array<() => void> = [];
+    const acquireLane = (): Promise<void> | null =>
+      fireLanes.size < MAX_FIRE_LANES ? Promise.resolve() : new Promise<void>((resolve) => fireWaiters.push(resolve));
+    const enqueueFire = (run: () => Promise<void>): void => {
+      const startLane = () => {
+        const lane = run().finally(() => {
+          fireLanes.delete(lane);
+          const next = fireWaiters.shift();
+          if (next) next();
+        });
+        fireLanes.add(lane);
+      };
+      const slot = acquireLane();
+      if (slot) void slot.then(startLane);
+      else startLane();
+    };
     const executorBusy = new Set<string>();
     // Runtime stats for the heartbeat alert — the post-mortem data when things
     // don't work as expected (how many DUE we saw, tried, fired, and lost).
@@ -652,7 +692,7 @@ program
     const NO_ROUTE_COOLDOWN_MS = 10 * 60_000;
     const BLOCKLIST_AFTER = 3;
     const executorFailStreak = new Map<string, number>();
-    const executeDue = (obligation: string): void => {
+    const executeDue = (obligation: string, opts: { bypassHealth?: boolean } = {}): void => {
       if (!options.execute || !executeMarket) return;
       if (executorBlocklist.has(obligation)) return;
       const noRoute = executorNoRouteUntil.get(obligation) ?? 0;
@@ -662,7 +702,9 @@ program
       if (Date.now() - last < executorCooldownMs) return;
       executorRecentlyTried.set(obligation, Date.now());
       executorBusy.add(obligation);
-      void (async () => {
+      // Bounded fire lane: up to MAX_FIRE_LANES pipelines run in PARALLEL (the
+      // LionX same-slot burst shape); extras queue until a lane frees.
+      enqueueFire(async () => {
         try {
           const guards = evaluateFireGuards(executorAutoOptions, loadLedger(executorAutoOptions.ledgerPath), Date.now(), existsSync(executorAutoOptions.stopFilePath));
           if (!guards.allowed) {
@@ -673,8 +715,8 @@ program
             return;
           }
           executorStats.dueAttempted++;
-          let hydrated: Awaited<ReturnType<typeof refreshTrackedObligations>> = [];
-          for (let tryIndex = 0; tryIndex < 3 && !hydrated.length; tryIndex++) {
+          let hydrated: Awaited<ReturnType<typeof refreshTrackedObligations>> = { candidates: [], obligations: new Map() };
+          for (let tryIndex = 0; tryIndex < 3 && !hydrated.candidates.length; tryIndex++) {
             try {
               hydrated = await refreshTrackedObligations({ rpc: rpcClient(options.rpc), preloaded: preloaded!, pubkeys: [address(obligation)] });
             } catch {
@@ -682,12 +724,23 @@ program
               await new Promise((resolve) => setTimeout(resolve, 750 * (tryIndex + 1)));
             }
           }
-          const candidate = hydrated[0];
-          if (!candidate || candidate.healthFactor >= 1) return;
+          const candidate = hydrated.candidates[0];
+          if (!candidate) return;
+          // The live recompute health from THIS seconds-fresh hydration is the same math
+          // the program runs at liquidation — the arbiter for every rail (WS slice,
+          // tracker, scan). The tx refreshes on-chain anyway; simulate() re-checks too.
+          if (candidate.healthFactor >= 1) return;
           // (position-age guard: hydration above IS the freshness guarantee — the
           // candidate data was fetched seconds ago, never stale cached state)
           // The prize drives the FASTLANE bid (auto mode) — worst-case profit on the table.
           const prizeUsd = Math.max(0, candidate.estimatedProfitUsd ?? 0);
+          // Dust firewall: a ~$0.50 dust-spray cohort sits DUE every single scan; every one
+          // used to charge the full quote→simulate→broadcast pipeline. Below the threshold
+          // we stop here (post-hydration) — zero assemble RPC, zero chance of a 429 chain.
+          if (prizeUsd < (executorAutoOptions.minPrizeUsd ?? 1.0)) {
+            executorFailStreak.delete(obligation);
+            return;
+          }
           const runExecutor = () =>
             executeLiquidationOnce({
               rpc: rpcClient(options.rpc),
@@ -698,12 +751,22 @@ program
               minProfitUsd: executorAutoOptions.minProfitUsd,
               ...(executorAltState ? { lookupTableAddresses: [address(executorAltState.lookupTable)] } : {}),
               ...(options.fast ? { fast: true } : {}),
-              ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd }),
+              ...(hydrated.obligations.get(obligation) ? { prehydratedObligation: hydrated.obligations.get(obligation) as KaminoObligation } : {}),
+              ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd, bypassHealth: opts.bypassHealth ?? false }),
             }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
           let outcome = await runExecutor();
           if (!outcome.passed && /ReserveStale|6009|price_status/.test(outcome.reason)) {
             if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] executor: ${obligation.slice(0, 8)}… reserve stale (EMA window tail) — retrying in 15s`));
             await new Promise((resolve) => setTimeout(resolve, 15_000));
+            outcome = await runExecutor();
+          }
+          // Transient RPC throttling on the shared key: one pause-then-retry, and never
+          // count it toward the structural-failure streak (a 429 is not a property of the
+          // obligation — blocklisting a healthy DUE target because the RPC hiccuped would
+          // be fatal).
+          if (!outcome.passed && /8100002|429|too many|rate.?limit/i.test(outcome.reason)) {
+            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] executor: ${obligation.slice(0, 8)}… RPC throttled (429) — retrying in 8s`));
+            await new Promise((resolve) => setTimeout(resolve, 8_000));
             outcome = await runExecutor();
           }
           if (!outcome.passed) {
@@ -728,6 +791,12 @@ program
               executorNoRouteUntil.set(obligation, Date.now() + NO_ROUTE_COOLDOWN_MS);
               return;
             }
+            // RPC throttling (429 / 8100002): transient infra noise, never a structural
+            // property of the obligation — clear the streak and let cooldown pace retries.
+            if (/8100002|429|too many|rate.?limit/i.test(outcome.reason)) {
+              executorFailStreak.delete(obligation);
+              return;
+            }
             // Structural failures: after a streak, blocklist so it never burns budget again.
             const streak = (executorFailStreak.get(obligation) ?? 0) + 1;
             executorFailStreak.set(obligation, streak);
@@ -743,9 +812,10 @@ program
             withdraw: outcome.plan.withdrawReserveSymbol,
             quoted: outcome.plan.quotedProfitUsd.toFixed(4),
             worst: outcome.plan.worstCaseProfitUsd.toFixed(4),
+            ...(outcome.plan.swapSource ? { swap: outcome.plan.swapSource } : {}),
           };
           if (options.json) console.log(safeJsonStringify({ executable: { ...line, shadow: !options.broadcast } }));
-          else console.log(color.bold(color.green(`⚡ EXECUTABLE ${obligation.slice(0, 8)}…`)) + `  repay ${line.repay} → ${line.withdraw}  quoted $${line.quoted} worst $${line.worst}  ${options.broadcast ? "FIRING" : "SHADOW"}`);
+          else console.log(color.bold(color.green(`⚡ EXECUTABLE ${obligation.slice(0, 8)}…`)) + `  repay ${line.repay} → ${line.withdraw}  quoted $${line.quoted} worst $${line.worst}  swap ${line.swap ?? "?"}  ${options.broadcast ? "FIRING" : "SHADOW"}`);
           alerter.push(dueAttemptAlert({
             obligation: obligation.slice(0, 12),
             health: outcome.plan.healthFactor,
@@ -778,7 +848,7 @@ program
         } finally {
           executorBusy.delete(obligation);
         }
-      })();
+      });
     };
 
     const emitTrackerEvents = (events: TrackerEvent[]) => {
@@ -817,18 +887,28 @@ program
 
     let adaptiveBand = scanConfig.healthWatch;
     let surgeActive = false;
+    let hotTickRunning = false;
 
     const hotTick = async () => {
-      if (!preloaded) return;
-      const hotAddresses = tracker.hotObligations();
-      if (!hotAddresses.length) return;
-      const updates = await refreshTrackedObligations({
-        rpc: rpcClient(options.rpc),
-        preloaded,
-        pubkeys: hotAddresses.map((value) => address(value)),
-      });
-      const events = tracker.applyHotUpdate(updates, new Date().toISOString());
-      if (events.length) emitTrackerEvents(events);
+      // Never overlap: while one hot tick is mid-backoff (the shared key throttled), a
+      // second tick starting at its 10s cadence would spawn a parallel RPC chain and
+      // double the load — serially re-arm only after the previous tick settled.
+      if (hotTickRunning) return;
+      hotTickRunning = true;
+      try {
+        if (!preloaded) return;
+        const hotAddresses = tracker.hotObligations();
+        if (!hotAddresses.length) return;
+        const updates = await refreshTrackedObligations({
+          rpc: rpcClient(options.rpc),
+          preloaded,
+          pubkeys: hotAddresses.map((value) => address(value)),
+        });
+        const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString());
+        if (events.length) emitTrackerEvents(events);
+      } finally {
+        hotTickRunning = false;
+      }
     };
 
     const printTrace = (cycle: number, result: ScanResult) => {
@@ -880,6 +960,40 @@ program
       // Feed the hot tracker: full scan acts as ground truth for tracked DUE positions
       const absorbEvents = tracker.absorb([...result.liquidatable, ...result.nearMiss], result.scannedAt);
       if (absorbEvents.length) emitTrackerEvents(absorbEvents);
+      // Phase-3: keep the LOCAL CLMM quoter warm for every pair the DUE + near-miss
+      // cohorts actually reference (their largest-debt reserve + collateral reserves).
+      // Warm quotes are ~3-5ms local math — the fire path then skips Jupiter HTTP.
+      if (executeMarket) {
+        const { getClmmQuoter } = await import("./strategies/liquidation/clmm.js");
+        const { PublicKey } = await import("@solana/web3.js");
+        const quoter = getClmmQuoter(options.rpc);
+        // symbol → liquidity mint (the market's own reserve map)
+        const mintBySymbol = new Map<string, string>();
+        for (const reserve of executeMarket.getReserves()) {
+          mintBySymbol.set(reserve.getTokenSymbol(), reserve.getLiquidityMint().toString());
+        }
+        mintBySymbol.set("WSOL", "So11111111111111111111111111111111111111112");
+        const pairs = new Set<string>();
+        for (const candidate of [...result.liquidatable, ...result.nearMiss]) {
+          const debtMint = mintBySymbol.get(candidate.largestDebt.symbol);
+          if (!debtMint) continue;
+          for (const symbol of candidate.collateralSymbols) {
+            const collMint = mintBySymbol.get(symbol);
+            if (!collMint || collMint === debtMint) continue;
+            const key = [collMint, debtMint].sort().join("|");
+            if (pairs.has(key)) continue;
+            pairs.add(key);
+            quoter.keepWarm(new PublicKey(collMint), new PublicKey(debtMint));
+          }
+        }
+        if (pairs.size) {
+          const { getClmmQuoter } = await import("./strategies/liquidation/clmm.js");
+          const quoter = getClmmQuoter(options.rpc);
+          void quoter.loadAllWarm().then((ok) => {
+            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] clmm quoter warm: ${ok}/${pairs.size} pairs`));
+          });
+        }
+      }
       // Adaptive surge widening: DUE presence widens the watch band so the next full
       // scan hydrates positions further from the line before they cross; calm clears it.
       const dueCount = result.liquidatable.length;
@@ -978,6 +1092,10 @@ program
           if (Date.now() - lastLogged < 30_000) return;
           wsLogged.set(obligation, Date.now());
           console.log(`${color.bold(color.red("⚡ WS DUE"))} ${shortAddress(obligation)}  health ${slice.cachedHealth.toFixed(4)}`);
+          // The WS slice's stored-sf ratio is the health at the moment the program last
+          // wrote the account — a low-latency TRIGGER, not proof. Prices move between that
+          // write and our fire: executeDue re-hydrates fresh and its live gate (matching
+          // the program's liquidation check) arbitrates, so we never bypass it.
           executeDue(obligation);
         },
         onReady: () => {
@@ -1038,6 +1156,7 @@ program
       market,
       reserves,
       signer,
+      rpcUrl: options.rpc,
       ...(reuseAlt ? { existingLookupTable: reuseAlt } : {}),
       ...(existingKeys?.length ? { existingKeys: existingKeys.map((k: string) => address(k)) } : {}),
     });
@@ -1093,11 +1212,23 @@ program
     if (!outcome.passed) {
       console.log(color.yellow(`${outcome.stage}: ${outcome.reason}`));
       if (outcome.stage === "simulate") (outcome as { logs?: string[] }).logs?.forEach((line) => console.log(color.dim(line)));
+      const timings = (outcome as { timings?: Record<string, number> }).timings;
+      if (timings && Object.keys(timings).length) {
+        const parts = Object.entries(timings).map(([k, v]) => `${k}=${v}ms`).join("  ");
+        const total = Object.values(timings).reduce((a, b) => a + b, 0);
+        console.log(color.dim(`⏱ ${parts}  total=${total}ms`));
+      }
       process.exitCode = 1;
       return;
     }
     console.log(color.bold(color.green("✔ SIMULATION PASSED")));
     console.log(safeJsonStringify(outcome.plan));
+    const timings = (outcome as { timings?: Record<string, number> }).timings;
+    if (timings && Object.keys(timings).length) {
+      const parts = Object.entries(timings).map(([k, v]) => `${k}=${v}ms`).join("  ");
+      const total = Object.values(timings).reduce((a, b) => a + b, 0);
+      console.log(color.dim(`⏱ ${parts}  total=${total}ms`));
+    }
     if (!options.yes) {
       console.log(color.dim("shadow — pass --yes to broadcast"));
       return;

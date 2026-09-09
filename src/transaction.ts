@@ -22,7 +22,7 @@ type AltInfoResponse = { result?: { value?: { data?: { parsed?: { info?: { addre
 const parseAltResponse = async (r: Response): Promise<AltInfoResponse | null> => r.json().catch(() => null);
 
 export async function createSignedTransaction(rpc: Rpc<SolanaRpcApi>, signer: TransactionSigner, instructions: Instruction[]) {
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+  const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
   const message = pipe(
     createTransactionMessage({ version: 0 }),
     (tx) => setTransactionMessageFeePayer(signer.address, tx),
@@ -30,6 +30,25 @@ export async function createSignedTransaction(rpc: Rpc<SolanaRpcApi>, signer: Tr
     (tx) => appendTransactionMessageInstructions(instructions, tx)
   );
   return signTransactionMessageWithSigners(message);
+}
+
+/** getLatestBlockhash with bounded 429 backoff (shared Helius key throttles under load). */
+export async function fetchLatestBlockhash(rpc: Rpc<SolanaRpcApi>) {
+  let delay = 500;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      return await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const context = (error as { context?: { statusCode?: unknown } } | null)?.context;
+      const is429 = /429|rate.?limit|too many requests/i.test(message)
+        || context?.statusCode === 429 || context?.statusCode === "429";
+      if (!is429 || attempt === 5) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 4_000);
+    }
+  }
+  throw new Error("getLatestBlockhash exhausted retries");
 }
 
 /**
@@ -45,7 +64,7 @@ export async function createSignedTransactionWithAlt(
   instructions: Instruction[],
   lookupTableAddresses: Address[],
 ) {
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+  const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
   let message = pipe(
     createTransactionMessage({ version: 0 }),
     (tx) => setTransactionMessageFeePayer(signer.address, tx),

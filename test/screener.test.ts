@@ -55,7 +55,7 @@ function fakeObligation(params: {
   } as never;
 }
 
-function fakeMarketReserveMap(entries: Partial<Record<string, never>> | Array<{ address: string; symbol: string; liquidityMint?: string; flashLoanEnabled?: boolean; availableUsd?: number; priceValid?: boolean; liquidationBonus?: number }> = []): MarketReserveMap {
+function fakeMarketReserveMap(entries: Partial<Record<string, never>> | Array<{ address: string; symbol: string; liquidityMint?: string; flashLoanEnabled?: boolean; availableUsd?: number; priceValid?: boolean; liquidationBonus?: number; liquidationThresholdPct?: number }> = []): MarketReserveMap {
   const map = new Map<string, MarketReserveMap extends Map<string, infer V> ? V : never>();
   for (const entry of entries as Array<Record<string, unknown>>) {
     map.set(entry.address as string, {
@@ -67,6 +67,7 @@ function fakeMarketReserveMap(entries: Partial<Record<string, never>> | Array<{ 
       liquidationBonusMax: (entry.liquidationBonusMax as number) ?? ((entry.liquidationBonus as number) ?? 0.05) * 10,
       availableUsd: (entry.availableUsd as number) ?? 1_000_000,
       priceValid: entry.priceValid !== false,
+      liquidationThresholdPct: (entry.liquidationThresholdPct as number) ?? 80,
     });
   }
   return map as MarketReserveMap;
@@ -112,11 +113,24 @@ test("sfToUsd divides by 1e18", () => {
 });
 
 test("estimateLiquidationProfit uses reserve bonus when available", () => {
-  assert.equal(estimateLiquidationProfit(1000, 0.05), 50);
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05 }), 50);
 });
 
 test("estimateLiquidationProfit falls back to 3 percent", () => {
-  assert.equal(estimateLiquidationProfit(1000, 0), 30);
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0 }), 30);
+});
+
+test("estimateLiquidationProfit applies the market close-factor cap (program economics)", () => {
+  // The on-chain liquidate repays at most closeFactor × debt position. Our market
+  // runs closeFactor=10%: a $1000 debt at 5% bonus yields $5, not $50.
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05, closeFactorPct: 10 }), 5);
+  // Dust-full liquidation threshold aside, the close factor is a hard multiple.
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05, closeFactorPct: 25 }), 12.5);
+});
+
+test("estimateLiquidationProfit subtracts the flash-loan fee on the repaid amount", () => {
+  // 10% close factor, 5% bonus, 0.3% flash fee on the borrow: 1000*0.1*(0.05-0.003) = 4.7
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05, closeFactorPct: 10, flashLoanFeeRate: 0.003 }).toFixed(4), "4.7000");
 });
 
 test("parseObligationSlice reads debt, unhealthy Sf, and ADL fields from dataSlice bytes", () => {
@@ -245,6 +259,35 @@ test("filterLiquidatable tracks near-miss between 1.0 and nearMissHealth", () =>
   const { candidates, nearMiss: nearMisses } = filterLiquidatable([nearMiss], marketReserves, DEFAULTS);
   assert.equal(candidates.length, 0);
   assert.equal(nearMisses.length, 1);
+});
+
+test("filterLiquidatable uses the live recompute as the DUE gate, NOT stored scaled-factor health", () => {
+  const marketReserves = fakeMarketReserveMap([
+    { address: RESERVE_USDC, symbol: "USDC", liquidationBonus: 0.05 },
+  ]);
+  // Recompute (the program's liquidation basis) says healthy: 0.8 limit / 0.7 borrow = 1.14.
+  // Stored scaled-factor fields are a stale snapshot from the obligation's last on-chain refresh
+  // and do NOT follow price moves: we observed stored 0.99 vs live 1.35, and the program rejects
+  // every such stored-DUE target with Custom 6016 ObligationHealthy. Stored health therefore must
+  // NOT promote a recompute-healthy obligation to DUE.
+  const dueByAddress = "DueBySf1111111111111111111111111111111111111";
+  const healthyObligation = fakeObligation({
+    address: dueByAddress,
+    collateralUsd: 1000,
+    liquidationLimitUsd: 800,
+    borrowedUsd: 700,
+    borrows: [{ reserve: RESERVE_USDC, symbol: "USDC", usd: 700 }],
+  });
+  const storedHealthByPubkey = new Map<string, number>([[dueByAddress, 0.99]]);
+  const { candidates, nearMiss: nearMisses } = filterLiquidatable(
+    [healthyObligation],
+    marketReserves,
+    DEFAULTS,
+    undefined,
+    storedHealthByPubkey,
+  );
+  assert.equal(candidates.length, 0);
+  assert.equal(nearMisses.length, 0);
 });
 
 test("filterLiquidatable sorts candidates by estimated profit descending", () => {

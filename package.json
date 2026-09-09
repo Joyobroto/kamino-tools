@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@kamino-finance/klend-sdk": "^11.0.2",
+    "@kamino-finance/kswap-sdk": "^2.8.3",
     "@kamino-finance/scope-sdk": "^13.0.0",
     "@solana/kit": "^2.3.0",
     "@solana/sysvars": "^2.3.0",

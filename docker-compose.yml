@@ -25,6 +25,7 @@ services:
       --ledger /data/liq_autofire_ledger.jsonl
       --stop-file /data/liq_autofire.stop
       --min-profit ${LIQ_MIN_PROFIT:-0.05}
+      --min-prize ${LIQ_MIN_PRIZE:-1.00}
       --slippage-bps ${LIQ_SLIPPAGE_BPS:-50}
       --priority-mode ${LIQ_PRIORITY_MODE:-auto}
       --fast
