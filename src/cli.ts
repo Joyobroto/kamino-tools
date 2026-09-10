@@ -604,7 +604,7 @@ program
   .option("--execute", "arm the in-process executor: DUE positions spotted by this scan (or the hot loop) are attempted immediately (shadow unless --broadcast)", false)
   .option("--broadcast", "actually send liquidation transactions (default: shadow — plan+simulate only)", false)
   .option("--min-profit <usd>", "minimum worst-case net profit in USD for the executor to fire (close factor 10% makes plays smaller)", "0.05")
-  .option("--min-prize <usd>", "minimum estimated prize (candidate.estimatedProfitUsd) before the executor spends ANY RPC — skips dust positions that sit DUE every scan", "1.00")
+  .option("--min-prize <usd>", "minimum estimated prize before the executor spends any RPC (0 disables — learning mode: every DUE attempt is worth the ~$0.001 fee if the net-profit guard below still passes)", "0")
   .option("--slippage-bps <n>", "slippage tolerance on the executor's collateral→debt swap", "50")
   .option("--max-attempts-per-day <n>", "executor broadcast attempt budget (rolling day)", "12")
   .option("--max-loss-per-day <usd>", "executor fee-burn budget per rolling day", "1.5")
@@ -876,10 +876,13 @@ program
           }
           if (raceRail) {
             const raceCandidate = hydrated.candidates[0];
-            // Prize firewall still applies on the race rail (dust shouldn't
-            // burn lanes), but health is NEVER gated here — sim decides.
-            if (raceCandidate && (raceCandidate.estimatedProfitUsd ?? 0) < (executorAutoOptions.minPrizeUsd ?? 1.0)) {
-              logVeto(`WS race: prize $${(raceCandidate.estimatedProfitUsd ?? 0).toFixed(2)} < min-prize (dust firewall)`, { liveHealth: raceCandidate.healthFactor, prizeUsd: raceCandidate.estimatedProfitUsd ?? 0 });
+            // Prize firewall ONLY when configured (>0). Default 0 = learning
+            // mode: dust DUE attempts are welcome — the net-profit guard and the
+            // on-chain sim are the real "don't lose money" arbiters, and every
+            // attempt is measured cost (fee burn) against measured learning.
+            const raceMinPrize = executorAutoOptions.minPrizeUsd ?? 0;
+            if (raceCandidate && raceMinPrize > 0 && (raceCandidate.estimatedProfitUsd ?? 0) < raceMinPrize) {
+              logVeto(`WS race: prize $${(raceCandidate.estimatedProfitUsd ?? 0).toFixed(2)} < min-prize $${raceMinPrize.toFixed(2)} (dust firewall)`, { liveHealth: raceCandidate.healthFactor, prizeUsd: raceCandidate.estimatedProfitUsd ?? 0 });
               return;
             }
             boardUpdate(obligation, {
@@ -918,12 +921,15 @@ program
           // candidate data was fetched seconds ago, never stale cached state)
           // The prize drives the FASTLANE bid (auto mode) — worst-case profit on the table.
           const prizeUsd = Math.max(0, candidate.estimatedProfitUsd ?? 0);
-          // Dust firewall: a ~$0.50 dust-spray cohort sits DUE every single scan; every one
-          // used to charge the full quote→simulate→broadcast pipeline. Below the threshold
-          // we stop here (post-hydration) — zero assemble RPC, zero chance of a 429 chain.
-          if (prizeUsd < (executorAutoOptions.minPrizeUsd ?? 1.0)) {
+          // Prize firewall ONLY when configured (>0). Default 0 = learning
+          // mode: dust DUE attempts proceed into the pipeline — the sim +
+          // net-profit guard (worst-case ≥ min-profit AFTER flash fee and
+          // slippage) are the real "never lose money" arbiters, and each
+          // attempt's fee burn is the measured cost of finding our position.
+          const scanMinPrize = executorAutoOptions.minPrizeUsd ?? 0;
+          if (scanMinPrize > 0 && prizeUsd < scanMinPrize) {
             executorFailStreak.delete(obligation);
-            logVeto(`prize $${prizeUsd.toFixed(2)} < min-prize $${(executorAutoOptions.minPrizeUsd ?? 1.0).toFixed(2)} (dust firewall)`, { liveHealth: candidate.healthFactor, prizeUsd });
+            logVeto(`prize $${prizeUsd.toFixed(2)} < min-prize $${scanMinPrize.toFixed(2)} (dust firewall)`, { liveHealth: candidate.healthFactor, prizeUsd });
             return;
           }
           const runExecutor = () =>
