@@ -21,6 +21,7 @@ import {
   type TransactionSigner,
 } from "@solana/kit";
 import { SYSVAR_INSTRUCTIONS_ADDRESS } from "@solana/sysvars";
+import { createFailoverRpc } from "./rpc-failover.js";
 import { formatTokenAmount } from "./amount.js";
 import type { LoadedStrategy } from "./strategy.js";
 
@@ -44,6 +45,15 @@ export interface FlashLoanBuild {
 }
 
 export function rpcClient(url: string): Rpc<SolanaRpcApi> {
+  // Failover wiring: when a fallback endpoint is configured (SOLANA_RPC_FALLBACK
+  // in .env / docker-compose), every rpcClient() call site transparently gets a
+  // primary+fallback transport — 429s and dead connections flip to the fallback
+  // for a cooldown window and the SAME in-flight request is retried there, so
+  // the scan/hot/race pipelines never starve on a single provider's quota.
+  const fallback = process.env.SOLANA_RPC_FALLBACK;
+  if (fallback && fallback !== url) {
+    return createFailoverRpc({ primaryUrl: url, fallbackUrl: fallback }).rpc;
+  }
   return createSolanaRpc(url);
 }
 
