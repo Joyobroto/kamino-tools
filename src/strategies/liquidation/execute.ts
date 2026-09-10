@@ -49,16 +49,19 @@ import {
 } from "@solana/kit";
 import { SYSVAR_INSTRUCTIONS_ADDRESS } from "@solana/sysvars";
 import { getSetComputeUnitLimitInstruction, getSetComputeUnitPriceInstruction } from "@solana-program/compute-budget";
-import { loadWalletSigner, privateKeyFromEnv } from "../../config.js";
 import {
   buildFlashLoan,
   createAtaInstruction,
   deriveAssociatedTokenAccount,
   fetchTokenAccount,
+  type TokenAccountInfo,
 } from "../../kamino.js";
 import { externalInstructionsToStrategy, type ExternalInstruction } from "../../strategy.js";
 import { simulate } from "../../transaction.js";
-import { createSignedTransactionWithAltCached, getCachedScopeConfigurations } from "./hotcache.js";
+import { createSignedTransactionWithAltCached, getCachedScopeConfigurations, getCachedWalletSigner, ataStateKnown, setCachedAtaExists } from "./hotcache.js";
+import { getClmmQuoter, web3InstructionToExternal } from "./clmm.js";
+import { PublicKey } from "@solana/web3.js";
+import BNImport from "bn.js";
 import { fetchKswapRoutes } from "./kswap.js";
 import { safeJsonStringify } from "../../ui.js";
 import { buildMarketReserveMap, healthFactor, obligationToCandidate } from "./filters.js";
@@ -82,6 +85,13 @@ export interface LiquidationInput {
   /** Skip the client-side health gate (mechanics/E2E test only — the program still
    *  reverts in simulation if the obligation is genuinely healthy). */
   bypassHealth?: boolean;
+  /** Health-gate tolerance: when live health is within this band ABOVE 1.0, keep
+   *  going and let SIMULATION arbitrate (the tx's own RefreshObligation is the
+   *  same check the program runs — the winner of the 2026-09-09 races all fired
+   *  on positions our 2s-stale hydration read as 1.003–1.007). Default 0:
+   *  strict gate. Race post-mortem: LionX took E5ANmg7d 3s after our veto at
+   *  health 1.0069. */
+  healthGateTolerance?: number;
   /** Extra lookup tables (our persistent klend-side ALT) to compress the tx. */
   lookupTableAddresses?: Address[];
   /** FAST mode: skip the second (CU-pinned re-sim) roundtrip to save ~1-2s in the
@@ -223,12 +233,17 @@ export const MAX_TIP_FRACTION_OF_PRIZE = 0.02; // never bid more than 2% of the 
 export const MIN_TIP_USD = 0.01; // floor: still beat base-fee spam
 const SOL_USD_ESTIMATE = 150; // conservative constant — only drives the bid ladder, not P&L
 
-/** The bid ladder: prize bucket → target tip USD (before the 2% cap). */
+/** The bid ladder: prize bucket → target tip USD (before the 2% cap).
+ *  Race-tuned 2026-09-10: the old $0.75 ceiling on a ~$832 prize (5xRRAGUe,
+ *  lost at 0.09% of prize) was the blockspace-auction loss — competitors bid
+ *  $1-5 on prizes like that. Buckets now scale to a meaningful fraction of
+ *  the prize while the MAX_TIP_FRACTION_OF_PRIZE cap still bounds the burn. */
 const PRIZE_BID_LADDER: Array<{ minPrizeUsd: number; bidUsd: number; label: string }> = [
-  { minPrizeUsd: 100, bidUsd: 0.75, label: "lane-3 kill-shot" },
-  { minPrizeUsd: 25, bidUsd: 0.30, label: "lane-2 hot" },
-  { minPrizeUsd: 5, bidUsd: 0.10, label: "lane-1 fast" },
-  { minPrizeUsd: 0, bidUsd: 0.03, label: "lane-0 base" },
+  { minPrizeUsd: 500, bidUsd: 6.0, label: "lane-4 kill-shot" },
+  { minPrizeUsd: 100, bidUsd: 1.8, label: "lane-3 hot" },
+  { minPrizeUsd: 25, bidUsd: 0.6, label: "lane-2 fast" },
+  { minPrizeUsd: 5, bidUsd: 0.2, label: "lane-1 quick" },
+  { minPrizeUsd: 0, bidUsd: 0.05, label: "lane-0 base" },
 ];
 
 export function choosePriorityFee(params: {
@@ -280,7 +295,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   if (!obligation) return { stage: "plan", passed: false, reason: "obligation account not found", timings };
   if (obligation.obligationTag !== 0) return { stage: "plan", passed: false, reason: "non-vanilla obligation (skip)" , timings };
   const health = healthFactor(obligation);
-  if (health >= 1 && !input.bypassHealth) {
+  const healthTolerance = input.healthGateTolerance ?? 0;
+  if (health >= 1 + healthTolerance && !input.bypassHealth) {
     return { stage: "plan", passed: false, reason: `health ${health.toFixed(4)} — not liquidatable right now` , timings };
   }
 
@@ -355,7 +371,9 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //      swap instructions in ONE call; the three ATA state fetches are independent.
   //      Jupiter quote+swap-instructions remains the fallback (2 sequential HTTP).
   done = mark("quote");
-  const signer = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
+  // Fire-path trim: the signer (private-key decode + ed25519 derive) is
+  // process-immutable — the shared hot cache serves it with zero work.
+  const signer = await getCachedWalletSigner();
 
   // ATAs: debt-liquidity (userSourceLiquidity + flash ATA), collateral-liquidity
   // (userDestinationLiquidity + swap input), collateral cToken (userDestinationCollateral).
@@ -391,12 +409,16 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // Primary: the Jupiter pair (measured ~165ms, +0.5% better price than KSwap).
   // KSwap (Kamino's official router) is the FALLBACK — redundancy on the fire
   // path: if Jupiter is down/slow mid-race we still quote via api.kamino.finance.
-  const buildJupiterPlan = async (): Promise<SwapPlan | null> => {
+  // A DIRECT-route variant is quoted in parallel: multi-hop routes stack 2+ swap
+  // ix (~80 accounts) and can bust the 1232-byte packet; the direct variant is
+  // the packet-safe fallback at a slightly worse price.
+  const buildJupiterPlan = async (onlyDirectRoutes: boolean): Promise<SwapPlan | null> => {
     const quote = await fetchRawQuote({
       inputMint: withdrawReserve.getLiquidityMint().toString(),
       outputMint: repayReserve.getLiquidityMint().toString(),
       amount: estCollateralBaseUnits.toString(),
       slippageBps: input.slippageBps,
+      onlyDirectRoutes,
     });
     if (!quote) return null;
     const plan = await fetchSwapInstructions(quote, signer.address.toString());
@@ -406,7 +428,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       lookupTables: plan.addressLookupTableAddresses.map((a: string) => address(a)),
       swapOut: BigInt(quote.outAmount),
       swapOutMin: applySlippage(BigInt(quote.outAmount), input.slippageBps),
-      source: "jupiter",
+      source: onlyDirectRoutes ? "jupiter-direct" : "jupiter",
     };
   };
   const buildKswapPlan = async (): Promise<SwapPlan | null> => {
@@ -434,9 +456,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // the pair has no CLMM pool or the cache is cold mid-race.
   const buildLocalClmmPlan = async (): Promise<SwapPlan | null> => {
     try {
-      const { getClmmQuoter, web3InstructionToExternal } = await import("./clmm.js");
-      const BNImport = (await import("bn.js")).default;
-      const { PublicKey } = await import("@solana/web3.js");
+      // Static imports (top of file) — no dynamic import latency on the fire path.
       const quoter = getClmmQuoter(input.rpcUrl);
       const tokenIn = new PublicKey(withdrawReserve.getLiquidityMint().toString());
       const tokenOut = new PublicKey(repayReserve.getLiquidityMint().toString());
@@ -477,12 +497,33 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), ms));
     return Promise.race([promise, timeout]);
   };
-  const [clmmPlan, jupPlan, debtAtaState, collAtaState, cTokenAtaState] = await Promise.all([
+  // Fire-path trim: ATA existence (OUR hot ATAs — created once by liq-setup)
+  // is cached process-lifetime once seen; a known-existing ATA needs NO
+  // getAccountInfo round-trip. Only genuinely unknown states hit the RPC.
+  const ataFetchIfUnknown = (ata: Address, mint: Address, decimals: number): Promise<TokenAccountInfo | null> | null => {
+    const known = ataStateKnown(ata.toString());
+    if (!known) return null;
+    return Promise.resolve(
+      known.exists
+        ? { address: ata, mint, owner: signer.address, amount: 0n, decimals }
+        : null,
+    );
+  };
+  const fetchAtaWithCache = (ata: Address, mint: Address, decimals: number, label: string): Promise<TokenAccountInfo | null> => {
+    const cached = ataFetchIfUnknown(ata, mint, decimals);
+    if (cached) return cached;
+    return withBackoff(() => fetchTokenAccount(rpc, ata.toString()), label).then((fetched) => {
+      setCachedAtaExists(ata.toString(), Boolean(fetched));
+      return fetched;
+    });
+  };
+  const [clmmPlan, jupPlan, jupDirectPlan, debtAtaState, collAtaState, cTokenAtaState] = await Promise.all([
     withTimeout(buildLocalClmmPlan(), 350),
-    buildJupiterPlan().catch(() => null),
-    withBackoff(() => fetchTokenAccount(rpc, debtAta.toString()), "ata fetch"),
-    withBackoff(() => fetchTokenAccount(rpc, collAta.toString()), "ata fetch"),
-    withBackoff(() => fetchTokenAccount(rpc, cTokenAta.toString()), "ata fetch"),
+    buildJupiterPlan(false).catch(() => null),
+    buildJupiterPlan(true).catch(() => null),
+    fetchAtaWithCache(debtAta, repayReserve.getLiquidityMint(), repayReserve.getMintDecimals(), "ata fetch"),
+    fetchAtaWithCache(collAta, withdrawReserve.getLiquidityMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
+    fetchAtaWithCache(cTokenAta, withdrawReserve.getCTokenMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
   ]);
   let swapPlan: SwapPlan | null = clmmPlan ?? jupPlan;
   if (!swapPlan) {
@@ -698,45 +739,62 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     });
   const build = await buildSwapChain(activeSwapPlan);
 
-  const buildPlanWithSizeGuard = async (plan: SwapPlan, fallbackPlan: SwapPlan | null): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; plan: SwapPlan; txTooLarge: boolean }> => {
+  // Size guard for EVERY swap backend, not just CLMM: the wire tx must fit
+  // 1232 bytes or the RPC rejects it (-32602 / "too large" — the exact failure
+  // mode that burned the 2026-09-08 ledger: KSwap multi-hop routes stack more
+  // accounts than the ALTs cover). Measure the PRIMARY plan first; if it busts,
+  // try every already-fetched fallback (jupiter → kswap) before giving up.
+  const wireSizeOf = async (plan: SwapPlan): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; tx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null; tooLarge: boolean }> => {
     const built = await buildSwapChain(plan);
     const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]).catch(() => null);
     const wire = tx ? Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length : Number.POSITIVE_INFINITY;
-    if (wire > 1232) return { build: built, plan, txTooLarge: true };
-    return { build: built, plan, txTooLarge: false };
+    return { build: built, tx, tooLarge: wire > 1232 };
   };
 
-  // CLMM-first with a size guard: the CLMM swap ix is account-heavy; when the pair's
-  // pool accounts aren't covered by Raydium's ALT the packet busts 1232B. In that
-  // case fall back to the (already-fetched) Jupiter plan instead of losing the fire.
+  // Candidate order: the chosen plan first, then every other fetched plan as
+  // fallback — including the packet-safe jupiter-direct variant. Unknown-null
+  // (never quoted) plans are skipped.
+  const fallbackPlans = [clmmPlan, jupPlan, jupDirectPlan].filter((p): p is SwapPlan => p !== null && p !== activeSwapPlan);
   let chosenPlan = activeSwapPlan;
   let buildFinal = build;
-  if (activeSwapPlan.source.startsWith("clmm-local") && jupPlan) {
-    const guarded = await buildPlanWithSizeGuard(activeSwapPlan, jupPlan);
-    if (guarded.txTooLarge) {
-      const fallbackBuild = await buildSwapChain(jupPlan);
-      buildFinal = fallbackBuild;
-      chosenPlan = jupPlan;
-      timings.swapFallback = 0;
-      (timings as Record<string, unknown>).swapFallback = "clmm→jupiter (packet)";
+  let signedTx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null = null;
+  {
+    const primary = await wireSizeOf(activeSwapPlan);
+    if (primary.tooLarge) {
+      for (const fallback of fallbackPlans) {
+        const attempt = await wireSizeOf(fallback);
+        if (!attempt.tooLarge) {
+          chosenPlan = fallback;
+          buildFinal = attempt.build;
+          signedTx = attempt.tx;
+          timings.swapFallback = 0;
+          (timings as Record<string, unknown>).swapFallback = `${activeSwapPlan.source}→${fallback.source} (packet)`;
+          break;
+        }
+      }
+      if (!signedTx) {
+        // Every backend busts the packet (account-heavy multi-hop market) —
+        // fail the fire here rather than sending an RPC-rejected tx.
+        return { stage: "assemble", passed: false, reason: `tx exceeds 1232-byte packet on every swap backend (${[activeSwapPlan, ...fallbackPlans].map((p) => p.source).join(", ")})`, timings };
+      }
     } else {
-      buildFinal = guarded.build;
+      signedTx = primary.tx;
     }
   }
   const activePlan = chosenPlan;
   const activeSwapOut = activePlan === activeSwapPlan ? swapOut : activePlan.swapOut;
   const activeSwapOutMin = activePlan === activeSwapPlan ? swapOutMin : activePlan.swapOutMin;
-
-  const transaction = await createSignedTransactionWithAltCached(
-    rpc,
-    input.rpcUrl,
-    signer,
-    buildFinal.instructions,
-    [
-      ...activePlan.lookupTables,
-      ...(input.lookupTableAddresses ?? []),
-    ],
-  );
+  const transaction = signedTx
+    ?? (await createSignedTransactionWithAltCached(
+      rpc,
+      input.rpcUrl,
+      signer,
+      buildFinal.instructions,
+      [
+        ...activePlan.lookupTables,
+        ...(input.lookupTableAddresses ?? []),
+      ],
+    ));
 
   done();
 

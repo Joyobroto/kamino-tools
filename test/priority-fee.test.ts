@@ -23,6 +23,13 @@ test("auto mode scales the bid with the prize", () => {
   assert.ok(small.lane.includes("lane-1"));
 });
 
+test("auto mode race-tuned ladder bids aggressively on big prizes", () => {
+  // The 5xRRAGUe case: $832 prize must bid ~$6+ (the old $0.75 lost the auction)
+  const r = choosePriorityFee({ priorityMode: "auto", prizeUsd: 832 });
+  assert.ok(r.tipUsd >= 5, `kill-shot lane must bid aggressively, got $${r.tipUsd}`);
+  assert.ok(r.tipUsd <= 832 * MAX_TIP_FRACTION_OF_PRIZE + 1e-9, "still capped at 2% of prize");
+});
+
 test("auto mode never bids more than the 2% prize cap", () => {
   const r = choosePriorityFee({ priorityMode: "auto", prizeUsd: 30 });
   assert.ok(r.tipUsd <= 30 * MAX_TIP_FRACTION_OF_PRIZE + 1e-9);

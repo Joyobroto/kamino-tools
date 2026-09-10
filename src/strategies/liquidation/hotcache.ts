@@ -203,4 +203,60 @@ export function warmScopeConfigurations(rpc: Rpc<SolanaRpcApi>): void {
   void getCachedScopeConfigurations(rpc).catch(() => {});
 }
 
+// ─── Signer cache ───────────────────────────────────────────────────────────
+// loadWalletSigner decodes the private key (base58/JSON parse + ed25519 key
+// derivation) EVERY call — the executor did it once per fire, on the critical
+// path. The signer is immutable for the process lifetime: decode once, share.
+
+let cachedSigner: TransactionSigner | null = null;
+let signerInFlight: Promise<TransactionSigner> | null = null;
+
+export async function getCachedWalletSigner(): Promise<TransactionSigner> {
+  if (cachedSigner) return cachedSigner;
+  if (signerInFlight) return signerInFlight;
+  const promise = (async (): Promise<TransactionSigner> => {
+    const { loadWalletSigner, privateKeyFromEnv } = await import("../../config.js");
+    const signer = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
+    cachedSigner = signer;
+    return signer;
+  })().finally(() => { signerInFlight = null; });
+  signerInFlight = promise;
+  return promise;
+}
+
+// ─── ATA existence cache ────────────────────────────────────────────────────
+// The executor's three fetchTokenAccount round-trips (~80-100ms each, even
+// though parallel) check whether OUR hot ATAs exist — a fact that changes only
+// when we (or liq-setup) create them. Cache "exists" for the process lifetime;
+// cache "missing" briefly so a fire right after creation still picks it up.
+
+interface CachedAtaState {
+  exists: boolean;
+  fetchedAt: number;
+}
+const ataStateCache = new Map<string, CachedAtaState>();
+const ATA_MISSING_RECHECK_MS = 60_000;
+
+/** Records an ATA's existence from ANY observation (fire-path fetch, warm pass). */
+export function setCachedAtaExists(ata: string, exists: boolean): void {
+  if (exists) {
+    // existence is monotonic for our own accounts — never revert to missing
+    ataStateCache.set(ata, { exists: true, fetchedAt: Date.now() });
+  } else {
+    const prior = ataStateCache.get(ata);
+    if (prior?.exists) return;
+    ataStateCache.set(ata, { exists: false, fetchedAt: Date.now() });
+  }
+}
+
+/** True when a cached "exists" (or a fresh-enough "missing") lets the fire
+ *  path skip the getAccountInfo round-trip entirely. */
+export function ataStateKnown(ata: string): { exists: boolean } | null {
+  const cached = ataStateCache.get(ata);
+  if (!cached) return null;
+  if (cached.exists) return { exists: true };
+  if (Date.now() - cached.fetchedAt < ATA_MISSING_RECHECK_MS) return { exists: false };
+  return null;
+}
+
 export const HOTCACHE_INTERNALS = { BLOCKHASH_STALE_RETRY_MS };

@@ -74,7 +74,7 @@ export const DEFAULT_AUTOFIRE_OPTIONS: AutofireOptions = {
 
 export interface LedgerEntry {
   at: string;
-  type: "fired" | "skipped" | "blocked" | "pass";
+  type: "fired" | "skipped" | "blocked" | "pass" | "vetoed";
   symbol?: string;
   obligation?: string;
   stage?: ExecutionOutcomeForDaemon["stage"];
@@ -83,6 +83,19 @@ export interface LedgerEntry {
   quotedProfitUsd?: number;
   worstCaseProfitUsd?: number;
   lossUsdEstimate?: number;
+  /** For "vetoed": how the veto was resolved — "lost-race" (another bot
+   *  liquidated it on-chain) or "self-healed" (no liquidation ever landed). */
+  outcome?: "lost-race" | "self-healed";
+  /** For "vetoed"/lost-race: the winning liquidator's fee payer. */
+  winner?: string;
+  /** For "vetoed"/lost-race: the winning tx signature. */
+  winnerSignature?: string;
+  /** For "vetoed": ms between the trigger and the veto. */
+  latencyMs?: number;
+  /** For "vetoed": the live health the hydration computed at veto time. */
+  liveHealth?: number;
+  /** For "vetoed": the prize that was on the table, USD. */
+  prizeUsd?: number;
 }
 
 export interface DaemonState {

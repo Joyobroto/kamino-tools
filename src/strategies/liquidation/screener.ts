@@ -185,6 +185,15 @@ const preloadCache = new Map<string, PreloadedMarket>();
 const ledgerInstantInFlight = new Map<string, Promise<Awaited<ReturnType<typeof getCurrentLedgerInstant>>>>();
 let ledgerInstantLast = { at: 0, value: undefined as Awaited<ReturnType<typeof getCurrentLedgerInstant>> | undefined };
 
+/** True for the getSlot→getBlockTime race: the slot number exists but its block
+ *  isn't in the node's blockstore yet (-32004 "Block not available for slot").
+ *  Transient by construction — the block lands (or the slot is skipped) within a
+ *  slot or two; observed ~1x/day on Helius. */
+export function isBlockNotAvailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /-32004|block not available/i.test(message);
+}
+
 async function fetchLedgerInstant(rpc: Rpc<SolanaRpcApi>, label: string): Promise<Awaited<ReturnType<typeof getCurrentLedgerInstant>>> {
   const now = Date.now();
   if (ledgerInstantLast.value && now - ledgerInstantLast.at < 500) return ledgerInstantLast.value;
@@ -201,7 +210,27 @@ async function fetchLedgerInstant(rpc: Rpc<SolanaRpcApi>, label: string): Promis
   }
   const promise = (async () => {
     try {
-      const value = await withBackoff(() => getCurrentLedgerInstant(rpc), label);
+      // -32004 race: getSlot returns the newest slot but getBlockTime for that
+      // exact slot can 404 while the blockstore catches up. Retry with a short
+      // pause — by the second attempt the block is virtually always there.
+      let value: Awaited<ReturnType<typeof getCurrentLedgerInstant>>;
+      try {
+        value = await withBackoff(() => getCurrentLedgerInstant(rpc), label);
+      } catch (error) {
+        if (!isBlockNotAvailableError(error)) throw error;
+        await sleep(600);
+        try {
+          value = await withBackoff(() => getCurrentLedgerInstant(rpc), label);
+        } catch (retryError) {
+          // Still racing (rare): fall back to the last known-good instant when
+          // it's fresh enough — blockTime only feeds margin-call AGE in hours
+          // and refresh-staleness windows; a seconds-stale timestamp is fine.
+          if (isBlockNotAvailableError(retryError) && ledgerInstantLast.value && Date.now() - ledgerInstantLast.at < 300_000) {
+            return ledgerInstantLast.value;
+          }
+          throw retryError;
+        }
+      }
       ledgerInstantLast = { at: Date.now(), value };
       return value;
     } finally {

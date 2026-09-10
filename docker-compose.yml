@@ -19,7 +19,7 @@ services:
     command: >
       node --disable-warning=ExperimentalWarning --import tsx src/cli.ts scan
       --watch
-      --interval ${WATCH_INTERVAL:-60}
+      --interval ${WATCH_INTERVAL:-120}
       --hot-interval 10
       --log /data/opportunities.jsonl
       --ledger /data/liq_autofire_ledger.jsonl
