@@ -50,6 +50,7 @@ import {
   dueAttemptAlert,
 } from "./alerts/telegram.js";
 import { DEFAULT_AUTOFIRE_OPTIONS, evaluateFireGuards, loadLedger, logLedgerEntry, type AutofireOptions } from "./strategies/arb/autofire.js";
+import { failoverHealth } from "./rpc-failover.js";
 import { resolveVetoFate } from "./strategies/liquidation/veto-forensics.js";
 import { planLstArb, fetchSwapInstructions, applySlippage } from "./strategies/arb/lst-arb.js";
 import {
@@ -698,14 +699,39 @@ program
     };
     const executorBusy = new Set<string>();
     // Runtime stats for the heartbeat alert — the post-mortem data when things
-    // don't work as expected (how many DUE we saw, tried, fired, and lost).
+    // don't work as expected. Every counter is a REAL event that happened in
+    // this process: triggers seen, vetoes by class, attempts, fires, and races
+    // lost (deduped across the tracker + forensics detection rails).
     const executorStats = {
       startedAt: Date.now(),
       cycles: 0,
+      dueTriggers: 0,
       dueAttempted: 0,
       dueFired: 0,
-      liquidatedByOthers: 0,
+      vetoDust: 0,
+      vetoHealth: 0,
+      selfHealed: 0,
       lastFailure: undefined as string | undefined,
+    };
+    // Race-loss truth: ONE row per obligation per hour — the tracker's "taken"
+    // event and the forensics' "lost-race" both fire for the same loss; the
+    // Map dedups them and carries the prize we had on the table.
+    const lostRaces = new Map<string, { prizeUsd: number; at: number }>();
+    const LOST_RACE_DEDUP_MS = 60 * 60_000;
+    const markRaceLost = (obligation: string, prizeUsd: number): void => {
+      if ((lostRaces.get(obligation)?.at ?? 0) > Date.now() - LOST_RACE_DEDUP_MS) return;
+      lostRaces.set(obligation, { prizeUsd: Math.max(prizeUsd, lostRaces.get(obligation)?.prizeUsd ?? 0), at: Date.now() });
+    };
+    const raceLostStats = (): { count: number; prizeUsd: number } => {
+      let prize = 0;
+      let count = 0;
+      const now = Date.now();
+      for (const [obligation, row] of [...lostRaces.entries()]) {
+        if (now - row.at > LOST_RACE_DEDUP_MS) { lostRaces.delete(obligation); continue; }
+        count += 1;
+        prize += row.prizeUsd;
+      }
+      return { count, prizeUsd: prize };
     };
     // ── Smart retry policy (ported pattern) ──
     // Blocklist: obligations that consistently fail structurally (deprecated banks,
@@ -728,6 +754,7 @@ program
     const executorStillDue = new Map<string, number>(); // obligation → last WS-seen-DUE timestamp
     const executeDue = (obligation: string, opts: { bypassHealth?: boolean; rail?: "ws" | "scan" | "hot" } = {}): void => {
       const triggeredAtMs = Date.now();
+      executorStats.dueTriggers++;
       const rail = opts.rail ?? "scan";
       if (!options.execute || !executeMarket) return;
       if (executorBlocklist.has(obligation)) return;
@@ -753,6 +780,10 @@ program
       const logVeto = (reason: string, detail: { liveHealth?: number; prizeUsd?: number; forensics?: boolean }): void => {
         const latencyMs = Date.now() - triggeredAtMs;
         const runForensics = detail.forensics ?? false;
+        // Real counters for the heartbeat: every veto class is distinguishable
+        // (dust vs health-gate vs hydration noise) instead of one opaque "0".
+        if (/dust|min-prize/i.test(reason)) executorStats.vetoDust++;
+        else if (/client gate|health/i.test(reason)) executorStats.vetoHealth++;
         if (!runForensics) {
           logLedgerEntry(executorAutoOptions.ledgerPath, {
             at: new Date().toISOString(),
@@ -781,6 +812,7 @@ program
           });
           if (options.json) return;
           if (fate.outcome === "lost-race") {
+            markRaceLost(obligation, detail.prizeUsd ?? 0);
             boardUpdate(obligation, { status: "LOST", ...(fate.winner ? { executedBy: fate.winner } : {}) });
             const lostAfter = ((fate.raceLostAfterMs ?? 0) / 1000).toFixed(1);
             console.log(
@@ -788,6 +820,7 @@ program
                 color.dim(`  ${reason} @+${(latencyMs / 1000).toFixed(1)}s — winner ${fate.winner?.slice(0, 8) ?? "?"}… liquidated it ${lostAfter}s after our trigger  https://solscan.io/tx/${fate.winnerSignature}`),
             );
           } else {
+            executorStats.selfHealed++;
             boardUpdate(obligation, { status: "HEALED" });
             console.log(
               color.dim(`[${localTimestamp(new Date().toISOString())}] veto ${obligation.slice(0, 8)}…  ${reason} — SELF-HEALED (no liquidation on-chain; borrower/price recovered, nothing was taken)`),
@@ -1029,7 +1062,7 @@ program
           // Only surface LIQUIDATIONS: a tracked candidate that went DUE and was taken
           // by another liquidator. Healed/managed band exits stay in the JSONL only.
           if (event.wasDue) {
-            executorStats.liquidatedByOthers++;
+            markRaceLost(event.obligation, event.debtUsd ?? 0);
             const debt = `${(event.debtUsd ?? 0).toFixed(2)} ${event.debtSymbol ?? "?"}`;
             console.log(
               `${color.bold(color.red("⚡ LIQUIDATED"))} ${color.red(event.obligation)}` +
@@ -1317,18 +1350,33 @@ program
             .send()
             .then((r) => Number(r.value) / 1e9)
             .catch(() => 0);
+          const losses = raceLostStats();
           alerter.push(heartbeatAlert({
             uptimeMinutes: Math.round((Date.now() - executorStats.startedAt) / 60_000),
             cycles: executorStats.cycles,
             nearMissCount: tracker.size,
+            dueTriggers: executorStats.dueTriggers,
             dueAttempted: executorStats.dueAttempted,
             dueFired: executorStats.dueFired,
-            liquidatedByOthers: executorStats.liquidatedByOthers,
+            vetoDust: executorStats.vetoDust,
+            vetoHealth: executorStats.vetoHealth,
+            selfHealed: executorStats.selfHealed,
+            lostRaces: losses.count,
+            lostPrizeUsd: losses.prizeUsd,
             walletSol,
+            mode: options.broadcast ? "live" : "shadow",
+            wsLive: wsRailAlive(),
+            rpcOnFallback: failoverHealth({ primaryUrl: options.rpc, fallbackUrl: process.env.SOLANA_RPC_FALLBACK ?? "" }).onFallback,
+            ...(executorStats.lastFailure ? { lastFailure: executorStats.lastFailure } : {}),
           }));
         })();
       }, 60 * 60_000).unref();
     }
+    // Heartbeat + ticker share the WS-rail aliveness flag — set by onReady,
+    // cleared by onError/subscribe-fail; a DOWN rail means the bot races blind
+    // and the heartbeat must say so.
+    let wsRailState: "connecting" | "live" | "down" = "connecting";
+    const wsRailAlive = (): boolean => wsRailState === "live";
     let cycle = 0;
     let fullScanPromise: Promise<void> | null = null;
     let nextFullScan = 0;
@@ -1450,9 +1498,11 @@ program
           executeDue(obligation, { rail: "ws" });
         },
         onReady: () => {
+          wsRailState = "live";
           console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live`));
         },
         onError: (error: unknown) => {
+          if (wsRailState === "live") wsRailState = "down";
           console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
         },
       });
@@ -1461,6 +1511,7 @@ program
           wsHandle = handle;
         })
         .catch((error: unknown) => {
+          wsRailState = "down";
           if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws subscribe failed: ${error instanceof Error ? error.message : String(error)}`));
         });
       // Ordering: hold the FIRST scan until the WS rail announces itself (or

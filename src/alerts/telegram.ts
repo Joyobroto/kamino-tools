@@ -390,26 +390,50 @@ export function budgetPausedAlert(params: { dailyLossUsd: number; capUsd: number
   };
 }
 
-/** Periodic heartbeat — the one place to see the whole system's health at a glance. */
+/** Periodic heartbeat — the one place to see the whole system's health at a glance.
+ *  Every number is a REAL event count from this process run: triggers seen,
+ *  vetoes by class, attempts, fires, and deduped race losses (tracker +
+ *  forensics detection merged). Rail/provider health included because a dead
+ *  WS rail means the bot is racing blind while the heartbeat still says 0. */
 export function heartbeatAlert(params: {
   uptimeMinutes: number;
   cycles: number;
   nearMissCount: number;
+  dueTriggers: number;
   dueAttempted: number;
   dueFired: number;
-  liquidatedByOthers: number;
+  vetoDust: number;
+  vetoHealth: number;
+  selfHealed: number;
+  lostRaces: number;
+  lostPrizeUsd: number;
   walletSol: number;
+  mode: "shadow" | "live";
+  wsLive: boolean;
+  rpcOnFallback: boolean;
+  lastFailure?: string;
 }): TelegramAlert {
+  const lossCell = params.lostRaces > 0
+    ? `${params.lostRaces} ($${params.lostPrizeUsd.toFixed(2)} prize lost)`
+    : String(params.lostRaces);
+  const rails = [
+    `WS ${params.wsLive ? "live ✓" : "DOWN ✗"}`,
+    `RPC ${params.rpcOnFallback ? "on FALLBACK ⚠" : "primary ✓"}`,
+  ].join(" · ");
+  const lines = [
+    `Uptime: ${params.uptimeMinutes}m | Cycles: ${params.cycles} | ${params.mode === "live" ? "🔴 LIVE FIRE" : "SHADOW (no broadcast)"}`,
+    rails,
+    `Tracked near-miss: ${params.nearMissCount}`,
+    `DUE triggers: ${params.dueTriggers} | attempts: ${params.dueAttempted} | fired: ${params.dueFired}`,
+    `Vetoed: ${params.vetoDust} dust · ${params.vetoHealth} health-gate | self-healed: ${params.selfHealed}`,
+    `Lost to other bots: ${lossCell}`,
+    `Wallet: ${params.walletSol.toFixed(4)} SOL`,
+  ];
+  if (params.lastFailure) lines.push(`Last failure: ${params.lastFailure.slice(0, 120)}`);
   return {
     kind: "digest",
     title: "💓 LIQ ENGINE HEARTBEAT",
-    lines: [
-      `Uptime: ${params.uptimeMinutes}m | Cycles: ${params.cycles}`,
-      `Near-miss tracked: ${params.nearMissCount}`,
-      `DUE attempts: ${params.dueAttempted} (fired: ${params.dueFired})`,
-      `Lost to others (LIQUIDATED): ${params.liquidatedByOthers}`,
-      `Wallet: ${params.walletSol.toFixed(4)} SOL`,
-    ],
+    lines,
   };
 }
 
