@@ -669,6 +669,11 @@ program
       minPrizeUsd: Number(options.minPrize),
     };
     const HEALTH_GATE_TOLERANCE = Math.max(0, Number(options.raceTolerance));
+    // Learning-mode blind-fire ceiling: WS-rail DUE plays with an estimated
+    // prize below this skip the sim round-trip entirely (LionX same-slot
+    // shape; wrong guess ≈ $0.001). Bigger prizes keep the full verdict chain —
+    // a $500+ miss on a failed sim is tuition we don't need to pay twice.
+    const BLIND_FIRE_MAX_PRIZE_USD = 2.0;
     const executorCooldownMs = 30_000;
     const executorRecentlyTried = new Map<string, number>();
     // Bounded-concurrency fire lanes: LionX's census shows they fire PARALLEL txs
@@ -942,6 +947,12 @@ program
               minProfitUsd: executorAutoOptions.minProfitUsd,
               ...(executorAltState ? { lookupTableAddresses: [address(executorAltState.lookupTable)] } : {}),
               ...(options.fast ? { fast: true } : {}),
+              // Learning-mode blind fire (LionX same-slot shape): for small
+              // prizes on the race rail the sim round-trip costs us the window
+              // (12:47 post-mortem: every sim'd dust attempt flipped healthy
+              // mid-sim; every fired one would have cost $0.001). The net-
+              // profit guard still runs client-side before this tx is built.
+              ...(raceRail && prizeUsd > 0 && prizeUsd < BLIND_FIRE_MAX_PRIZE_USD ? { skipSimulate: true, fast: true } : {}),
               ...(raceRail ? { healthGateTolerance: 1.5 } : marginalBand ? { healthGateTolerance: HEALTH_GATE_TOLERANCE } : {}),
               ...(hydrated.obligations.get(obligation) ? { prehydratedObligation: hydrated.obligations.get(obligation) as KaminoObligation } : {}),
               ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd, bypassHealth: opts.bypassHealth ?? false }),
@@ -986,7 +997,22 @@ program
                 return;
               }
               executorRecentlyTried.delete(obligation);
-              boardUpdate(obligation, { status: "HEALED" });
+              // Scan/hot rail: the position sits in the near-miss band, still
+              // tracked — return the board row to WATCH (with the live health),
+              // NOT a terminal HEALED (that's for genuinely-recovered positions;
+              // a stuck EXECUTOR row hides the cohort state).
+              boardUpdate(obligation, { status: "WATCH", ...(candidate.healthFactor < 1.05 ? { health: candidate.healthFactor } : {}) });
+              return;
+            }
+            // Farm-accounts shape (6120): the obligation participates in Kamino
+            // farms and our none() farm accounts fail the program's refresh —
+            // structural, not transient. Back off long (it's not market noise)
+            // but DON'T blocklist: implementing farm-account support later will
+            // revive these positions.
+            if (/6120|FarmAccountsMissing/i.test(outcome.reason)) {
+              executorNoRouteUntil.set(obligation, Date.now() + 60 * 60_000);
+              boardUpdate(obligation, { status: "WATCH", ...(candidate.healthFactor < 1.05 ? { health: candidate.healthFactor } : {}) });
+              if (!options.json) console.log(color.yellow(`[${localTimestamp(new Date().toISOString())}] executor ✗ ${obligation.slice(0, 8)}… farm-backed obligation (6120) — needs farm-account support, parked 1h`));
               return;
             }
             // No-route: Jupiter couldn't quote — back off 10 minutes, don't spam.
@@ -1482,14 +1508,17 @@ program
           if (Number.isFinite(health) && health < 1.05) {
             boardUpdate(obligation, { health, ...(health < 1 ? { status: "UNHEALTHY" } : {}) });
           }
-          if (health >= 1) {
-            // Healed back above 1.0 — disarm any armed fast-retry (position recovered).
-            if (executorStillDue.has(obligation)) {
-              executorStillDue.delete(obligation);
-              boardUpdate(obligation, { status: "HEALED", health });
-            }
-            return;
-          }
+           if (health >= 1) {
+             // Healed back above 1.0 — disarm any armed fast-retry (position
+             // recovered) AND release a lane-stuck EXECUTOR row: a position the
+             // WS now sees healthy is back in the tracked cohort (WATCH), not
+             // mid-verdict-chain.
+             if (executorStillDue.has(obligation) || (watchboard.get(obligation)?.status === "EXECUTOR" || watchboard.get(obligation)?.status === "UNHEALTHY")) {
+               executorStillDue.delete(obligation);
+               boardUpdate(obligation, { status: "HEALED", health });
+             }
+             return;
+           }
           // Still < 1.0: if a fast-retry is armed (sim said healthy but WS disagrees),
           // every further slice re-triggers the 5s race until the window closes.
           if (executorStillDue.has(obligation)) executeDue(obligation, { rail: "ws" });

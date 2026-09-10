@@ -98,6 +98,13 @@ export interface LiquidationInput {
    *  hot path. The first simulation still gates the send; the CU limit falls back
    *  to Jupiter's budget estimate + generous margin instead of sim-measured units. */
   fast?: boolean;
+  /** BLIND-FIRE mode (learning tuition, LionX same-slot shape): skip the
+   *  simulation round-trip and return the assembled tx ready-to-broadcast.
+   *  The on-chain program is the arbiter; a wrong guess burns only the
+   *  ~$0.001 fee. Race post-mortem 2026-09-10 12:47: LionX won same-slot
+   *  (0.0s) while our sim gate added ~300-500ms during which marginal
+   *  positions flipped back above 1.0. */
+  skipSimulate?: boolean;
   /** Priority-fee lane for the race (FASTLANE). "auto" scales the tip with the
    *  prize (capped at 2% of worst-case profit), "fixed" uses microlamportsPerCu
    *  verbatim, "off" sends at base fee. */
@@ -797,6 +804,48 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     ));
 
   done();
+
+  // BLIND-FIRE (skipSimulate): the on-chain program arbitrates; we return the
+  // assembled tx immediately. Only viable for cheap tuition plays — a wrong
+  // guess burns ~$0.001 of fee, but the same-slot speed is what wins marginal
+  // dust positions (the 12:47 post-mortem: every sim'd dust attempt lost the
+  // window to price oscillation, not to a competitor).
+  if (input.skipSimulate) {
+    done = mark("guards");
+    const feeBaseUnitsBlind = buildFinal.feeBaseUnits;
+    const netBaseUnitsBlind = activeSwapOutMin - repayAmountBaseUnits - feeBaseUnitsBlind;
+    const quotedNetBaseUnitsBlind = activeSwapOut - repayAmountBaseUnits - feeBaseUnitsBlind;
+    const usdPerDebtUnitBlind = Number(debtPriceBase.toFixed(12));
+    const worstCaseProfitUsdBlind = (Number(netBaseUnitsBlind) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnitBlind;
+    const quotedProfitUsdBlind = (Number(quotedNetBaseUnitsBlind) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnitBlind;
+    if (worstCaseProfitUsdBlind < input.minProfitUsd) {
+      return { stage: "simulate", passed: false, reason: `worst-case $${worstCaseProfitUsdBlind.toFixed(4)} < floor $${input.minProfitUsd}`, logs: [], timings };
+    }
+    return {
+      stage: "ready",
+      passed: true,
+      plan: {
+        obligation: obligationAddress,
+        healthFactor: health,
+        repayReserveSymbol: repayInfo.symbol,
+        withdrawReserveSymbol: withdrawReserve.getTokenSymbol(),
+        repayAmountBaseUnits,
+        repayUsd,
+        estCollateralBaseUnits,
+        estCollateralUsd: Number(new Decimal(estCollateralBaseUnits.toString()).mul(collPriceBase).toFixed(4)),
+        quotedProfitUsd: quotedProfitUsdBlind,
+        worstCaseProfitUsd: worstCaseProfitUsdBlind,
+        ...(activePlan.source ? { swapSource: activePlan.source } : {}),
+      },
+      transaction,
+      signer,
+      computeUnitsConsumed: 0n,
+      instructions: buildFinal.instructions.length,
+      timings,
+      priorityLane: priority.lane,
+      tipUsd: priority.tipUsd,
+    };
+  }
 
   // Simulate.
   done = mark("simulate");
