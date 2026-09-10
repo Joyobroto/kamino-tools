@@ -56,13 +56,27 @@ function isRateLimitFailure(statusCode: number | undefined, error: unknown): boo
 
 /** Connection-level failures (DNS, refused, timeout) — the primary being DOWN,
  *  not busy. These also warrant a flip (a dead endpoint is worse than a
- *  throttled one). HTTP 5xx stays on the primary (provider-side blips that
- *  usually clear in seconds and the callers' backoff already handles them). */
+ *  throttled one). */
 function isConnectionFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const cause = (error as { cause?: unknown } | null)?.cause;
   const causeMessage = cause instanceof Error ? cause.message : String(cause ?? "");
   return /fetch failed|ECONNREFUSED|ENOTFOUND|ECONNRESET|ETIMEDOUT|UND_ERR|network/i.test(message + " " + causeMessage);
+}
+
+/** Server-side failures (HTTP 5xx) — the provider is broken, not busy.
+ *  Observed live 2026-09-10: Helius returned 500s for 8 straight minutes and
+ *  three full-scan cycles died while the (free) fallback sat idle. A provider
+ *  outage is exactly what the fallback exists for — flip, and let the primary
+ *  re-earn traffic after the cooldown. */
+function isServerErrorFailure(statusCode: number | undefined, error: unknown): boolean {
+  if (typeof statusCode === "number" && statusCode >= 500 && statusCode < 600) return true;
+  const context = (error as { context?: { statusCode?: unknown } } | null)?.context;
+  if (context && typeof context.statusCode === "number" && context.statusCode >= 500 && context.statusCode < 600) return true;
+  // kit's SolanaError #8100002 wraps HTTP status in the context; regex as a
+  // last resort for message-embedded status codes.
+  const message = error instanceof Error ? error.message : String(error);
+  return /HTTP error \(5\d\d\)/i.test(message);
 }
 
 /**
@@ -94,7 +108,7 @@ export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRp
       })
       .catch(async (error: unknown) => {
         const statusCode = (error as { context?: { statusCode?: number } } | null)?.context?.statusCode;
-        const shouldFlip = isRateLimitFailure(statusCode, error) || isConnectionFailure(error);
+        const shouldFlip = isRateLimitFailure(statusCode, error) || isConnectionFailure(error) || isServerErrorFailure(statusCode, error);
         if (!shouldFlip) throw error;
         if (!chosenIsPrimary) {
           state.fallbackFailures += 1;
