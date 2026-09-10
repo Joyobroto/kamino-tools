@@ -166,18 +166,33 @@ function printAdlLine(candidate: AdlCandidate): string {
 
 function printScanPanel(cycle: number, result: ScanResult, scanNearMissBand: number, detailNearMiss: boolean): void {
   const { liquidatable, nearMiss, adlMarked, stats } = result;
-  console.log(color.bold(color.cyan(`CYCLE #${cycle}`)) + color.dim(`  ${localTimestamp(result.scannedAt)}  scanned=${result.obligationsScanned} hydrated=${result.shortlistScanned}`));
-  console.log(color.dim(`  skipped: ${stats.nonVanilla} non-vanilla · ${stats.healthy} healthy · ${stats.outOfBand} out of band · ${stats.noFlashDebt} no flash debt · ${stats.staleOracle} stale oracle · ${stats.belowFloor} below floor`));
+  // One-liner per scan. The cycle # prefix is dropped — "cycle #N scanning…"
+  // already announced it above; here only the timestamp + outcome matter.
+  // Skip-filters only list their NON-ZERO counts (out-of-band/below-floor
+  // are always 0 in this market's config — noise dropped from the line).
+  const skips: string[] = [];
+  if (stats.nonVanilla) skips.push(`${stats.nonVanilla} non-vanilla`);
+  if (stats.healthy) skips.push(`${stats.healthy} healthy`);
+  if (stats.outOfBand) skips.push(`${stats.outOfBand} out of band`);
+  if (stats.noFlashDebt) skips.push(`${stats.noFlashDebt} no flash debt`);
+  if (stats.staleOracle) skips.push(`${stats.staleOracle} stale oracle`);
+  if (stats.belowFloor) skips.push(`${stats.belowFloor} below floor`);
+  const skipCell = skips.length ? color.dim(`  ·  ${skips.join(" · ")}`) : "";
+  console.log(
+    color.dim(`[${localTimestamp(result.scannedAt)}]`) +
+    color.bold(color.cyan(` scanned=${result.obligationsScanned} hydrated=${result.shortlistScanned}`)) +
+    (liquidatable.length ? color.bold(color.red(`  ⚡ DUE=${liquidatable.length}`)) : "") +
+    (adlMarked.length ? color.bold(color.magenta(`  ADL=${adlMarked.length}`)) : "") +
+    skipCell,
+  );
 
-  // Zero = silence: ADL/DUE panels only print when there's something in them
-  // (the WATCHBOARD below carries the live cohort status every cycle anyway).
+  // Detail panels only when non-zero (counts already travel in the one-liner
+  // above; the WATCHBOARD carries the live cohort status every cycle anyway).
   if (adlMarked.length) {
-    console.log(color.bold(color.magenta(`◆ AUTO-DELEVERAGE MARKED: ${adlMarked.length}`)));
     adlMarked.forEach((candidate) => console.log(printAdlLine(candidate)));
   }
 
   if (liquidatable.length) {
-    console.log(color.bold(color.red(`⚡ DUE FOR LIQUIDATION: ${liquidatable.length}`)));
     // Cap the panel — in a dust/spray market dozens of ~$0.50 positions sit DUE every
     // scan; printing all of them floods the log while adding nothing. Show the
     // biggest prizes first + a truncation line.
@@ -728,14 +743,28 @@ program
       if (Date.now() - last < cooldownMs) return;
       executorRecentlyTried.set(obligation, Date.now());
       executorBusy.add(obligation);
-      // Fact-based veto forensics: when a DUE trigger is declined below (live
-      // gate, dust firewall, hydration gone), resolve WHY against the chain —
-      // "lost-race" (another bot liquidated it; who won, how fast) vs
-      // "self-healed" (no liquidation ever landed on-chain). Post-mortem of the
-      // 2026-09-09 22:07–22:11 window: 3 of 9 vetoes were races we LOST
-      // (LionX, 2CZ86epNMy…, ewcjNU4XWc…) 3–43s after our veto; the rest were
-      // genuine heals (12+ competitor txs all failed with ReserveStale).
-      const logVeto = (reason: string, detail: { liveHealth?: number; prizeUsd?: number }): void => {        const latencyMs = Date.now() - triggeredAtMs;
+      // Fact-based veto forensics: when a DUE trigger is declined by the
+      // HEALTH GATE, resolve WHY against the chain — "lost-race" (another bot
+      // liquidated it; who won, how fast) vs "self-healed" (nothing landed).
+      // Post-mortem 2026-09-09: 3 of 9 vetoes were races we LOST 3–43s later.
+      // Forensics is a getSignatures+getTransaction burst: dust/hydration
+      // vetoes log WITHOUT it (40+ dust vetoes per surge cycle used to
+      // self-inflict a 429 storm exactly when the race lanes needed the key).
+      const logVeto = (reason: string, detail: { liveHealth?: number; prizeUsd?: number; forensics?: boolean }): void => {
+        const latencyMs = Date.now() - triggeredAtMs;
+        const runForensics = detail.forensics ?? false;
+        if (!runForensics) {
+          logLedgerEntry(executorAutoOptions.ledgerPath, {
+            at: new Date().toISOString(),
+            type: "vetoed",
+            obligation,
+            reason,
+            latencyMs,
+            ...(detail.liveHealth !== undefined ? { liveHealth: detail.liveHealth } : {}),
+            ...(detail.prizeUsd !== undefined ? { prizeUsd: detail.prizeUsd } : {}),
+          });
+          return;
+        }
         void (async () => {
           const fate = await resolveVetoFate({ rpcUrl: options.rpc, obligation, triggeredAtMs });
           logLedgerEntry(executorAutoOptions.ledgerPath, {
@@ -788,8 +817,31 @@ program
           // spam shows they fire with NO pre-check at all). Scan/hot rails keep
           // the full gate below (they arrive with fresh candidates anyway).
           const raceRail = rail === "ws";
+          {
+            // Both rails hydrate for prize/debt metadata — with bounded retries
+            // and NO swallowed errors (a swallowed RPC error used to morph into
+            // a false "closed or unparseable" veto). The race rail differs only
+            // in that health is never gated afterwards — sim arbitrates.
+            for (let tryIndex = 0; tryIndex < 3 && !hydrated.candidates.length; tryIndex++) {
+              try {
+                hydrated = await refreshTrackedObligations({ rpc: rpcClient(options.rpc), preloaded: preloaded!, pubkeys: [address(obligation)] });
+              } catch {
+                if (tryIndex === 2) {
+                  // Race rail: RPC hiccup must NOT end the attempt — re-arm via
+                  // timer so a live DUE survives infra noise.
+                  if (raceRail) {
+                    executorRecentlyTried.delete(obligation);
+                    setTimeout(() => executeDue(obligation, { rail }), 3_000);
+                    return;
+                  }
+                  logVeto("hydration failed 3× (RPC errors during live-gate check)", {});
+                  return;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 750 * (tryIndex + 1)));
+              }
+            }
+          }
           if (raceRail) {
-            hydrated = await refreshTrackedObligations({ rpc: rpcClient(options.rpc), preloaded: preloaded!, pubkeys: [address(obligation)] }).catch(() => hydrated);
             const raceCandidate = hydrated.candidates[0];
             // Prize firewall still applies on the race rail (dust shouldn't
             // burn lanes), but health is NEVER gated here — sim decides.
@@ -806,18 +858,6 @@ program
                 prizeUsd: Math.max(0, raceCandidate.estimatedProfitUsd ?? 0),
               } : {}),
             });
-          } else {
-            for (let tryIndex = 0; tryIndex < 3 && !hydrated.candidates.length; tryIndex++) {
-              try {
-                hydrated = await refreshTrackedObligations({ rpc: rpcClient(options.rpc), preloaded: preloaded!, pubkeys: [address(obligation)] });
-              } catch {
-                if (tryIndex === 2) {
-                  logVeto("hydration failed 3× (RPC errors during live-gate check)", {});
-                  return;
-                }
-                await new Promise((resolve) => setTimeout(resolve, 750 * (tryIndex + 1)));
-              }
-            }
           }
           const candidate = hydrated.candidates[0];
           if (!candidate) {
@@ -828,7 +868,7 @@ program
           // this entirely (healthGateTolerance 1.5 below) and lets the tx's own
           // RefreshObligation + simulate() arbitrate on fresh prices.
           if (!raceRail && candidate.healthFactor >= 1 + HEALTH_GATE_TOLERANCE) {
-            logVeto(`live health ${candidate.healthFactor.toFixed(4)} ≥ ${(1 + HEALTH_GATE_TOLERANCE).toFixed(2)} (client gate declined)`, { liveHealth: candidate.healthFactor, prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0) });
+            logVeto(`live health ${candidate.healthFactor.toFixed(4)} ≥ ${(1 + HEALTH_GATE_TOLERANCE).toFixed(2)} (client gate declined)`, { liveHealth: candidate.healthFactor, prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0), forensics: true });
             return;
           }
           const marginalBand = !raceRail && candidate.healthFactor >= 1;
@@ -868,19 +908,19 @@ program
               ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd, bypassHealth: opts.bypassHealth ?? false }),
             }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
           let outcome = await runExecutor();
-          if (!outcome.passed && /ReserveStale|6009|price_status/.test(outcome.reason)) {
-            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] executor: ${obligation.slice(0, 8)}… reserve stale (EMA window tail) — retrying in 15s`));
-            await new Promise((resolve) => setTimeout(resolve, 15_000));
-            outcome = await runExecutor();
-          }
-          // Transient RPC throttling on the shared key: one pause-then-retry, and never
-          // count it toward the structural-failure streak (a 429 is not a property of the
-          // obligation — blocklisting a healthy DUE target because the RPC hiccuped would
-          // be fatal).
-          if (!outcome.passed && /8100002|429|too many|rate.?limit/i.test(outcome.reason)) {
-            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] executor: ${obligation.slice(0, 8)}… RPC throttled (429) — retrying in 8s`));
-            await new Promise((resolve) => setTimeout(resolve, 8_000));
-            outcome = await runExecutor();
+          // ReserveStale / RPC-throttle retries NO LONGER sleep inside the fire
+          // lane (a sleeping lane blocks the queue — 2 retries × 15s held = the
+          // same 3-lane stall shape as a hung send). The retry re-triggers
+          // executeDue on a timer, OUTSIDE the lane, and this lane exits now.
+          const retryable =
+            !outcome.passed && (/ReserveStale|6009|price_status/.test(outcome.reason)
+              || /8100002|429|too many|rate.?limit/i.test(outcome.reason));
+          if (retryable) {
+            const delayMs = /ReserveStale|6009|price_status/.test(outcome.reason) ? 5_000 : 3_000;
+            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] executor: ${obligation.slice(0, 8)}… ${/ReserveStale/.test(outcome.reason) ? "reserve stale" : "RPC throttled"} — re-arming in ${delayMs / 1000}s (lane released)`));
+            executorRecentlyTried.delete(obligation); // let the re-trigger pass cooldown
+            setTimeout(() => executeDue(obligation, { rail }), delayMs);
+            return;
           }
           if (!outcome.passed) {
             logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "skipped", obligation, stage: outcome.stage, reason: outcome.reason.slice(0, 200) });
@@ -913,12 +953,6 @@ program
             // No-route: Jupiter couldn't quote — back off 10 minutes, don't spam.
             if (/unquotable|No routes|unavailable/i.test(outcome.reason)) {
               executorNoRouteUntil.set(obligation, Date.now() + NO_ROUTE_COOLDOWN_MS);
-              return;
-            }
-            // RPC throttling (429 / 8100002): transient infra noise, never a structural
-            // property of the obligation — clear the streak and let cooldown pace retries.
-            if (/8100002|429|too many|rate.?limit/i.test(outcome.reason)) {
-              executorFailStreak.delete(obligation);
               return;
             }
             // Structural failures: after a streak, blocklist so it never burns budget again.
@@ -1086,7 +1120,7 @@ program
 
     const runOnce = async (cycle: number) => {
       executorStats.cycles = cycle;
-      if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] cycle #${cycle} scanning${surgeActive ? color.red(" [SURGE MODE]") : ""}...`));
+      if (!options.json) console.log(color.dim(`\n[${localTimestamp(new Date().toISOString())}] cycle #${cycle} scanning${surgeActive ? color.red(" [SURGE MODE]") : ""}...`));
       const result = await scanOnce({
         rpc: rpcClient(options.rpc),
         marketAddress: options.market,
@@ -1378,9 +1412,12 @@ program
     // broadcast) is owned by the executor, so we never execute on stale slate.
     const wsUrl = options.ws || options.rpc.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
     let wsHandle: LiquidationWsHandle | undefined;
+    let wsReadyPromise: Promise<void> | null = null;
     if (options.watch && !options.json) {
       const wsLogged = new Map<string, number>();
-      subscribeLiquidationSlices({
+      // The raw subscription promise (handle intact) — the first-cycle gate and
+      // the wsHandle assignment both consume it.
+      const wsSubscription: Promise<LiquidationWsHandle> = subscribeLiquidationSlices({
         wsUrl,
         marketAddress: options.market,
         onSlice: (slice) => {
@@ -1413,20 +1450,35 @@ program
           executeDue(obligation, { rail: "ws" });
         },
         onReady: () => {
-          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live (${wsUrl})`));
+          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live`));
         },
         onError: (error: unknown) => {
           console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
         },
-      }).then((handle) => {
-        wsHandle = handle;
-      }).catch((error: unknown) => {
-        if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws subscribe failed: ${error instanceof Error ? error.message : String(error)}`));
       });
+      wsSubscription
+        .then((handle) => {
+          wsHandle = handle;
+        })
+        .catch((error: unknown) => {
+          if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws subscribe failed: ${error instanceof Error ? error.message : String(error)}`));
+        });
+      // Ordering: hold the FIRST scan until the WS rail announces itself (or
+      // 5s pass) so the startup log reads watching → telegram → ws deltas live
+      // → cycle #1 — instead of the first-scan line racing in between.
+      wsReadyPromise = Promise.race([
+        wsSubscription.then((handle) => handle.ready).catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
+      ]);
     }
     while (true) {
       const now = Date.now();
       if (now >= nextFullScan && !fullScanPromise) {
+        if (wsReadyPromise) {
+          const hold = wsReadyPromise;
+          wsReadyPromise = null; // only gate the first cycle
+          await hold;
+        }
         cycle += 1;
         nextFullScan = now + intervalMs;
         nextHotTick = now + hotIntervalMs;

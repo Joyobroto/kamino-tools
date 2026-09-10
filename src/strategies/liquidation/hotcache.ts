@@ -24,7 +24,9 @@ interface CachedBlockhash {
   fetchedAt: number;
 }
 
-const BLOCKHASH_MAX_AGE_MS = 45_000; // 150 slots ≈ 60s; refresh well before expiry
+const BLOCKHASH_MAX_AGE_MS = 30_000; // 150 slots ≈ 60s validity; refresh with a
+// safety margin — a fire that assembles + sims for ~10-20s must still have
+// enough blockhash lifetime left to land AND confirm.
 const BLOCKHASH_STALE_RETRY_MS = 2_000;
 
 const blockhashCache = new Map<string, CachedBlockhash>();

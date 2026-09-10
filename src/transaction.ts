@@ -111,13 +111,24 @@ export async function simulate(rpc: Rpc<SolanaRpcApi>, transaction: FullySignedT
 export async function sendAndConfirm(
   rpcUrl: string,
   rpc: Rpc<SolanaRpcApi>,
-  transaction: FullySignedTransaction & TransactionWithBlockhashLifetime
+  transaction: FullySignedTransaction & TransactionWithBlockhashLifetime,
 ): Promise<string> {
   const wsUrl = rpcUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
   const { createSolanaRpcSubscriptions } = await import("@solana/kit");
   const subscriptions = createSolanaRpcSubscriptions(wsUrl);
   const sender = sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions: subscriptions });
   const signature = getSignatureFromTransaction(transaction);
-  await sender(transaction, { commitment: "confirmed", skipPreflight: false });
+  // Hard timeout: a tx that never confirms (lost blockspace race, expired
+  // blockhash behind a slow send) must RELEASE the fire lane — without this the
+  // sendAndConfirm promise hangs forever and all 3 MAX_FIRE_LANES stall
+  // permanently (the "bot froze overnight" failure mode). The blockhash
+  // lifetime is ≤60s; 90s covers worst-case confirmation latency.
+  const SEND_CONFIRM_TIMEOUT_MS = 90_000;
+  await Promise.race([
+    sender(transaction, { commitment: "confirmed", skipPreflight: true }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`sendAndConfirm timeout after ${SEND_CONFIRM_TIMEOUT_MS}ms — tx likely expired (blockhash) or lost the blockspace race`)), SEND_CONFIRM_TIMEOUT_MS),
+    ),
+  ]);
   return signature;
 }

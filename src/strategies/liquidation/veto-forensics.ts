@@ -56,7 +56,7 @@ export async function resolveVetoFate(params: {
   limit?: number;
 }): Promise<VetoResolution> {
   const { obligation, triggeredAtMs } = params;
-  const limit = params.limit ?? 30;
+  const limit = params.limit ?? 10;
   try {
     const response = await fetch(params.rpcUrl, {
       method: "POST",
