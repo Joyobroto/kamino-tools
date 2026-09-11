@@ -32,3 +32,17 @@ test("queue reserves exactly three slots during a synchronous burst and drains f
   await tick();
   assert.equal(completed, 10); assert.equal(errors.length, 2);
 });
+
+test("queue prioritizes fresh race work while preserving FIFO ties", async () => {
+  const started: number[] = [];
+  const release: Array<() => void> = [];
+  const enqueue = createTaskQueue(1, () => {});
+  enqueue(async () => { started.push(1); await new Promise<void>((resolve) => release.push(resolve)); });
+  enqueue(async () => { started.push(2); });
+  enqueue(async () => { started.push(3); }, 10);
+  await tick();
+  assert.deepEqual(started, [1]);
+  release.shift()!();
+  await tick();
+  assert.equal(started[1], 3);
+});

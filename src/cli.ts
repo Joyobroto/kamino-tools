@@ -709,15 +709,15 @@ program
     const executorCooldownMs = 30_000;
     const executorRecentlyTried = new Map<string, number>();
     // Bounded-concurrency fire lanes: LionX's census shows they fire PARALLEL txs
-    // (3 liquidations in the same slot, one per obligation). A strict FIFO would
-    // serialize a same-slot burst — the 3rd fire waits ~2 fire-lengths and loses.
-    // MAX_FIRE_LANES keeps ≤3 pipelines in flight: parallel enough to match a
-    // same-slot burst, bounded enough to never re-trigger the 429 storm that
-    // unbounded spawning caused (each pipeline is ~10 RPC calls on the shared
-    // key). Guards/budget caps are evaluated INSIDE each lane, so the caps bind
-    // exactly the same; ledger writes are single-line JSONL appends.
+    // (3 liquidations in the same slot, one per obligation). Keep exactly three
+    // lanes, but reserve one for WS race triggers so a scan burst cannot occupy
+    // every slot. Both queues are priority ordered; fresher/prepared candidates
+    // jump ahead without increasing RPC concurrency or recreating the 429 storm.
     const MAX_FIRE_LANES = 3;
-    const enqueueFire = createTaskQueue(MAX_FIRE_LANES, (error) => {
+    const enqueueWsFire = createTaskQueue(1, (error) => {
+      console.error(`ws executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    const enqueueGeneralFire = createTaskQueue(MAX_FIRE_LANES - 1, (error) => {
       console.error(`executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     const enqueueForensics = createTaskQueue(1, () => {});
@@ -852,8 +852,13 @@ program
           }
         });
       };
-      // Bounded fire lane: up to MAX_FIRE_LANES pipelines run in PARALLEL (the
-      // LionX same-slot burst shape); extras queue until a lane frees.
+      // WS gets its reserved lane; scan/hot work uses the other two. Priority
+      // is stable FIFO for equal scores, with fresh/prepared race candidates
+      // ahead of older queued work.
+      const queuePriority = (opts.streamSnapshot?.receivedAt !== undefined
+        ? Math.max(0, 2_000 - (Date.now() - opts.streamSnapshot.receivedAt))
+        : 0) + Math.max(0, opts.prepared?.candidates[0]?.estimatedProfitUsd ?? 0);
+      const enqueueFire = rail === "ws" ? enqueueWsFire : enqueueGeneralFire;
       enqueueFire(async () => {
         try {
           const guards = evaluateFireGuards(executorAutoOptions, loadLedger(executorAutoOptions.ledgerPath), Date.now(), existsSync(executorAutoOptions.stopFilePath));

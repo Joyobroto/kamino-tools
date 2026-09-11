@@ -27,10 +27,12 @@ export async function firstUsable<T>(works: Array<Promise<T | null>>): Promise<T
 export function createTaskQueue(capacity: number, onError: (error: unknown) => void) {
   if (!Number.isInteger(capacity) || capacity < 1) throw new Error("Invalid queue capacity");
   let active = 0;
-  const waiting: Array<() => Promise<void>> = [];
+  let sequence = 0;
+  const waiting: Array<{ task: () => Promise<void>; priority: number; sequence: number }> = [];
   const drain = () => {
     while (active < capacity && waiting.length) {
-      const task = waiting.shift()!;
+      waiting.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
+      const task = waiting.shift()!.task;
       active++;
       void Promise.resolve().then(task).catch(onError).finally(() => {
         active--;
@@ -38,5 +40,8 @@ export function createTaskQueue(capacity: number, onError: (error: unknown) => v
       });
     }
   };
-  return (task: () => Promise<void>) => { waiting.push(task); drain(); };
+  return (task: () => Promise<void>, priority = 0) => {
+    waiting.push({ task, priority, sequence: sequence++ });
+    drain();
+  };
 }
