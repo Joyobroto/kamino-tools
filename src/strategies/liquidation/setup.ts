@@ -3,6 +3,7 @@ import { address, type Address, type Instruction, type Rpc, type SolanaRpcApi, t
 import {
   createLookupTableIx,
   extendLookupTableIxs,
+  initLookupTableIx,
   type KaminoMarket,
   type KaminoReserve,
 } from "@kamino-finance/klend-sdk";
@@ -212,10 +213,18 @@ export async function buildLiquidationSetup(input: {
   const complements: AltRef[] = [];
   const extendTransactions: Instruction[][] = [];
   let tableForGroup: Address = lookupTable;
+  // Companion PDAs must be DISTINCT. createLookupTableIx seeds the PDA with the
+  // CURRENT finalized slot — two creates back-to-back resolve to the SAME slot
+  // (same PDA) and the second create tx fails "already initialized" (seen live
+  // on the first --all run). Derive each with an explicit slot offset instead.
+  const baseSlot =
+    groups.length > 1
+      ? (await rpc.getSlot({ commitment: "finalized" }).send())
+      : 0n;
   for (let g = 0; g < groups.length; g += 1) {
     const keysIn = groups[g]!;
     if (g > 0) {
-      const [createCompanionIx, newTable] = await createLookupTableIx(rpc, signer);
+      const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(g));
       if (createCompanionIx) companionCreates.push([createCompanionIx]);
       tableForGroup = newTable;
       complements.push({ lookupTable: newTable.toString(), keyCount: keysIn.length });
