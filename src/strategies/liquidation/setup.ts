@@ -88,11 +88,25 @@ export async function liquidationAltKeys(input: {
   return [...keys.values()];
 }
 
+export interface AltRef {
+  lookupTable: string;
+  keyCount: number;
+}
+
 export interface AltState {
   lookupTable: string;
   createdAt: string;
   authority: string;
   keyCount: number;
+  /** Chained companion tables (each ≤256 slots) holding the overflow from
+   *  market-wide --all coverage — see buildLiquidationSetup MAX_ALT_KEYS. */
+  complements?: AltRef[];
+}
+
+/** Primary + all companion tables as address strings (empty when no ALT). */
+export function altTableAddresses(state: AltState | null): string[] {
+  if (!state) return [];
+  return [state.lookupTable, ...(state.complements?.map((c) => c.lookupTable) ?? [])];
 }
 
 export function loadAltState(path: string = ALT_STATE_PATH): AltState | null {
@@ -113,6 +127,11 @@ export function saveAltState(state: AltState, path: string = ALT_STATE_PATH): vo
  * pre-creates the hot ATAs. Returns SEPARATE transactions (each fits the packet
  * size — an ALT-extend carries its full key list inline).
  */
+/** Table slots to fill before rotating to a fresh companion table — well under
+ *  the 256-slot hard cap, leaving headroom so a late extend never straddles. */
+const MAX_ALT_KEYS = 240;
+const EXTEND_CHUNK = 20;
+
 export async function buildLiquidationSetup(input: {
   rpc: Rpc<SolanaRpcApi>;
   market: KaminoMarket;
@@ -124,7 +143,7 @@ export async function buildLiquidationSetup(input: {
   existingLookupTable?: Address;
   /** Keys already in the ALT (skip re-appending them). */
   existingKeys?: Address[];
-}): Promise<{ transactions: Instruction[][]; lookupTable: Address; keyCount: number }> {
+}): Promise<{ transactions: Instruction[][]; lookupTable: Address; keyCount: number; complements: AltRef[] }> {
   const { rpc, market, reserves, signer } = input;
   let createIx: Instruction | null = null;
   const lookupTable = input.existingLookupTable ?? (await createLookupTableIx(rpc, signer))[1];
@@ -167,16 +186,44 @@ export async function buildLiquidationSetup(input: {
     ? [[createIx, ...(ataBatches.shift() ?? [])], ...ataBatches]
     : ataBatches;
 
-  // Tx 2..n: extend the ALT in small chunks. An ALT cannot hold duplicate keys,
-  // so skip anything already present when reusing.
+  // Tx 2..n: extend the ALT(s) in small chunks. An ALT cannot hold duplicate
+  // keys, so skip anything already present when reusing. Market-wide coverage
+  // (58 reserves ≈ 1000+ keys) exceeds the 256-slot table cap — group the
+  // overflow into chained companion tables, each independently ≤ MAX_ALT_KEYS.
   const keys = await liquidationAltKeys({ market, reserves, authority: signer.address, rpcUrl: input.rpcUrl });
   const existing = new Set((input.existingKeys ?? []).map((a) => a.toString()));
   const toAdd = keys.filter((k) => !existing.has(k.toString()));
-  const CHUNK = 20;
-  const extendTransactions: Instruction[][] = [];
-  for (let i = 0; i < toAdd.length; i += CHUNK) {
-    extendTransactions.push(extendLookupTableIxs(signer, lookupTable, toAdd.slice(i, i + CHUNK), signer));
+
+  const groups: Address[][] = [];
+  let group: Address[] = [];
+  let groupBudget = MAX_ALT_KEYS - existing.size;
+  for (const key of toAdd) {
+    if (groupBudget <= 0) {
+      groups.push(group);
+      group = [];
+      groupBudget = MAX_ALT_KEYS;
+    }
+    group.push(key);
+    groupBudget -= 1;
   }
-  const transactions = [...ataTransactions, ...extendTransactions].filter((tx) => tx.length > 0);
-  return { transactions, lookupTable, keyCount: keys.length };
+  if (group.length) groups.push(group);
+
+  const companionCreates: Instruction[][] = [];
+  const complements: AltRef[] = [];
+  const extendTransactions: Instruction[][] = [];
+  let tableForGroup: Address = lookupTable;
+  for (let g = 0; g < groups.length; g += 1) {
+    const keysIn = groups[g]!;
+    if (g > 0) {
+      const [createCompanionIx, newTable] = await createLookupTableIx(rpc, signer);
+      if (createCompanionIx) companionCreates.push([createCompanionIx]);
+      tableForGroup = newTable;
+      complements.push({ lookupTable: newTable.toString(), keyCount: keysIn.length });
+    }
+    for (let i = 0; i < keysIn.length; i += EXTEND_CHUNK) {
+      extendTransactions.push(extendLookupTableIxs(signer, tableForGroup, keysIn.slice(i, i + EXTEND_CHUNK), signer));
+    }
+  }
+  const transactions = [...ataTransactions, ...companionCreates, ...extendTransactions].filter((tx) => tx.length > 0);
+  return { transactions, lookupTable, keyCount: keys.length, complements };
 }

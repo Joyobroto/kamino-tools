@@ -30,7 +30,7 @@ import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarke
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
 import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
-import { buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
+import { altTableAddresses, buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
 import { getAccountsInLut } from "@kamino-finance/klend-sdk";
 import type { KaminoObligation, KaminoReserve } from "@kamino-finance/klend-sdk";
 import type { ScanEvent, ScanResult, LiquidatableCandidate, AdlCandidate } from "./strategies/liquidation/types.js";
@@ -649,6 +649,16 @@ program
     // preloaded market is reused (no second market-load RPC burst).
     const executeMarket = options.execute ? (preloaded?.market ?? await loadMarket(rpcClient(options.rpc), options.market)) : undefined;
     const executorAltState = loadAltState();
+    const executorAltTables = altTableAddresses(executorAltState);
+    // Warm the fire path BEFORE the first fire: blockhash + every chained ALT
+    // contents are fetched in the background so the first DUE never eats the
+    // cold-fetch round-trips on the critical path (ALT contents ~80-100ms each;
+    // with companion tables that same cost every fire would be).
+    if (executorAltTables.length) {
+      const { warmAltTables, warmBlockhash } = await import("./strategies/liquidation/hotcache.js");
+      warmBlockhash(rpcClient(options.rpc));
+      warmAltTables(options.rpc, executorAltTables);
+    }
     const executorAutoOptions: AutofireOptions = {
       lsts: [],
       sizeUsd: 0,
@@ -945,7 +955,7 @@ program
               obligationAddress: address(obligation),
               slippageBps: executorAutoOptions.slippageBps,
               minProfitUsd: executorAutoOptions.minProfitUsd,
-              ...(executorAltState ? { lookupTableAddresses: [address(executorAltState.lookupTable)] } : {}),
+              ...(executorAltTables.length ? { lookupTableAddresses: executorAltTables.map(address) } : {}),
               ...(options.fast ? { fast: true } : {}),
               // Learning-mode blind fire (LionX same-slot shape): for small
               // prizes on the race rail the sim round-trip costs us the window
@@ -1603,7 +1613,7 @@ program
 
     const reuseAlt = options.reuseAlt ? address(options.reuseAlt) : undefined;
     const existingKeys = reuseAlt ? await getAccountsInLut(rpc, reuseAlt) : undefined;
-    const { transactions, lookupTable, keyCount } = await buildLiquidationSetup({
+    const { transactions, lookupTable, keyCount, complements } = await buildLiquidationSetup({
       rpc,
       market,
       reserves,
@@ -1613,6 +1623,7 @@ program
       ...(existingKeys?.length ? { existingKeys: existingKeys.map((k: string) => address(k)) } : {}),
     });
     console.log(`ALT ${lookupTable} will hold ${keyCount} keys${existingKeys?.length ? ` (${existingKeys.length} already present)` : ""} across ${transactions.length} transactions…`);
+    if (complements.length) console.log(color.dim(`  companion tables for the overflow: ${complements.map((c) => `${c.lookupTable} (${c.keyCount} keys)`).join(", ")}`));
     for (const [index, instructions] of transactions.entries()) {
       if (!instructions.length) continue;
       const setupTx = await createSignedTransactionWithAlt(rpc, options.rpc, signer, instructions, []);
@@ -1625,8 +1636,14 @@ program
       }
     }
     console.log(color.green(`✅ SETUP COMPLETE`));
-    saveAltState({ lookupTable: lookupTable.toString(), createdAt: new Date().toISOString(), authority: signer.address.toString(), keyCount });
-    console.log(color.bold(color.green(`✔ ALT saved to ${ALT_STATE_PATH} — future liquidation txs now compress via it`)));
+    saveAltState({
+      lookupTable: lookupTable.toString(),
+      createdAt: new Date().toISOString(),
+      authority: signer.address.toString(),
+      keyCount,
+      ...(complements.length ? { complements } : {}),
+    });
+    console.log(color.bold(color.green(`✔ ALT${complements.length ? "s" : ""} saved to ${ALT_STATE_PATH} — future liquidation txs now compress via the chained tables`)));
   });
 
 program
@@ -1658,7 +1675,7 @@ program
       slippageBps: Number(options.slippageBps),
       minProfitUsd: Number(options.minProfit),
       ...(options.bypassHealth ? { bypassHealth: true } : {}),
-      ...(altState ? { lookupTableAddresses: [address(altState.lookupTable)] } : {}),
+      ...(altTableAddresses(altState).length ? { lookupTableAddresses: altTableAddresses(altState).map(address) } : {}),
     }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
 
     if (!outcome.passed) {

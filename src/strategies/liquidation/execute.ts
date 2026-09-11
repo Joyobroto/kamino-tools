@@ -27,6 +27,7 @@ import {
   getCurrentLedgerInstant,
   getTokenIdsForScopeRefresh,
   liquidateObligationAndRedeemReserveCollateralV2,
+  obligationFarmStatePda,
   refreshObligation,
   refreshReserve,
   type KaminoMarket,
@@ -71,6 +72,65 @@ import { applySlippage, fetchRawQuote, fetchSwapInstructions } from "../arb/lst-
 const ATA_PROGRAM = "ATokenGPvbdgxrpT2sgsWoLtT8H9y6hktjssKpsrjqer";
 const DEFAULT_CLOSE_FACTOR = 0.5;
 const PRECISION_MARGIN_BPS = 20; // safety haircut on the collateral estimate
+
+type FarmAccounts = {
+  obligationFarmUserState: Option<Address>;
+  reserveFarmState: Option<Address>;
+};
+
+/**
+ * Resolve the farm accounts the liquidation V2 ix must carry — ZERO added fire
+ * latency because it joins the existing paralel Promise.all (collateralForFarm
+ * derivation is local math; only ONE batched getMultipleAccounts, kicked at the
+ * same instant as the Jupiter quote).
+ *
+ * 6120/FarmAccountsMissing happens when an obligation JOINED a Kamino lending
+ * farm for the repay/withdraw reserve (obligation-farm-user-state PDA exists
+ * on-chain) but the tx passes none() — the program refuses to refresh
+ * farm-backed positions without those accounts. The reserve stores its farm
+ * address directly (getDebtFarmAddress / getCollateralFarmAddress — set on ALL
+ * 58 main market reserves), and the obligation side is the farms-program PDA
+ * reconciling that farm with the obligation. If the PDA doesn't exist the
+ * obligation never joined → none() is correct and unchanged.
+ */
+async function resolveFarmAccounts(
+  rpc: Rpc<SolanaRpcApi>,
+  repayReserve: KaminoReserve,
+  withdrawReserve: KaminoReserve,
+  obligationAddress: Address,
+): Promise<{ collateralFarmsAccounts: FarmAccounts; debtFarmsAccounts: FarmAccounts }> {
+  const noneFarms = (): FarmAccounts => ({ obligationFarmUserState: none<Address>(), reserveFarmState: none<Address>() });
+  const debtFarmOption = repayReserve.getDebtFarmAddress();
+  const collFarmOption = withdrawReserve.getCollateralFarmAddress();
+  if (debtFarmOption.__option !== "Some" && collFarmOption.__option !== "Some") {
+    return { collateralFarmsAccounts: noneFarms(), debtFarmsAccounts: noneFarms() };
+  }
+
+  const probes: Array<{ farm: Address; key: "debtFarmsAccounts" | "collateralFarmsAccounts" }> = [];
+  if (debtFarmOption.__option === "Some") probes.push({ farm: debtFarmOption.value, key: "debtFarmsAccounts" });
+  if (collFarmOption.__option === "Some") probes.push({ farm: collFarmOption.value, key: "collateralFarmsAccounts" });
+
+  const withPda = await Promise.all(
+    probes.map(async (side) => ({ ...side, pda: await obligationFarmStatePda(side.farm, obligationAddress) })),
+  );
+  const existence = await rpc
+    .getMultipleAccounts(withPda.map((side) => side.pda), { encoding: "base64" })
+    .send()
+    .then((r) => (r.value ?? []).map(Boolean))
+    .catch(() => withPda.map(() => false));
+
+  const out: { collateralFarmsAccounts: FarmAccounts; debtFarmsAccounts: FarmAccounts } = {
+    collateralFarmsAccounts: noneFarms(),
+    debtFarmsAccounts: noneFarms(),
+  };
+  for (let i = 0; i < withPda.length; i += 1) {
+    const side = withPda[i]!;
+    if (existence[i]) {
+      out[side.key] = { obligationFarmUserState: some(side.pda), reserveFarmState: some(side.farm) };
+    }
+  }
+  return out;
+}
 
 export interface LiquidationInput {
   rpc: Rpc<SolanaRpcApi>;
@@ -524,13 +584,18 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       return fetched;
     });
   };
-  const [clmmPlan, jupPlan, jupDirectPlan, debtAtaState, collAtaState, cTokenAtaState] = await Promise.all([
+  const [clmmPlan, jupPlan, jupDirectPlan, debtAtaState, collAtaState, cTokenAtaState, farmAccounts] = await Promise.all([
     withTimeout(buildLocalClmmPlan(), 350),
     buildJupiterPlan(false).catch(() => null),
     buildJupiterPlan(true).catch(() => null),
     fetchAtaWithCache(debtAta, repayReserve.getLiquidityMint(), repayReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(collAta, withdrawReserve.getLiquidityMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(cTokenAta, withdrawReserve.getCTokenMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
+    // Farm account resolution rides the SAME parallel batch (CPUs/IO overlap) —
+    // a DNS/RPC slow-down here costs the fire nothing: fifty reservations already
+    // share this window. On 6120 obligations this is the difference between a
+    // fireable tx and a guaranteed program-reject.
+    resolveFarmAccounts(rpc, repayReserve, withdrawReserve, obligationAddress),
   ]);
   let swapPlan: SwapPlan | null = clmmPlan ?? jupPlan;
   if (!swapPlan) {
@@ -665,8 +730,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         withdrawLiquidityTokenProgram: withdrawReserve.getLiquidityTokenProgram(),
         instructionSysvarAccount: SYSVAR_INSTRUCTIONS_ADDRESS,
       },
-      collateralFarmsAccounts: { obligationFarmUserState: none<Address>(), reserveFarmState: none<Address>() },
-      debtFarmsAccounts: { obligationFarmUserState: none<Address>(), reserveFarmState: none<Address>() },
+      collateralFarmsAccounts: farmAccounts.collateralFarmsAccounts,
+      debtFarmsAccounts: farmAccounts.debtFarmsAccounts,
       farmsProgram: market.farmsProgramId,
     },
     [],
