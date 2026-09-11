@@ -410,6 +410,7 @@ export function heartbeatAlert(params: {
   walletSol: number;
   mode: "shadow" | "live";
   wsLive: boolean;
+  wsActive?: string;
   rpcOnFallback: boolean;
   lastFailure?: string;
 }): TelegramAlert {
@@ -417,7 +418,7 @@ export function heartbeatAlert(params: {
     ? `${params.lostRaces} ($${params.lostPrizeUsd.toFixed(2)} prize lost)`
     : String(params.lostRaces);
   const rails = [
-    `WS ${params.wsLive ? "live ✓" : "DOWN ✗"}`,
+    `WS ${params.wsLive ? "live ✓" : "DOWN ✗"}${params.wsActive ? ` (${params.wsActive})` : ""}`,
     `RPC ${params.rpcOnFallback ? "on FALLBACK ⚠" : "primary ✓"}`,
   ].join(" · ");
   const lines = [

@@ -7,6 +7,10 @@ const OBLIGATION_ACCOUNT_SIZE = 3344n;
 const MARKET_OFFSET_OFFSET = 32n;
 const SLICE_OFFSET = 2208;
 const SLICE_LENGTH = 130;
+/** Liveness check cadence + soft-resync window for the deltas rail. */
+const LIVENESS_CHECK_MS = 20_000;
+const LIVENESS_RESYNC_MS = 15 * 60_000;
+const RECONNECT_MAX_MS = 15_000;
 
 export interface WsObligationSlice {
   pubkey: Address;
@@ -39,12 +43,16 @@ export function healthFactorFromParsed(parsed: { debtSf: bigint; unhealthySf: bi
 
 export interface LiquidationWsOptions {
   wsUrl: string;
+  /** Optional rotation list. On every (re)connect attempt the rail advances to
+   *  the next candidate, giving automatic provider fallback (primary Helius →
+   *  fallback RPC wss → Solana public wss). wsUrl is always the first. */
+  wsCandidates?: string[];
   marketAddress: string;
   programId?: Address;
   /** Called for every obligation account change delivered over WSS. */
   onSlice: (slice: WsObligationSlice) => void;
-  /** Called when the WSS subscription is (re)established. */
-  onReady?: () => void;
+  /** Called when the WSS subscription is (re)established with the active endpoint. */
+  onReady?: (activeEndpoint: string) => void;
   /** Called on subscribe errors or unexpected stream errors. */
   onError?: (error: unknown) => void;
 }
@@ -52,6 +60,8 @@ export interface LiquidationWsOptions {
 export interface LiquidationWsHandle {
   abort: () => void;
   ready: Promise<void>;
+  /** The endpoint currently serving the (re)established stream. */
+  activeEndpoint: () => string;
 }
 
 /**
@@ -63,6 +73,7 @@ export interface LiquidationWsHandle {
 export async function subscribeLiquidationSlices(options: LiquidationWsOptions): Promise<LiquidationWsHandle> {
   const { wsUrl, marketAddress, onSlice } = options;
   const programId = options.programId ?? address(KLEND_PROGRAM_ID.toString());
+  const candidates = [...new Set([wsUrl, ...(options.wsCandidates ?? [])])];
 
   const abortController = new AbortController();
   let resolveReady!: () => void;
@@ -71,13 +82,46 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
     resolveReady = resolve;
     rejectReady = reject;
   });
+  // Monotonic attempt counter drives the round-robin: after a drop the next try
+  // lands on the NEXT provider, so a dead primary falls through to the fallbacks
+  // by itself and a healthy stream stays put until IT drops.
+  let attempt = 0;
+  let activeEndpoint = wsUrl;
 
   const run = async (): Promise<void> => {
     let delayMs = 1_000;
-    let first = true;
+    let readySettled = false;
     while (!abortController.signal.aborted) {
-      const subscriptions = createSolanaRpcSubscriptions(wsUrl);
+      const endpoint = candidates[attempt % candidates.length]!;
+      attempt += 1;
+      // Per-iteration abort (NOT the shared handle abort): lets us teardown a
+      // single stream instance without killing the whole rail.
+      const iterationControl = new AbortController();
+      const subscriptions = createSolanaRpcSubscriptions(endpoint);
+      let wantResync = false;
+      let lastSyncAt = Date.now();
+      // Provider-agnostic liveness: a WS that stays connected but silently stops
+      // forwarding (Helius edges have done this) never throws, so the reconnect
+      // loop never fires and the live flag goes stale. Slot/ping methods differ
+      // across RPCs, so we SOFT-RESYNC on a timer instead: re-establish the whole
+      // stream periodically unless it proved alive in the window. One reconnect
+      // per rotation is microseconds of duty — and it keeps the heartbeat honest
+      // AND catches a dead-but-open socket within that bound.
+      const livenessTimer = setInterval(() => {
+        if (abortController.signal.aborted || iterationControl.signal.aborted) {
+          clearInterval(livenessTimer);
+          return;
+        }
+        if (Date.now() - lastSyncAt > LIVENESS_RESYNC_MS) {
+          wantResync = true;
+          options.onError?.(new Error(`ws liveness: no activity in ${(LIVENESS_RESYNC_MS / 1000)}s — soft reconnect`));
+          iterationControl.abort();
+        }
+      }, LIVENESS_CHECK_MS);
       try {
+        // Combined signal: per-iteration teardown (liveness/watchdog) AND the
+        // shared handle.abort() both end this stream.
+        const streamSignal = AbortSignal.any([abortController.signal, iterationControl.signal]);
         const iterable = await subscriptions
           .programNotifications(programId, {
             commitment: "confirmed",
@@ -87,14 +131,22 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
               { memcmp: { offset: MARKET_OFFSET_OFFSET, bytes: marketAddress as unknown as Base58EncodedBytes, encoding: "base58" } },
             ],
           })
-          .subscribe({ abortSignal: abortController.signal });
-        if (first) {
-          options.onReady?.();
+          .subscribe({ abortSignal: streamSignal });
+        lastSyncAt = Date.now();
+        activeEndpoint = endpoint;
+        // onReady on EVERY (re)establishment — a rail that recovered must flip
+        // back to "live", otherwise the heartbeat keeps reporting a stale DOWN.
+        options.onReady?.(endpoint);
+        // Ready promise settles on the FIRST successful connect ever; it only
+        // rejects once every candidate failed a full round (real outage), not on
+        // a transient primary failure that a fallback immediately replaces.
+        if (!readySettled) {
           resolveReady();
-          first = false;
+          readySettled = true;
         }
         delayMs = 1_000;
         for await (const notification of iterable) {
+          lastSyncAt = Date.now();
           const value = (notification as unknown as {
             value?: { pubkey?: string; account?: { data?: [string, string] } };
           }).value;
@@ -105,16 +157,36 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
             // malformed account — ignore (error isolation, never crash the stream)
           }
         }
-      } catch (error) {
-        if (abortController.signal.aborted) break;
-        options.onError?.(error);
-        if (first) {
-          rejectReady(error);
-          first = false;
+        if (abortController.signal.aborted) {
+          clearInterval(livenessTimer);
+          break;
         }
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        delayMs = Math.min(delayMs * 2, 15_000);
+        // Stream ended without an error (upstream closed it quietly) — treat as a
+        // drop and let the catch below run a bounded reconnect, never a tight loop.
+        throw new Error("program notification stream ended");
+      } catch (error) {
+        if (abortController.signal.aborted) {
+          clearInterval(livenessTimer);
+          break;
+        }
+        options.onError?.(error);
+        // Ready rejects only after a FULL round of candidates failed to connect —
+        // a transient primary drop that a fallback replaces must NOT reject it.
+        if (!readySettled && attempt >= candidates.length) {
+          rejectReady(error);
+          readySettled = true;
+        }
+        clearInterval(livenessTimer);
+        if (wantResync) {
+          // Soft resync: reconnect immediately (success path resets delayMs).
+          delayMs = 0;
+          wantResync = false;
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          delayMs = Math.min(delayMs * 2, RECONNECT_MAX_MS);
+        }
       }
+      iterationControl.abort();
     }
   };
 
@@ -123,5 +195,6 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
   return {
     abort: () => abortController.abort(),
     ready,
+    activeEndpoint: () => activeEndpoint,
   };
 }

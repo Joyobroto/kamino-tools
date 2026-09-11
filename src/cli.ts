@@ -333,6 +333,14 @@ function shortAddress(value: string): string {
   return `${value.slice(0, 8)}…${value.slice(-6)}`;
 }
 
+function safeWebsocketHost(wsUrl: string): string {
+  try {
+    return new URL(wsUrl).hostname;
+  } catch {
+    return "";
+  }
+}
+
 function compactNumber(value: string): string {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return value;
@@ -1410,6 +1418,7 @@ program
             walletSol,
             mode: options.broadcast ? "live" : "shadow",
             wsLive: wsRailAlive(),
+            wsActive: safeWebsocketHost(activeWsEndpoint),
             rpcOnFallback: failoverHealth({ primaryUrl: options.rpc, fallbackUrl: process.env.SOLANA_RPC_FALLBACK ?? "" }).onFallback,
             ...(executorStats.lastFailure ? { lastFailure: executorStats.lastFailure } : {}),
           }));
@@ -1503,6 +1512,14 @@ program
     // go straight to executeDue — every later stage (fresh hydration, guards, sim,
     // broadcast) is owned by the executor, so we never execute on stale slate.
     const wsUrl = options.ws || options.rpc.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    // Auto-fallback WS rotation: primary → SOLANA_RPC_FALLBACK wss → Solana public
+    // wss. ws-realtime advances one spot per failed attempt, so a dead primary
+    // falls through by itself. An explicit --ws override pins a single endpoint.
+    const fallbackWsUrl = (process.env.SOLANA_RPC_FALLBACK ?? "").replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    const wsCandidates = options.ws
+      ? undefined
+      : [...new Set([wsUrl, fallbackWsUrl, "wss://api.mainnet-beta.solana.com"].filter(Boolean))];
+    let activeWsEndpoint = "";
     let wsHandle: LiquidationWsHandle | undefined;
     let wsReadyPromise: Promise<void> | null = null;
     if (options.watch && !options.json) {
@@ -1511,6 +1528,7 @@ program
       // the wsHandle assignment both consume it.
       const wsSubscription: Promise<LiquidationWsHandle> = subscribeLiquidationSlices({
         wsUrl,
+        ...(wsCandidates ? { wsCandidates } : {}),
         marketAddress: options.market,
         onSlice: (slice) => {
           const obligation = slice.pubkey.toString();
@@ -1544,9 +1562,11 @@ program
           // arbiter (the tx's own RefreshObligation re-checks on fresh prices).
           executeDue(obligation, { rail: "ws" });
         },
-        onReady: () => {
+        onReady: (endpoint: string) => {
           wsRailState = "live";
-          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live`));
+          activeWsEndpoint = endpoint;
+          const host = safeWebsocketHost(endpoint);
+          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live${host ? ` (${host})` : ""}`));
         },
         onError: (error: unknown) => {
           if (wsRailState === "live") wsRailState = "down";
