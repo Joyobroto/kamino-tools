@@ -120,12 +120,19 @@ export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRp
         state.fallbackUntil = Date.now() + cooldownMs;
         state.primaryFailures += 1;
         state.lastFlipAt = Date.now();
+        const primaryHost = safeHost(options.primaryUrl);
+        const fallbackHost = safeHost(options.fallbackUrl);
+        console.warn(`[rpc-failover] primary ${primaryHost} failed; using fallback ${fallbackHost} for ${Math.round(cooldownMs / 1000)}s`);
         return fallbackTransport(config) as unknown as Promise<TResponse>;
       });
   }) as RpcTransport;
 
   const rpc = createSolanaRpcFromTransport(selectingTransport);
   return { rpc, state: () => ({ ...state }) };
+}
+
+function safeHost(url: string): string {
+  try { return new URL(url).host; } catch { return "unknown"; }
 }
 
 /** Reads the failover endpoint order for logs/health output. */

@@ -343,6 +343,15 @@ function safeWebsocketHost(wsUrl: string): string {
   }
 }
 
+function websocketEndpointLabel(wsUrl: string, primaryUrl: string, fallbackUrl: string): string {
+  const host = safeWebsocketHost(wsUrl);
+  if (!host) return "unknown";
+  const primaryHost = safeWebsocketHost(primaryUrl);
+  const fallbackHost = safeWebsocketHost(fallbackUrl);
+  const role = host === primaryHost ? "primary" : host === fallbackHost ? "fallback" : host === "api.mainnet-beta.solana.com" ? "public" : "custom";
+  return `${host} / ${role}`;
+}
+
 function compactNumber(value: string): string {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return value;
@@ -1444,7 +1453,7 @@ program
             walletSol,
             mode: options.broadcast ? "live" : "shadow",
             wsLive: wsRailAlive(),
-            wsActive: safeWebsocketHost(activeWsEndpoint),
+            wsActive: websocketEndpointLabel(activeWsEndpoint, wsUrl, fallbackWsUrl),
             rpcOnFallback: failoverHealth({ primaryUrl: options.rpc, fallbackUrl: process.env.SOLANA_RPC_FALLBACK ?? "" }).onFallback,
             ...(executorStats.lastFailure ? { lastFailure: executorStats.lastFailure } : {}),
           }));
@@ -1598,8 +1607,8 @@ program
         onReady: (endpoint: string) => {
           wsRailState = "live";
           activeWsEndpoint = endpoint;
-          const host = safeWebsocketHost(endpoint);
-          if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live${host ? ` (${host})` : ""}`));
+          const label = websocketEndpointLabel(endpoint, wsUrl, fallbackWsUrl);
+          if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live (${label})`));
         },
         onError: (error: unknown) => {
           if (wsRailState === "live") wsRailState = "down";
