@@ -142,9 +142,17 @@ export async function buildLiquidationSetup(input: {
   rpcUrl: string;
   /** Existing ALT to extend instead of creating a new one. */
   existingLookupTable?: Address;
+  /** Existing companion tables to extend instead of creating new PDAs (resume
+   *  support after an aborted --all run — companion PDAs are slot-derived, so a
+   *  fresh run would otherwise mint brand-new junk tables). */
+  existingCompanionAlts?: Address[];
   /** Keys already in the ALT (skip re-appending them). */
   existingKeys?: Address[];
-}): Promise<{ transactions: Instruction[][]; lookupTable: Address; keyCount: number; complements: AltRef[] }> {
+  /** Skip ATA pre-creation (--all market-wide: non-essential — the executor
+   *  creates any missing ATA inside the fire's setupInstructions anyway, and the
+   *  pre-creation batches were clogging the pipeline with retry storms). */
+  skipAta?: boolean;
+}): Promise<{ transactions: Instruction[][]; lookupTable: Address; keyCount: number; complements: AltRef[]; kinds: string[] }> {
   const { rpc, market, reserves, signer } = input;
   let createIx: Instruction | null = null;
   const lookupTable = input.existingLookupTable ?? (await createLookupTableIx(rpc, signer))[1];
@@ -156,33 +164,35 @@ export async function buildLiquidationSetup(input: {
   // create-ATA ix carries ~7 accounts — keep every tx well under the packet size).
   const ataBatches: Instruction[][] = [];
   const current: Instruction[] = [];
-  for (const reserve of reserves) {
-    for (const mint of [reserve.getLiquidityMint(), reserve.getCTokenMint()]) {
-      const ata = address(
-        await deriveAssociatedTokenAccount({
-          mint,
-          owner: signer.address,
-          tokenProgram: reserve.getLiquidityTokenProgram(),
-        }),
-      );
-      const exists = await fetchTokenAccount(rpc, ata.toString());
-      if (!exists) {
-        const ix = await createAtaInstruction({
-          payer: signer,
-          mint,
-          owner: signer.address,
-          tokenProgram: reserve.getLiquidityTokenProgram(),
-          ata,
-        });
-        current.push(ix);
-        if (current.length >= 5) {
-          ataBatches.push([...current]);
-          current.length = 0;
+  if (!input.skipAta) {
+    for (const reserve of reserves) {
+      for (const mint of [reserve.getLiquidityMint(), reserve.getCTokenMint()]) {
+        const ata = address(
+          await deriveAssociatedTokenAccount({
+            mint,
+            owner: signer.address,
+            tokenProgram: reserve.getLiquidityTokenProgram(),
+          }),
+        );
+        const exists = await fetchTokenAccount(rpc, ata.toString());
+        if (!exists) {
+          const ix = await createAtaInstruction({
+            payer: signer,
+            mint,
+            owner: signer.address,
+            tokenProgram: reserve.getLiquidityTokenProgram(),
+            ata,
+          });
+          current.push(ix);
+          if (current.length >= 5) {
+            ataBatches.push([...current]);
+            current.length = 0;
+          }
         }
       }
     }
+    if (current.length) ataBatches.push([...current]);
   }
-  if (current.length) ataBatches.push([...current]);
   const ataTransactions: Instruction[][] = createIx
     ? [[createIx, ...(ataBatches.shift() ?? [])], ...ataBatches]
     : ataBatches;
@@ -224,15 +234,28 @@ export async function buildLiquidationSetup(input: {
   for (let g = 0; g < groups.length; g += 1) {
     const keysIn = groups[g]!;
     if (g > 0) {
-      const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(g));
-      if (createCompanionIx) companionCreates.push([createCompanionIx]);
-      tableForGroup = newTable;
-      complements.push({ lookupTable: newTable.toString(), keyCount: keysIn.length });
+      const resumeTable = input.existingCompanionAlts?.[g - 1];
+      if (resumeTable) {
+        tableForGroup = resumeTable;
+        console.log(`  reuse companion table ${resumeTable.toString()} (was created by an aborted run)`);
+      } else {
+        const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(g));
+        if (createCompanionIx) companionCreates.push([createCompanionIx]);
+        tableForGroup = newTable;
+      }
+      complements.push({ lookupTable: tableForGroup.toString(), keyCount: keysIn.length });
     }
     for (let i = 0; i < keysIn.length; i += EXTEND_CHUNK) {
       extendTransactions.push(extendLookupTableIxs(signer, tableForGroup, keysIn.slice(i, i + EXTEND_CHUNK), signer));
     }
   }
+  // kinds MUST mirror the exact ordering of `transactions` below — keep them in
+  // the same array order or the per-tx labels lie (seen live: log mismatches).
   const transactions = [...ataTransactions, ...companionCreates, ...extendTransactions].filter((tx) => tx.length > 0);
-  return { transactions, lookupTable, keyCount: keys.length, complements };
+  const kinds = [
+    ...ataTransactions.map(() => "ata"),
+    ...companionCreates.map(() => "create"),
+    ...extendTransactions.map(() => "extend"),
+  ];
+  return { transactions, lookupTable, keyCount: keys.length, complements, kinds };
 }

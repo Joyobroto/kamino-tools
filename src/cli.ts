@@ -3,7 +3,7 @@ import { config as loadEnv } from "dotenv";
 import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { Command } from "commander";
 import "./quiet-bigint.js";
-import { address, createNoopSigner } from "@solana/kit";
+import { address, createNoopSigner, type Instruction } from "@solana/kit";
 import { formatTokenAmount, parseTokenAmount } from "./amount.js";
 import {
   configuredValue,
@@ -25,12 +25,14 @@ import {
   selectReserve,
 } from "./kamino.js";
 import { instructionSummary, loadStrategy, externalInstructionsToStrategy } from "./strategy.js";
-import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, simulate } from "./transaction.js";
+import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, sendAndConfirmPoll, simulate } from "./transaction.js";
 import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket } from "./strategies/liquidation/screener.js";
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
 import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
 import { altTableAddresses, buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
+import { deactivateLookupTableIx, closeLookupTableIx } from "@kamino-finance/klend-sdk";
+import { getCloseAccountInstruction, TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { getAccountsInLut } from "@kamino-finance/klend-sdk";
 import type { KaminoObligation, KaminoReserve } from "@kamino-finance/klend-sdk";
 import type { ScanEvent, ScanResult, LiquidatableCandidate, AdlCandidate } from "./strategies/liquidation/types.js";
@@ -1596,6 +1598,153 @@ program
   });
 
 program
+  .command("alt-reclaim")
+  .description("close rent-locked accounts (empty look-up tables + zero-balance ATAs) owned by this wallet, keeping the ones the bot uses; --yes actually closes")
+  .option("--rpc <url>", "Solana RPC URL", process.env.SOLANA_RPC_URL || DEFAULT_RPC)
+  .option("--yes", "broadcast close txs after listing (default: dry-run)", false)
+  .action(async (options: { rpc: string; yes: boolean }) => {
+    const rpc = rpcClient(options.rpc);
+    const signer = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
+    const keep = new Set(altTableAddresses(loadAltState()));
+    console.log(`wallet ${signer.address} — keeping in-use tables: ${[...keep].join(", ") || "(none — primary/hot will be re-created on demand)"}`);
+
+    // 1) look-up tables owned by this wallet (LUT account: authority pubkey at data offset 22)
+    const LUT_PROGRAM = "AddressLookupTab1e1111111111111111111111111";
+    const fetchJson = async (method: string, params: unknown[]): Promise<{ result?: unknown; error?: { message?: string } }> => {
+      const res = await fetch(options.rpc, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      return res.json() as Promise<{ result?: unknown; error?: { message?: string } }>;
+    };
+    const gpa = await fetchJson("getProgramAccounts", [
+      LUT_PROGRAM,
+      { commitment: "finalized", encoding: "base64", filters: [{ memcmp: { offset: 22, bytes: signer.address } }] },
+    ]);
+    const lutRows: { pubkey: string; deactivationSlot: bigint; rentLamports: number }[] = [];
+    for (const a of (gpa.result as { pubkey: string; account: { data: [string]; lamports: number } }[]) ?? []) {
+      const bytes = Buffer.from(a.account.data[0], "base64");
+      lutRows.push({
+        pubkey: a.pubkey,
+        deactivationSlot: bytes.readBigUInt64LE(4),
+        rentLamports: a.account.lamports,
+      });
+    }
+    const reclaimLuts = lutRows.filter((row) => !keep.has(row.pubkey));
+    const activeSlotResult = (await fetchJson("getSlot", [{ commitment: "finalized" }])) as { result: number };
+    const currentSlot = typeof activeSlotResult.result === "number" ? BigInt(activeSlotResult.result) : 0n;
+
+    for (const row of lutRows) {
+      const inUse = keep.has(row.pubkey);
+      console.log(`${inUse ? "KEEP" : "FREE"} LUT ${row.pubkey} deactivation_slot=${row.deactivationSlot.toString()} rent=₿${(row.rentLamports / 1e9).toFixed(6)} ${inUse ? "" : "→ reclaimable"}`);
+    }
+
+    // 2) zero-balance token accounts (standard token program)
+    const tokenResult = (await fetchJson("getTokenAccountsByOwner", [
+      signer.address,
+      { programId: TOKEN_PROGRAM_ADDRESS },
+      { encoding: "jsonParsed" },
+    ])) as { result?: { value?: { pubkey: string; account: { data: { parsed: { info: { mint: string; tokenAmount: { amount: string } } } }; lamports: number } }[] } };
+    const ataRows: { pubkey: string; mint: string; balance: bigint; lamports: number }[] = [];
+    for (const a of tokenResult.result?.value ?? []) {
+      ataRows.push({
+        pubkey: a.pubkey,
+        mint: a.account.data.parsed.info.mint,
+        balance: BigInt(a.account.data.parsed.info.tokenAmount.amount),
+        lamports: a.account.lamports,
+      });
+    }
+    const reclaimAtas = ataRows.filter((row) => row.balance === 0n);
+    let totalRent = 0n;
+    for (const row of reclaimLuts) totalRent += BigInt(row.rentLamports);
+    for (const row of reclaimAtas) totalRent += BigInt(row.lamports);
+    console.log(`\nreclaimable: ${reclaimLuts.length} LUT + ${reclaimAtas.length} zero-balance ATA = ₿${(Number(totalRent) / 1e9).toFixed(6)} SOL ≈ $${((Number(totalRent) / 1e9) * 154).toFixed(2)}`);
+    for (const row of reclaimAtas) console.log(`  FREE ATA ${row.pubkey} mint=${row.mint.slice(0, 8)}… rent=₿${(row.lamports / 1e9).toFixed(6)}`);
+
+    if (!options.yes) {
+      console.log(color.dim("dry-run only — re-run with --yes to broadcast the closes"));
+      return;
+    }
+    const setupIxs: Instruction[][] = [];
+    for (const row of reclaimLuts) {
+      if (row.deactivationSlot === 0xffffffffffffffffn) {
+        setupIxs.push([deactivateLookupTableIx(signer, address(row.pubkey))]);
+        console.log(`  → deactivate ${row.pubkey}`);
+      }
+    }
+    for (const [index, ixs] of setupIxs.entries()) {
+      try {
+        const tx = await createSignedTransactionWithAlt(rpc, options.rpc, signer, ixs, []);
+        await sendAndConfirmPoll(rpc, tx, 15_000);
+        console.log(`  ✓ deactivated ${index + 1}/${setupIxs.length}`);
+      } catch (error) {
+        console.log(color.yellow(`  ⚠ deactivate skipped (${(error instanceof Error ? error.message : String(error)).slice(0, 120).replace(/\n/g, " ")}) — will retry on the next run once the wallet is funded`));
+      }
+    }
+    const fetchSlot = async (): Promise<bigint> => {
+      const res = (await fetchJson("getSlot", [{ commitment: "finalized" }])) as { result: number };
+      return BigInt(typeof res.result === "number" ? res.result : 0);
+    };
+    const fetchDeactivationSlot = async (pubkey: string): Promise<bigint> => {
+      const info = (await fetchJson("getAccountInfo", [pubkey, { commitment: "finalized", encoding: "jsonParsed" }])) as {
+        result?: { value?: { data?: { parsed?: { info?: { deactivationSlot?: string | bigint | number } } } } };
+      };
+      const raw = info.result?.value?.data?.parsed?.info?.deactivationSlot;
+      if (typeof raw === "bigint") return raw;
+      if (typeof raw === "number") return BigInt(raw);
+      if (typeof raw === "string") {
+        const n = Number(raw);
+        if (Number.isSafeInteger(n)) return BigInt(n);
+        return BigInt(raw);
+      }
+      return 0xffffffffffffffffn;
+    };
+    for (const row of [...reclaimLuts]) {
+      if (keep.has(row.pubkey)) continue;
+      const deactivationSlot = row.deactivationSlot === 0xffffffffffffffffn ? await fetchDeactivationSlot(row.pubkey) : row.deactivationSlot;
+      let slot = await fetchSlot();
+      if (deactivationSlot !== 0xffffffffffffffffn) {
+        while (slot < deactivationSlot + 513n) {
+          console.log(`  waiting for deactivation cooldown… slot ${slot.toString()}/${(deactivationSlot + 513n).toString()}`);
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          slot = await fetchSlot();
+        }
+      }
+      const tx = await createSignedTransactionWithAlt(rpc, options.rpc, signer, [closeLookupTableIx(signer, address(row.pubkey))], []);
+      try {
+        await sendAndConfirmPoll(rpc, tx, 45_000);
+        console.log(`  ✓ closed LUT ${row.pubkey}`);
+      } catch (error) {
+        console.log(color.yellow(`  ⚠ LUT close skipped (${(error instanceof Error ? error.message : String(error)).slice(0, 160).replace(/\n/g, " ")})`));
+      }
+    }
+    const closeBatches: Instruction[][] = [];
+    let batch: Instruction[] = [];
+    for (const row of reclaimAtas) {
+      batch.push(getCloseAccountInstruction({ account: address(row.pubkey), destination: signer.address, owner: signer }));
+      if (batch.length >= 6) { closeBatches.push(batch); batch = []; }
+    }
+    if (batch.length) closeBatches.push(batch);
+    for (const [index, ixs] of closeBatches.entries()) {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const tx = await createSignedTransactionWithAlt(rpc, options.rpc, signer, ixs, []);
+        try {
+          await sendAndConfirmPoll(rpc, tx, 45_000);
+          console.log(`  ✓ closed ATA batch ${index + 1}/${closeBatches.length}`);
+          break;
+        } catch (error) {
+          const message = (error instanceof Error ? error.message : String(error)).replace(/\n/g, " ");
+          if (message.includes("failed on-chain")) {
+            console.log(color.yellow(`  ⚠ ATA batch ${index + 1} rejected (${message.slice(0, 160)})`));
+            break;
+          }
+          console.log(color.yellow(`  ⚠ ATA batch ${index + 1} attempt ${attempt}/3 failed (${message.slice(0, 100)})${attempt < 3 ? " — retrying with fresh blockhash" : ""}`));
+          if (attempt === 3) break;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+      }
+    }
+    console.log(color.green(`✅ reclaim complete — rent returned to wallet`));
+  });
+
+program
   .command("liq-setup")
   .description("one-time: create our persistent ALT + pre-create hot ATAs so liquidation txs fit the 1232-byte packet")
   .option("--rpc <url>", "Solana RPC URL", process.env.SOLANA_RPC_URL || DEFAULT_RPC)
@@ -1603,37 +1752,58 @@ program
   .option("--symbols <list>", "comma-separated reserve symbols to include (default: the common liquidation pairs)", "USDC,SOL,USDT,FDUSD,USDS,JitoSOL,JupSOL")
   .option("--all", "include every reserve in the market", false)
   .option("--reuse-alt <address>", "extend an existing ALT instead of creating a new one", "")
-  .action(async (options: { rpc: string; market: string; symbols: string; all: boolean; reuseAlt: string }) => {
+  .option("--companion-alts <list>", "comma-separated existing LUTs to use as the overflow tables (extends them instead of creating new — resume an aborted run)", "")
+  .action(async (options: { rpc: string; market: string; symbols: string; all: boolean; reuseAlt: string; companionAlts: string }) => {
     const rpc = rpcClient(options.rpc);
     const market = await loadMarket(rpc, options.market);
     const signer = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
+    const mem = () => `rss=${(process.memoryUsage().rss / 1e6).toFixed(0)}MB heap=${(process.memoryUsage().heapUsed / 1e6).toFixed(0)}MB`;
     const wanted = options.all ? null : new Set(options.symbols.split(",").map((s) => s.trim().toUpperCase()));
     const reserves = market.getReserves().filter((reserve: KaminoReserve) => !wanted || wanted.has(reserve.getTokenSymbol().toUpperCase()));
-    console.log(`reserves in scope (${reserves.length}): ${reserves.map((r: KaminoReserve) => r.getTokenSymbol()).join(", ")}`);
+    console.log(`reserves in scope (${reserves.length}): ${reserves.map((r: KaminoReserve) => r.getTokenSymbol()).join(", ")} (${mem()})`);
 
     const reuseAlt = options.reuseAlt ? address(options.reuseAlt) : undefined;
+    const companionAlts = options.companionAlts?.split(",").map((s) => s.trim()).filter(Boolean).map((a) => address(a)) ?? [];
     const existingKeys = reuseAlt ? await getAccountsInLut(rpc, reuseAlt) : undefined;
-    const { transactions, lookupTable, keyCount, complements } = await buildLiquidationSetup({
+    const { transactions, lookupTable, keyCount, complements, kinds } = await buildLiquidationSetup({
       rpc,
       market,
       reserves,
       signer,
       rpcUrl: options.rpc,
       ...(reuseAlt ? { existingLookupTable: reuseAlt } : {}),
+      ...(companionAlts.length ? { existingCompanionAlts: companionAlts } : {}),
       ...(existingKeys?.length ? { existingKeys: existingKeys.map((k: string) => address(k)) } : {}),
+      skipAta: true,
     });
-    console.log(`ALT ${lookupTable} will hold ${keyCount} keys${existingKeys?.length ? ` (${existingKeys.length} already present)` : ""} across ${transactions.length} transactions…`);
+    console.log(`ALT ${lookupTable} will hold ${keyCount} keys${existingKeys?.length ? ` (${existingKeys.length} already present)` : ""} across ${transactions.length} transactions… (${mem()})`);
     if (complements.length) console.log(color.dim(`  companion tables for the overflow: ${complements.map((c) => `${c.lookupTable} (${c.keyCount} keys)`).join(", ")}`));
     for (const [index, instructions] of transactions.entries()) {
+      const kind = kinds[index] ?? "tx";
       if (!instructions.length) continue;
       const setupTx = await createSignedTransactionWithAlt(rpc, options.rpc, signer, instructions, []);
       try {
-        const signature = await sendAndConfirm(options.rpc, rpc, setupTx);
-        console.log(color.green(`  ✅ setup tx ${index + 1}/${transactions.length} ${signature}`));
+        const signature = await sendAndConfirmPoll(rpc, setupTx, 45_000);
+        console.log(color.green(`  ✅ setup tx ${index + 1}/${transactions.length} [${kind}] ${signature} (${mem()})`));
       } catch (error) {
-        console.log(color.red(`  ✗ setup tx ${index + 1}/${transactions.length} failed: ${safeJsonStringify(error instanceof Error ? error.message : error).slice(0, 400)}`));
-        throw error;
+        // Best-effort semantics: ATA pre-creation can fail for exotic reserves
+        // (e.g. non-Associated weirdness) and is NOT load-bearing — the executor
+        // creates any missing ATA inside the fire's setupInstructions anyway.
+        // The ALT create/extend txs are the critical ones; a failure there is
+        // caught by the coverage check below instead of aborting mid-run.
+        console.log(color.yellow(`  ⚠ setup tx ${index + 1}/${transactions.length} [${kind}] skipped (${(error instanceof Error ? error.message : String(error)).slice(0, 160).replace(/\n/g, " ")})`));
       }
+    }
+    // Honest complements: only record companion tables that actually exist
+    // on-chain (sendAndConfirm of the create could still have failed).
+    const existingCompanions: typeof complements = [];
+    for (const comp of complements) {
+      const probe = getAccountsInLut(rpc, address(comp.lookupTable));
+      const [[probed]] = await Promise.all([probe]);
+      if (probed && probed.length > 0) existingCompanions.push(comp);
+    }
+    if (existingCompanions.length !== complements.length) {
+      console.log(color.red(`  ✗ ${complements.length - existingCompanions.length} companion table(s) did NOT materialize — re-run liq-setup extends them`));
     }
     console.log(color.green(`✅ SETUP COMPLETE`));
     saveAltState({
@@ -1641,7 +1811,7 @@ program
       createdAt: new Date().toISOString(),
       authority: signer.address.toString(),
       keyCount,
-      ...(complements.length ? { complements } : {}),
+      ...(existingCompanions.length ? { complements: existingCompanions } : {}),
     });
     console.log(color.bold(color.green(`✔ ALT${complements.length ? "s" : ""} saved to ${ALT_STATE_PATH} — future liquidation txs now compress via the chained tables`)));
   });

@@ -132,3 +132,36 @@ export async function sendAndConfirm(
   ]);
   return signature;
 }
+
+/**
+ * Deterministic send+confirm WITHOUT the websocket subscription factory.
+ * The kit's sendAndConfirmTransactionFactory leans on a WS subscription for
+ * confirmation; when the WS endpoint is flaky it silently re-submits the SAME
+ * signed tx until the blockhash dies (150 slots) and only THEN surfaces the
+ * misleading "currentBlockHeight > lastValidBlockHeight" error — seen live on
+ * EVERY one-off admin tx (liq-setup extends, alt-reclaim deactivate/close) while
+ * fire-path txs through the same factory confirm fine. One-off txs don't need
+ * WS at all: raw send + poll getSignatureStatuses. The fire path is untouched.
+ */
+export async function sendAndConfirmPoll(
+  rpc: Rpc<SolanaRpcApi>,
+  transaction: FullySignedTransaction & TransactionWithBlockhashLifetime,
+  timeoutMs = 20_000,
+): Promise<string> {
+  const signature = getSignatureFromTransaction(transaction);
+  await rpc.sendTransaction(getBase64EncodedWireTransaction(transaction), {
+    skipPreflight: true,
+    encoding: "base64",
+  }).send();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const status = (await rpc.getSignatureStatuses([signature]).send()).value?.[0];
+    if (status) {
+      const rep = (_: unknown, v: unknown) => (typeof v === "bigint" ? v.toString() : v);
+      if (status.err) throw new Error(`tx ${signature} failed on-chain: ${JSON.stringify(status.err, rep)}`);
+      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return signature;
+    }
+    if (Date.now() > deadline) throw new Error(`sendAndConfirmPoll timeout after ${timeoutMs}ms (sig ${signature})`);
+  }
+}
