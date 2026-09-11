@@ -390,6 +390,19 @@ export function streamSnapshotFresh(snapshot: StreamAccountSnapshot | undefined,
     && snapshot.receivedAt !== undefined && now >= snapshot.receivedAt && now - snapshot.receivedAt < 1500);
 }
 
+/** Fast race-rail ledger instant for an account delivered by WS. Resolving
+ * getBlockTime(slot) can add hundreds of milliseconds under RPC pressure. The
+ * account snapshot is already the authoritative slot payload and the executor
+ * rechecks health in simulation, so wall-clock seconds are sufficient for this
+ * preflight decode; normal scans still use the coherent RPC ledger instant. */
+export function streamLedgerInstant(snapshot: StreamAccountSnapshot): LedgerInstant {
+  if (snapshot.slot === undefined) throw new Error("WS snapshot has no slot");
+  return {
+    slot: snapshot.slot,
+    blockTime: BigInt(Math.floor(Date.now() / 1000)) as LedgerInstant["blockTime"],
+  };
+}
+
 export async function refreshTrackedObligations(params: {
   rpc: Rpc<SolanaRpcApi>;
   preloaded: PreloadedMarket;
@@ -404,7 +417,7 @@ export async function refreshTrackedObligations(params: {
   const snapshot = params.streamSnapshot;
   if (pubkeys.length === 1 && streamSnapshotFresh(snapshot, pubkeys[0]!)) {
     try {
-      const ledgerInstant = await ledgerInstantAtSlot(rpc, snapshot!.slot!);
+      const ledgerInstant = streamLedgerInstant(snapshot!);
       // A slow block-time call must not extend the account snapshot's lifetime.
       if (streamSnapshotFresh(snapshot, pubkeys[0]!)) {
         const obligation = KaminoObligation.fromAccountData(

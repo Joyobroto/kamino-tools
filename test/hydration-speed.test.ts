@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { address, type Rpc, type SolanaRpcApi } from "@solana/kit";
 import { KaminoObligation, type LedgerInstant } from "@kamino-finance/klend-sdk";
 import { Decimal } from "decimal.js";
-import { hydrateShortlist, ledgerInstantAtSlot, refreshTrackedObligations, streamSnapshotFresh, type PreloadedMarket } from "../src/strategies/liquidation/screener.js";
+import { hydrateShortlist, ledgerInstantAtSlot, refreshTrackedObligations, streamSnapshotFresh, streamLedgerInstant, type PreloadedMarket } from "../src/strategies/liquidation/screener.js";
 
 const key = address("11111111111111111111111111111111");
 
@@ -20,7 +20,7 @@ test("single-account hydration does not schedule the old 500ms trailing sleep", 
   assert.equal(slept,false);
 });
 
-test("fresh WS payload hydrates without getSlot/getMultipleAccounts, with shared slot time", async (t) => {
+test("fresh WS payload hydrates without getBlockTime/getMultipleAccounts on the race rail", async (t) => {
   let blockTimeCalls = 0;
   const rpc = {getBlockTime:()=>({send:async()=>{blockTimeCalls++;return 100n;}})} as unknown as Rpc<SolanaRpcApi>;
   const market = {getAddress:()=>key} as unknown as PreloadedMarket["market"];
@@ -33,8 +33,14 @@ test("fresh WS payload hydrates without getSlot/getMultipleAccounts, with shared
   const preloaded={market,marketAddress:key,marketReserves:new Map(),loadedAt:Date.now()};
   const params={rpc,preloaded,pubkeys:[key],streamSnapshot:{pubkey:key,accountData:Buffer.alloc(3344),slot:1n,receivedAt:Date.now()}};
   const [a,b]=await Promise.all([refreshTrackedObligations(params),refreshTrackedObligations(params)]);
-  assert.equal(blockTimeCalls,1);assert.equal(a.obligations.get(key),fake);assert.equal(b.market,market);
+  assert.equal(blockTimeCalls,0);assert.equal(a.obligations.get(key),fake);assert.equal(b.market,market);
   assert.equal(a.candidates[0]?.healthFactor,0.9);
+});
+
+test("streamLedgerInstant uses the WS slot without an RPC roundtrip", () => {
+  const instant = streamLedgerInstant({ pubkey: key, slot: 42n, receivedAt: Date.now() });
+  assert.equal(instant.slot, 42n);
+  assert.ok(Number(instant.blockTime) > 0);
 });
 
 test("stream snapshot rejects expired, future, mismatched or missing-slot data", () => {
