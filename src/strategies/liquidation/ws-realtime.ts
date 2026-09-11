@@ -20,20 +20,24 @@ export interface WsObligationSlice {
   adlMarginCallTs: number;
   /** Cached health factor (unhealthy/debt) from the notification. */
   cachedHealth: number;
+  /** Preserve the already-delivered account for execution; no second account RPC. */
+  accountData?: Buffer;
+  slot?: bigint;
+  receivedAt?: number;
 }
 
 /**
  * Parses the full 3344-byte obligation account (as delivered by program
  * notifications) into the same health slice the GPA snapshot uses.
  */
-export function parseFullObligationAccount(dataBase64: string, pubkey: Address): WsObligationSlice {
+export function parseFullObligationAccount(dataBase64: string, pubkey: Address, slot?: bigint): WsObligationSlice {
   const full = Buffer.from(dataBase64, "base64");
   if (full.length !== Number(OBLIGATION_ACCOUNT_SIZE)) {
     throw new Error(`Unexpected obligation account length ${full.length}`);
   }
   const slice = full.subarray(SLICE_OFFSET, SLICE_OFFSET + SLICE_LENGTH).toString("base64");
   const parsed = parseObligationSlice(slice);
-  return { pubkey, ...parsed, cachedHealth: healthFactorFromParsed(parsed) };
+  return { pubkey, ...parsed, cachedHealth: healthFactorFromParsed(parsed), accountData: full, receivedAt: Date.now(), ...(slot !== undefined ? { slot } : {}) };
 }
 
 export function healthFactorFromParsed(parsed: { debtSf: bigint; unhealthySf: bigint }): number {
@@ -124,7 +128,10 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
         const streamSignal = AbortSignal.any([abortController.signal, iterationControl.signal]);
         const iterable = await subscriptions
           .programNotifications(programId, {
-            commitment: "confirmed",
+            // This is a trigger rail only. The executor refreshes the account and
+            // simulates the transaction before sending, so processed delivery
+            // removes a confirmation delay without trusting stale WS state.
+            commitment: "processed",
             encoding: "base64",
             filters: [
               { dataSize: OBLIGATION_ACCOUNT_SIZE },
@@ -147,12 +154,14 @@ export async function subscribeLiquidationSlices(options: LiquidationWsOptions):
         delayMs = 1_000;
         for await (const notification of iterable) {
           lastSyncAt = Date.now();
-          const value = (notification as unknown as {
+          const envelope = notification as unknown as {
+            context?: { slot?: bigint };
             value?: { pubkey?: string; account?: { data?: [string, string] } };
-          }).value;
+          };
+          const value = envelope.value;
           if (!value?.pubkey || !value.account?.data?.[0]) continue;
           try {
-            onSlice(parseFullObligationAccount(value.account.data[0], address(value.pubkey)));
+            onSlice(parseFullObligationAccount(value.account.data[0], address(value.pubkey), envelope.context?.slot));
           } catch {
             // malformed account — ignore (error isolation, never crash the stream)
           }

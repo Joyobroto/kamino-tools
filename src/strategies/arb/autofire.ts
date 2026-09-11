@@ -80,16 +80,26 @@ export interface LedgerEntry {
   stage?: ExecutionOutcomeForDaemon["stage"];
   reason?: string;
   signature?: string;
+  rail?: string;
+  triggeredAt?: string;
+  triggerSlot?: string;
+  latencyMsTotal?: number;
+  timingsMs?: Record<string, number>;
+  simulationLogs?: string[];
+  simulationPerformed?: boolean;
   quotedProfitUsd?: number;
   worstCaseProfitUsd?: number;
   lossUsdEstimate?: number;
   /** For "vetoed": how the veto was resolved — "lost-race" (another bot
    *  liquidated it on-chain) or "self-healed" (no liquidation ever landed). */
-  outcome?: "lost-race" | "self-healed";
+  outcome?: "lost-race" | "self-healed" | "no-liquidation-found" | "unknown";
   /** For "vetoed"/lost-race: the winning liquidator's fee payer. */
   winner?: string;
   /** For "vetoed"/lost-race: the winning tx signature. */
   winnerSignature?: string;
+  feePayer?: string;
+  liquidationSlot?: number;
+  raceLostAfterMs?: number;
   /** For "vetoed": ms between the trigger and the veto. */
   latencyMs?: number;
   /** For "vetoed": the live health the hydration computed at veto time. */

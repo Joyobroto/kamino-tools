@@ -1,0 +1,53 @@
+{
+  "kind": "offline synthetic hydration component benchmark",
+  "rpcDelayMs": 100,
+  "iterations": 5,
+  "note": "Not production latency or win-rate evidence. SDK decode is stubbed equally for both paths. Baseline reconstructs the removed serial reads and 500ms sleep.",
+  "medianMs": {
+    "before": 801.5636400000003,
+    "wsPayload": 100.56281599999966,
+    "targetedAccountRead": 100.43769799999973
+  },
+  "samples": [
+    {
+      "baselineMs": 802.0603850000002,
+      "wsMs": 102.67336700000033,
+      "targetedMs": 100.50586800000019,
+      "baselineRpcCalls": 3,
+      "wsRpcCalls": 1,
+      "targetedRpcCalls": 1
+    },
+    {
+      "baselineMs": 801.7301989999996,
+      "wsMs": 100.5490890000001,
+      "targetedMs": 100.39575000000059,
+      "baselineRpcCalls": 3,
+      "wsRpcCalls": 1,
+      "targetedRpcCalls": 1
+    },
+    {
+      "baselineMs": 801.5381710000001,
+      "wsMs": 100.56281599999966,
+      "targetedMs": 100.43769799999973,
+      "baselineRpcCalls": 3,
+      "wsRpcCalls": 1,
+      "targetedRpcCalls": 1
+    },
+    {
+      "baselineMs": 801.5636400000003,
+      "wsMs": 100.73988000000008,
+      "targetedMs": 100.92300400000022,
+      "baselineRpcCalls": 3,
+      "wsRpcCalls": 1,
+      "targetedRpcCalls": 1
+    },
+    {
+      "baselineMs": 801.5184370000006,
+      "wsMs": 100.53927599999952,
+      "targetedMs": 100.385268,
+      "baselineRpcCalls": 3,
+      "wsRpcCalls": 1,
+      "targetedRpcCalls": 1
+    }
+  ]
+}

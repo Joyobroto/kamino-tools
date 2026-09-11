@@ -1,3 +1,4 @@
+import { firstUsable, withDeadline } from "./pipeline.js";
 /**
  * Kamino liquidation executor — builds the atomic flash-borrow liquidation
  * sandwich for one DUE obligation, replicating the exact on-chain shape the
@@ -57,7 +58,7 @@ import {
   fetchTokenAccount,
   type TokenAccountInfo,
 } from "../../kamino.js";
-import { externalInstructionsToStrategy, type ExternalInstruction } from "../../strategy.js";
+import { externalInstructionsToStrategy, upsertComputeBudget, type ExternalInstruction } from "../../strategy.js";
 import { simulate } from "../../transaction.js";
 import { createSignedTransactionWithAltCached, getCachedScopeConfigurations, getCachedWalletSigner, ataStateKnown, setCachedAtaExists } from "./hotcache.js";
 import { getClmmQuoter, web3InstructionToExternal } from "./clmm.js";
@@ -213,6 +214,11 @@ export type LiquidationOutcome =
       tipUsd: number;
     };
 
+/** Convert signed token base units using a price that already includes mint decimals. */
+export function profitBaseUnitsToUsd(amount: bigint, pricePerBaseUnit: Decimal): number {
+  return new Decimal(amount.toString()).mul(pricePerBaseUnit).toNumber();
+}
+
 /** Flash-borrow price for sizing (USD per base unit of the reserve mint). */
 function usdPerBaseUnit(reserve: KaminoReserve): Decimal {
   return reserve.getOracleMarketPrice().div(10 ** reserve.getMintDecimals());
@@ -269,11 +275,13 @@ export function estimateCollateralForRepay(input: {
 }): bigint {
   const margin = input.precisionMarginBps ?? PRECISION_MARGIN_BPS;
   const protocolFeePct = input.protocolLiquidationFeePct ?? 0;
+  // The protocol takes a share of the bonus; principal remains redeemable.
+  const netBonus = new Decimal(input.liquidationBonus)
+    .mul(new Decimal(1).sub(new Decimal(protocolFeePct).div(100)));
   const collateralEstimate = new Decimal(input.repayAmountBaseUnits.toString())
     .mul(input.debtPriceBase)
     .div(input.collPriceBase)
-    .mul(new Decimal(1 + input.liquidationBonus))
-    .mul(new Decimal(1 - protocolFeePct / 100))
+    .mul(new Decimal(1).add(netBonus))
     .mul(new Decimal(1 - margin / 10_000))
     .floor();
   return BigInt(collateralEstimate.toFixed(0));
@@ -317,6 +325,7 @@ export function choosePriorityFee(params: {
   priorityMode: "off" | "fixed" | "auto";
   prizeUsd?: number;
   microlamportsPerCu?: number;
+  computeUnitLimit?: number;
 }): { microlamportsPerCu: number; tipUsd: number; lane: string } {
   const { priorityMode } = params;
   if (priorityMode === "off") return { microlamportsPerCu: 0, tipUsd: 0, lane: "base-fee" };
@@ -327,9 +336,9 @@ export function choosePriorityFee(params: {
   const prize = Math.max(0, params.prizeUsd ?? 0);
   const bucket = PRIZE_BID_LADDER.find((b) => prize >= b.minPrizeUsd) ?? PRIZE_BID_LADDER[PRIZE_BID_LADDER.length - 1]!;
   const cappedBid = Math.max(MIN_TIP_USD, Math.min(bucket.bidUsd, prize * MAX_TIP_FRACTION_OF_PRIZE));
-  // Convert the USD bid to micro-lamports per CU for a ~350k-CU transaction.
+  // Priority fees are charged on the requested CU limit, not consumed units.
   const tipSol = cappedBid / SOL_USD_ESTIMATE;
-  const micro = Math.max(1, Math.round((tipSol * 1e9 * 1e6) / 350_000));
+  const micro = Math.max(1, Math.round((tipSol * 1e9 * 1e6) / (params.computeUnitLimit ?? 350_000)));
   return { microlamportsPerCu: micro, tipUsd: cappedBid, lane: `${bucket.label} (~$${cappedBid.toFixed(2)})` };
 }
 
@@ -422,7 +431,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //    Conservative floor: minLiquidationBonusBps (just-past-threshold positions
   //    liquidate at the min — verified on-chain 2026-09-03).
   const collPriceBase = usdPerBaseUnit(withdrawReserve);
-  const bonus = Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000 || 0.01;
+  const bonus = Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000;
   const protocolFeePct = Number(withdrawReserve.state.config.protocolLiquidationFeePct ?? 0);
   const estCollateralBaseUnits = estimateCollateralForRepay({
     repayAmountBaseUnits,
@@ -556,14 +565,15 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     }
   };
   done();
-  // Selection order: LOCAL CLMM (zero HTTP) → Jupiter (1 pair of HTTP) → KSwap.
-  // The CLMM plan races the Jupiter plan with a hard 350ms budget: warm CLMM
-  // (~3-5ms local math) always wins; a cold CLMM (pool discovery ~1s) forfeits to
-  // the already-parallel Jupiter plan instead of stalling the fire path.
-  const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | null> => {
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), ms));
-    return Promise.race([promise, timeout]);
-  };
+  // Start independent routes now; a warm local route never waits for Jupiter.
+  done = mark("quoteWait");
+  const routePromises = [
+    withDeadline(buildLocalClmmPlan(), 350),
+    withDeadline(buildJupiterPlan(false), 2_000),
+    withDeadline(buildJupiterPlan(true), 2_000),
+  ];
+  let kswapPromise: Promise<SwapPlan | null> | undefined;
+  const kswapPlan = () => kswapPromise ??= withDeadline(buildKswapPlan(), 2_000);
   // Fire-path trim: ATA existence (OUR hot ATAs — created once by liq-setup)
   // is cached process-lifetime once seen; a known-existing ATA needs NO
   // getAccountInfo round-trip. Only genuinely unknown states hit the RPC.
@@ -584,10 +594,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       return fetched;
     });
   };
-  const [clmmPlan, jupPlan, jupDirectPlan, debtAtaState, collAtaState, cTokenAtaState, farmAccounts] = await Promise.all([
-    withTimeout(buildLocalClmmPlan(), 350),
-    buildJupiterPlan(false).catch(() => null),
-    buildJupiterPlan(true).catch(() => null),
+  const [firstPlan, debtAtaState, collAtaState, cTokenAtaState, farmAccounts] = await Promise.all([
+    firstUsable(routePromises),
     fetchAtaWithCache(debtAta, repayReserve.getLiquidityMint(), repayReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(collAta, withdrawReserve.getLiquidityMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(cTokenAta, withdrawReserve.getCTokenMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
@@ -597,18 +605,17 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     // fireable tx and a guaranteed program-reject.
     resolveFarmAccounts(rpc, repayReserve, withdrawReserve, obligationAddress),
   ]);
-  let swapPlan: SwapPlan | null = clmmPlan ?? jupPlan;
+  done();
+  let swapPlan: SwapPlan | null = firstPlan;
   if (!swapPlan) {
     done = mark("kswapFallback");
-    swapPlan = await buildKswapPlan().catch(() => null);
+    swapPlan = await kswapPlan();
     done();
   }
   if (!swapPlan) return { stage: "plan", passed: false, reason: "collateral→debt route unquotable (clmm+jupiter+kswap all failed)" , timings };
   const activeSwapPlan: SwapPlan = swapPlan;
   const swapOut = activeSwapPlan.swapOut;
   const swapOutMin = activeSwapPlan.swapOutMin;
-  timings.swapSource = 0; // marker — see timingsMs source below
-  (timings as Record<string, unknown>).swapSource = activeSwapPlan.source;
 
   const setupInstructions: Instruction[] = [];
   if (!debtAtaState) {
@@ -738,22 +745,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     market.programId,
   );
 
-  // Swap instructions from the chosen plan — deduped into the external-instruction
-  // shape the flash-loan builder expects. Applied per-plan (the size-guard fallback
-  // re-dedupes the Jupiter plan through the same helper).
-  done = mark("swapIx");
-  const fingerprint = (instruction: ExternalInstruction): string => `${instruction.programId}|${instruction.data}`;
-  const dedupeSwapIxs = (instructions: ExternalInstruction[]): ExternalInstruction[] => {
-    const out: ExternalInstruction[] = [];
-    for (const instruction of instructions) {
-      if (out.some((existing) => fingerprint(existing) === fingerprint(instruction))) continue;
-      out.push(instruction);
-    }
-    return out;
-  };
-  const merged = dedupeSwapIxs(activeSwapPlan.swapInstructions);
   const budgetMerged: ExternalInstruction[] = [];
-  done();
 
   // CU LIMIT: the swap backend must always pin a compute-unit limit. Our chain is
   // refresh×N + flash + liquidate + swap + repay (~15-25 ixs) — the node default
@@ -767,6 +759,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // outbids base-fee traffic in the race for the next block. Jupiter's own
   // price ix (if present) is dropped for the same discriminator to avoid doubles.
   const priority = choosePriorityFee({
+    computeUnitLimit: 1_400_000,
     priorityMode: input.priorityMode ?? "off",
     ...(input.prizeUsd !== undefined ? { prizeUsd: input.prizeUsd } : {}),
     ...(input.microlamportsPerCu !== undefined ? { microlamportsPerCu: input.microlamportsPerCu } : {}),
@@ -799,17 +792,14 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       signer,
       tokenAccount,
       amountBaseUnits: repayAmountBaseUnits,
-      strategy: {
-        ...externalInstructionsToStrategy(
-          [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...plan.swapInstructions],
-          budgetMerged,
-          signer,
-        ),
-        preInstructions: [...preInstructions, refreshObligationIx],
-      },
+      strategy: externalInstructionsToStrategy(
+        [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...plan.swapInstructions],
+        budgetMerged,
+        signer,
+        [...preInstructions, refreshObligationIx],
+      ),
       setupInstructions,
     });
-  const build = await buildSwapChain(activeSwapPlan);
 
   // Size guard for EVERY swap backend, not just CLMM: the wire tx must fit
   // 1232 bytes or the RPC rejects it (-32602 / "too large" — the exact failure
@@ -818,7 +808,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // try every already-fetched fallback (jupiter → kswap) before giving up.
   const wireSizeOf = async (plan: SwapPlan): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; tx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null; tooLarge: boolean }> => {
     const built = await buildSwapChain(plan);
-    const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]).catch(() => null);
+    const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]);
     const wire = tx ? Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length : Number.POSITIVE_INFINITY;
     return { build: built, tx, tooLarge: wire > 1232 };
   };
@@ -826,21 +816,22 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // Candidate order: the chosen plan first, then every other fetched plan as
   // fallback — including the packet-safe jupiter-direct variant. Unknown-null
   // (never quoted) plans are skipped.
-  const fallbackPlans = [clmmPlan, jupPlan, jupDirectPlan].filter((p): p is SwapPlan => p !== null && p !== activeSwapPlan);
+  const fallbackPlans: SwapPlan[] = [];
   let chosenPlan = activeSwapPlan;
-  let buildFinal = build;
+  const primary = await wireSizeOf(activeSwapPlan);
+  let buildFinal = primary.build;
   let signedTx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null = null;
   {
-    const primary = await wireSizeOf(activeSwapPlan);
     if (primary.tooLarge) {
+      // Only pay the fallback wait if the first usable route cannot fit.
+      fallbackPlans.push(...(await Promise.all([...routePromises, kswapPlan()]))
+        .filter((p): p is SwapPlan => p !== null && p !== activeSwapPlan));
       for (const fallback of fallbackPlans) {
         const attempt = await wireSizeOf(fallback);
         if (!attempt.tooLarge) {
           chosenPlan = fallback;
           buildFinal = attempt.build;
           signedTx = attempt.tx;
-          timings.swapFallback = 0;
-          (timings as Record<string, unknown>).swapFallback = `${activeSwapPlan.source}→${fallback.source} (packet)`;
           break;
         }
       }
@@ -880,9 +871,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     const feeBaseUnitsBlind = buildFinal.feeBaseUnits;
     const netBaseUnitsBlind = activeSwapOutMin - repayAmountBaseUnits - feeBaseUnitsBlind;
     const quotedNetBaseUnitsBlind = activeSwapOut - repayAmountBaseUnits - feeBaseUnitsBlind;
-    const usdPerDebtUnitBlind = Number(debtPriceBase.toFixed(12));
-    const worstCaseProfitUsdBlind = (Number(netBaseUnitsBlind) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnitBlind;
-    const quotedProfitUsdBlind = (Number(quotedNetBaseUnitsBlind) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnitBlind;
+    const worstCaseProfitUsdBlind = profitBaseUnitsToUsd(netBaseUnitsBlind, debtPriceBase);
+    const quotedProfitUsdBlind = profitBaseUnitsToUsd(quotedNetBaseUnitsBlind, debtPriceBase);
     if (worstCaseProfitUsdBlind < input.minProfitUsd) {
       return { stage: "simulate", passed: false, reason: `worst-case $${worstCaseProfitUsdBlind.toFixed(4)} < floor $${input.minProfitUsd}`, logs: [], timings };
     }
@@ -921,37 +911,31 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   if (simErr) {
     return { stage: "simulate", passed: false, reason: `simulation failed: ${safeJsonStringify(simErr)}`, logs, timings };
   }
-  let consumedUnits = 0n;
-  for (const log of logs) {
-    const match = log.match(/consumed (\d+) of \d+ compute units/);
-    if (match) consumedUnits = BigInt(match[1] ?? 0);
-  }
+  // RPC reports total transaction consumption; the final program log is only
+  // that program's invocation and can understate the whole chain drastically.
+  const consumedUnits = simulation.value.unitsConsumed ?? 0n;
 
   // Gas guard: pin the CU limit to consumption + 25% headroom, then RE-SIMULATE
   // the pinned tx. If the pin (or anything race-y) broke it, we never send.
   // This is what keeps the on-chain failure rate at zero — sim must pass twice.
-  // FAST mode skips the re-sim roundtrip (~1-2s saved): the CU pin is applied
-  // optimistically and the tx that already passed simulation once is reused
-  // without the pin — relying on the node's default CU budget instead.
+  // FAST mode keeps the simulated 1.4M CU limit and skips the second simulation.
   let finalTransaction = transaction;
   if (consumedUnits > 0n && !input.fast) {
-    const cuLimit = consumedUnits + (consumedUnits >> 2n); // +25%
+    const cuLimit = BigInt(Math.min(1_400_000, Math.ceil(Number(consumedUnits) * 1.25)));
     const cuLimitIx = getSetComputeUnitLimitInstruction({ units: Number(cuLimit) });
-    const pinnedBudget = [...budgetMerged, instructionToExternal(cuLimitIx)];
+    const pinnedBudget = upsertComputeBudget(budgetMerged, instructionToExternal(cuLimitIx));
     const pinnedBuild = await buildFlashLoan({
       market,
       reserve: repayReserve,
       signer,
       tokenAccount,
       amountBaseUnits: repayAmountBaseUnits,
-      strategy: {
-        ...externalInstructionsToStrategy(
-          [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...dedupeSwapIxs(activePlan.swapInstructions)],
-          pinnedBudget,
-          signer,
-        ),
-        preInstructions: [...preInstructions, refreshObligationIx],
-      },
+      strategy: externalInstructionsToStrategy(
+        [instructionToExternal(buildRefreshReserveIx(market, repayReserve)), instructionToExternal(liquidationIx), ...activePlan.swapInstructions],
+        pinnedBudget,
+        signer,
+        [...preInstructions, refreshObligationIx],
+      ),
       setupInstructions,
     }).catch(() => null);
     if (pinnedBuild) {
@@ -961,7 +945,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         signer,
         pinnedBuild.instructions,
         [
-          ...activeSwapPlan.lookupTables,
+          ...activePlan.lookupTables,
           ...(input.lookupTableAddresses ?? []),
         ],
       );
@@ -985,15 +969,15 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   const feeBaseUnits = buildFinal.feeBaseUnits;
   const netBaseUnits = activeSwapOutMin - repayAmountBaseUnits - feeBaseUnits;
   const quotedNetBaseUnits = activeSwapOut - repayAmountBaseUnits - feeBaseUnits;
-  const usdPerDebtUnit = Number(debtPriceBase.toFixed(12));
-  const worstCaseProfitUsd = (Number(netBaseUnits) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnit;
-  const quotedProfitUsd = (Number(quotedNetBaseUnits) / 10 ** repayReserve.getMintDecimals()) * usdPerDebtUnit;
+  const worstCaseProfitUsd = profitBaseUnitsToUsd(netBaseUnits, debtPriceBase);
+  const quotedProfitUsd = profitBaseUnitsToUsd(quotedNetBaseUnits, debtPriceBase);
   if (worstCaseProfitUsd < input.minProfitUsd) {
     return {
       stage: "simulate",
       passed: false,
       reason: `worst-case $${worstCaseProfitUsd.toFixed(4)} < floor $${input.minProfitUsd}`,
       logs,
+      timings,
     };
   }
 

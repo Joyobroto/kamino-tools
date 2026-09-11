@@ -1,0 +1,112 @@
+{
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "windowStart": "2026-09-11T12:28:00Z",
+  "windowEnd": "2026-09-11T12:32:00Z",
+  "results": [
+    {
+      "obligation": "E5ANmg7dnN7shHCCJG7SBpvW7y2cghs7EsHD4Y2ssrDW",
+      "botRejectedAt": "2026-09-11T12:30:28.120Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "ewcjNU4XWcwE3sJDafm43cxGsiihRmzTtX7bwMHqaEP",
+          "feePayer": "ewcjNU4XWcwE3sJDafm43cxGsiihRmzTtX7bwMHqaEP",
+          "signature": "2xrqA1cVkctRRhLRLED3AV9a29u9KLyLcs8MvPA5fcZtZdFzbmyqXQGueLxP4RwUHtmYJFLj9ERWHxiZVhLVwpLJ",
+          "slot": 446157491,
+          "at": "2026-09-11T12:30:23.000Z",
+          "secondsBeforeBotRejection": 5.12
+        }
+      ]
+    },
+    {
+      "obligation": "H8is58VtiWvCQ6tXes5bpbUfn9Li4rdo8XVRdJKYn8Sz",
+      "botRejectedAt": "2026-09-11T12:30:28.121Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "BPLjJYGNrCe2KzmcaoSGcQ6ja5UXPdBcaDfzYYjaRwKh",
+          "feePayer": "BPLjJYGNrCe2KzmcaoSGcQ6ja5UXPdBcaDfzYYjaRwKh",
+          "signature": "TgcvnHzVFbQ6KB3wtTdcGSS5U3juNvwPNBTimvoxCygw9TZTyS6kCnHpZH1x6exJ5TqNkJNf8DP4pw69y9WCmL3",
+          "slot": 446157490,
+          "at": "2026-09-11T12:30:23.000Z",
+          "secondsBeforeBotRejection": 5.121
+        }
+      ]
+    },
+    {
+      "obligation": "Bayk7mMP5oMbtfF71yQq5ueauBco9ozGoiJzhDRAnDS6",
+      "botRejectedAt": "2026-09-11T12:30:28.159Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "4NUiCMoJLUsG1eRZY5PPeqRvc4w2P3rcQXfDpaR6k6xX",
+          "feePayer": "4NUiCMoJLUsG1eRZY5PPeqRvc4w2P3rcQXfDpaR6k6xX",
+          "signature": "4zZ8vjfAFvE6qmzGFo58Bd9ZU1N8inhftuQQEFbK1jtsZidkJDQvvZq31hv8zZ32rcSGPkk2z37hkWcqs9Nfmta8",
+          "slot": 446157489,
+          "at": "2026-09-11T12:30:22.000Z",
+          "secondsBeforeBotRejection": 6.159
+        }
+      ]
+    },
+    {
+      "obligation": "5fSS1q6SVWkSimiUi9gdLqLSkGc3fisPiCjCjEnQg9dm",
+      "botRejectedAt": "2026-09-11T12:30:29.993Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "BCusd3noav25xGgvUdSpHo7x6kyRAmUMqDbUrvu2LH6A",
+          "feePayer": "BCusd3noav25xGgvUdSpHo7x6kyRAmUMqDbUrvu2LH6A",
+          "signature": "2bSjALBYLHkUUST1akBfxctX2e19J3kzEimeXSLfg9gEVKWGGnMEDUvFst4hJ98HaqXJcCTWJTYW2GAhzp4b3jt8",
+          "slot": 446157505,
+          "at": "2026-09-11T12:30:27.000Z",
+          "secondsBeforeBotRejection": 2.993
+        }
+      ]
+    },
+    {
+      "obligation": "CspUGetMYfK72zjqrZmx8zercbgUpmfrvxaT41LqfA9b",
+      "botRejectedAt": "2026-09-11T12:30:30.003Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "Bcusd3nsT45sfqtz7aV33qZ2Rc2Ny8EgvZAe9guEZnTy",
+          "feePayer": "Bcusd3nsT45sfqtz7aV33qZ2Rc2Ny8EgvZAe9guEZnTy",
+          "signature": "onMoCFqyHZwoFjR8h192H5gHj6JtiKUPqYoDJ5Ks3kJHKUdfrHBfvoY4w8U2UUodJ8WvgGmMDkA3fyVKAGe7AJC",
+          "slot": 446157506,
+          "at": "2026-09-11T12:30:28.000Z",
+          "secondsBeforeBotRejection": 2.003
+        }
+      ]
+    },
+    {
+      "obligation": "Evr24yJ8Q8RHQSnwxq9bgUNKF8Eht1tpsXNXbuwQ6VVu",
+      "botRejectedAt": "2026-09-11T12:30:30.806Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "BCuSd3h3YB861StUUa17CSZ8JJLCFAQoz6PWr5u5MLKb",
+          "feePayer": "BCuSd3h3YB861StUUa17CSZ8JJLCFAQoz6PWr5u5MLKb",
+          "signature": "3yabSEnS3owPUJZ8wnM2u56BQs7DatHyvdjtZN37zGkPPJacJXsnTLvPNhRxox1iCrSwVsQt6ZBTteQs6pp2UeqB",
+          "slot": 446157508,
+          "at": "2026-09-11T12:30:28.000Z",
+          "secondsBeforeBotRejection": 2.806
+        }
+      ]
+    },
+    {
+      "obligation": "E6tUdf62xViq3gpPWtEW5NNp8ZLW1Bfg9k89Si3Fqc3n",
+      "botRejectedAt": "2026-09-11T12:30:36.708Z",
+      "historyWindowCovered": true,
+      "liquidations": [
+        {
+          "liquidator": "PcUsdTQBpKpczPUMLySPzf5kCE5w6pMnmpaS1DFJSUt",
+          "feePayer": "PcUsdTQBpKpczPUMLySPzf5kCE5w6pMnmpaS1DFJSUt",
+          "signature": "4cs2vG3ZyRgWKXFH8rvvUi6PN48mDr7497bDAFVLBcHN7HRhMQY3pMw9HDQG8N2NUydjE97W4eKCN38TiWViru6b",
+          "slot": 446157526,
+          "at": "2026-09-11T12:30:34.000Z",
+          "secondsBeforeBotRejection": 2.708
+        }
+      ]
+    }
+  ]
+}

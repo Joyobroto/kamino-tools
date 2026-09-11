@@ -29,8 +29,8 @@ const BLOCKHASH_MAX_AGE_MS = 30_000; // 150 slots ≈ 60s validity; refresh with
 // enough blockhash lifetime left to land AND confirm.
 const BLOCKHASH_STALE_RETRY_MS = 2_000;
 
-const blockhashCache = new Map<string, CachedBlockhash>();
-const blockhashInFlight = new Map<string, Promise<CachedBlockhash>>();
+const blockhashCache = new Map<unknown, CachedBlockhash>();
+const blockhashInFlight = new Map<unknown, Promise<CachedBlockhash>>();
 
 export interface BlockhashSnapshot {
   blockhash: CachedBlockhash["blockhash"];
@@ -38,11 +38,11 @@ export interface BlockhashSnapshot {
 }
 
 /** Cached getLatestBlockhash — falls through to a shared in-flight fetch. */
-export async function getCachedBlockhash(rpc: Rpc<SolanaRpcApi>): Promise<BlockhashSnapshot> {
-  const endpoint = (rpc as unknown as { url?: string } | null)?.url ?? "rpc";
+export async function getCachedBlockhash(rpc: Rpc<SolanaRpcApi>, rpcUrl?: string, force = false): Promise<BlockhashSnapshot> {
+  const endpoint = rpcUrl ?? rpc;
   const fresh = blockhashCache.get(endpoint);
   const now = Date.now();
-  if (fresh && now - fresh.fetchedAt < BLOCKHASH_MAX_AGE_MS) return fresh;
+  if (!force && fresh && now - fresh.fetchedAt < BLOCKHASH_MAX_AGE_MS) return fresh;
   const inflight = blockhashInFlight.get(endpoint);
   if (inflight) return inflight;
   const promise = (async (): Promise<CachedBlockhash> => {
@@ -61,15 +61,15 @@ export async function getCachedBlockhash(rpc: Rpc<SolanaRpcApi>): Promise<Blockh
 }
 
 /** True when the cached blockhash still has >10s of validity — fire-path eligible. */
-export function blockhashFresh(rpc: Rpc<SolanaRpcApi>): boolean {
-  const endpoint = (rpc as unknown as { url?: string } | null)?.url ?? "rpc";
+export function blockhashFresh(rpc: Rpc<SolanaRpcApi>, rpcUrl?: string): boolean {
+  const endpoint = rpcUrl ?? rpc;
   const cached = blockhashCache.get(endpoint);
   return Boolean(cached && Date.now() - cached.fetchedAt < BLOCKHASH_MAX_AGE_MS);
 }
 
 /** Kick a background refresh (never on the critical path). Errors are swallowed. */
-export function warmBlockhash(rpc: Rpc<SolanaRpcApi>): void {
-  void getCachedBlockhash(rpc).catch(() => {});
+export function warmBlockhash(rpc: Rpc<SolanaRpcApi>, rpcUrl?: string): void {
+  void getCachedBlockhash(rpc, rpcUrl, true).catch(() => {});
 }
 
 // ─── ALT contents cache ────────────────────────────────────────────────────
@@ -90,9 +90,10 @@ export async function getCachedAltAddresses(
   rpcUrl: string,
   tableAddress: string,
 ): Promise<Address[]> {
-  const fresh = altCache.get(tableAddress);
+  const cacheKey = `${rpcUrl}|${tableAddress}`;
+  const fresh = altCache.get(cacheKey);
   if (fresh && Date.now() - fresh.fetchedAt < ALT_MAX_AGE_MS) return fresh.addresses;
-  const inflight = altInFlight.get(tableAddress);
+  const inflight = altInFlight.get(cacheKey);
   if (inflight) return inflight.then((cached) => cached.addresses);
   const promise = (async (): Promise<CachedAlt> => {
     let response: Awaited<ReturnType<typeof parseAltResponse>> | null = null;
@@ -101,6 +102,7 @@ export async function getCachedAltAddresses(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAccountInfo", params: [tableAddress, { encoding: "jsonParsed" }] }),
+        signal: AbortSignal.timeout(2_000),
       }).catch(() => null);
       if (!raw) continue;
       if (raw.status === 429) {
@@ -111,10 +113,10 @@ export async function getCachedAltAddresses(
     }
     const addresses = response?.result?.value?.data?.parsed?.info?.addresses ?? [];
     const cached: CachedAlt = { addresses: addresses.map((a) => a as Address), fetchedAt: Date.now() };
-    if (cached.addresses.length) altCache.set(tableAddress, cached);
+    if (cached.addresses.length) altCache.set(cacheKey, cached);
     return cached;
-  })();
-  altInFlight.set(tableAddress, promise);
+  })().finally(() => altInFlight.delete(cacheKey));
+  altInFlight.set(cacheKey, promise);
   return promise.then((cached) => cached.addresses);
 }
 
@@ -134,7 +136,11 @@ export async function createSignedTransactionWithAltCached(
   instructions: Instruction[],
   lookupTableAddresses: Address[],
 ) {
-  const latestBlockhash = await getCachedBlockhash(rpc);
+  const uniqueTables = [...new Set(lookupTableAddresses.map(String))];
+  const [latestBlockhash, altResults] = await Promise.all([
+    getCachedBlockhash(rpc, rpcUrl),
+    Promise.all(uniqueTables.map(async (table) => [table, await getCachedAltAddresses(rpcUrl, table)] as const)),
+  ]);
   let message = pipe(
     createTransactionMessage({ version: 0 }),
     (tx) => setTransactionMessageFeePayer(signer.address, tx),
@@ -144,13 +150,8 @@ export async function createSignedTransactionWithAltCached(
     ),
     (tx) => appendTransactionMessageInstructions(instructions, tx),
   );
-  const uniqueTables = [...new Set(lookupTableAddresses.map((a) => a.toString()))];
   if (uniqueTables.length) {
     const addressesByLookupTableAddress: Record<string, Address[]> = {};
-    const altResults = await Promise.all(uniqueTables.map(async (table) => {
-      const addresses = await getCachedAltAddresses(rpcUrl, table);
-      return [table, addresses] as const;
-    }));
     for (const [table, addresses] of altResults) {
       if (addresses.length) addressesByLookupTableAddress[table] = addresses;
     }

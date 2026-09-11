@@ -3,7 +3,6 @@ import { ObligationTypeTag } from "@kamino-finance/klend-sdk";
 import type { LiquidatableCandidate, ScanOptions } from "./types.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-const LIQUIDATION_BONUS_FALLBACK = 0.03;
 const SF_SCALE = 1e18;
 
 export interface MarketReserveInfo {
@@ -17,6 +16,9 @@ export interface MarketReserveInfo {
   priceValid: boolean;
   /** The liquidation threshold (% of value) — drives the program's pair-priority. */
   liquidationThresholdPct: number;
+  protocolLiquidationFeePct?: number;
+  borrowFactorPct?: number;
+  loanToValuePct?: number;
 }
 
 export type MarketReserveMap = Map<string, MarketReserveInfo & { __marketCloseFactorPct?: number }>;
@@ -41,30 +43,23 @@ export function healthFactorFromSf(debtSf: bigint, unhealthySf: bigint): number 
   return Number(unhealthySf) / Number(debtSf);
 }
 
-/**
- * Estimated liquidation prize, mirroring the PROGRAM's actual economics:
- *   repay = min(closeFactor × largestDebtPosition, debtPosition)  ← the cap the
- *   on-chain liquidate enforces (market.state.liquidationMaxDebtCloseFactorPct;
- *   our market runs 10%), NOT the full debt.
- *   profit ≈ repay × liquidationBonus (bonus at MIN when just past threshold —
- *   verified on-chain: borderline positions liquidate at minLiquidationBonusBps).
- * Also subtract the flash-loan fee (we borrow the repay amount; 0 on fee-free
- * reserves but 9–30bps on most) and leave swap/slippage costs out (worst case
- * bounded by amountOutMin on-chain).
- */
+/** Estimated margin after protocol share and flash fee, BEFORE swap/network costs.
+ * Uses the executor's conservative selected-debt close-factor sizing.
+ * This is screening metadata, not a quote or realized profit. */
 export function estimateLiquidationProfit(input: {
   debtUsd: number;
   liquidationBonus: number;
   closeFactorPct?: number;
   flashLoanFeeRate?: number;
+  protocolLiquidationFeePct?: number;
 }): number {
-  const bonus = input.liquidationBonus > 0 ? input.liquidationBonus : LIQUIDATION_BONUS_FALLBACK;
+  const bonus = Math.max(0, input.liquidationBonus);
   // The program caps the repay at close-factor × the debt position. Default 100
   // only when the caller has no market state (unit tests).
   const closeFactor = Math.max(0, Math.min(100, input.closeFactorPct ?? 100)) / 100;
   const repayUsd = input.debtUsd * closeFactor;
   const feeRate = Math.max(0, input.flashLoanFeeRate ?? 0);
-  return repayUsd * bonus - repayUsd * feeRate;
+  return repayUsd * (bonus * (1 - (input.protocolLiquidationFeePct ?? 0) / 100) - feeRate);
 }
 
 function largestDebtPosition(
@@ -94,7 +89,15 @@ export function obligationToCandidate(
   // WS onSlice, hot tick, executeDue's own hydration — carries the same estimate.
   // Without it the --min-prize firewall saw prizeUsd = 0 and silently killed
   // every event-driven fire.
-  const debtReserveInfo = marketReserves.get(largestDebt.reserve);
+  const priorityBorrow = obligation.getBorrows().filter((b) => b.marketValueRefreshed.gt(0) && marketReserves.has(b.reserveAddress))
+    .sort((a, b) => (marketReserves.get(b.reserveAddress)?.borrowFactorPct ?? 100)
+      - (marketReserves.get(a.reserveAddress)?.borrowFactorPct ?? 100))[0];
+  const repayDebt = priorityBorrow ? {
+    reserve: priorityBorrow.reserveAddress,
+    symbol: wsolAwareSymbol(priorityBorrow.reserveAddress, marketReserves),
+    amountUsd: priorityBorrow.marketValueRefreshed.toNumber(),
+  } : largestDebt;
+  const debtReserveInfo = marketReserves.get(repayDebt.reserve);
   const marketMeta = marketReserves.get("__market__");
   const closeFactorPct = marketMeta?.__marketCloseFactorPct ?? 100;
   // The liquidation bonus is paid in extra COLLATERAL — it comes from the
@@ -104,12 +107,13 @@ export function obligationToCandidate(
   // what the executor will actually pick.
   const seizedCollateral = obligation.getDeposits()
     .map((deposit) => ({ deposit, info: marketReserves.get(deposit.reserveAddress) }))
-    .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info))
+    .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info && entry.info.availableUsd > 0 && (entry.info.loanToValuePct ?? 1) > 0))
     .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
   const bonus = seizedCollateral?.info.liquidationBonus ?? 0;
   const estimatedProfitUsd = estimateLiquidationProfit({
-    debtUsd: largestDebt.amountUsd,
+    debtUsd: repayDebt.amountUsd,
     liquidationBonus: bonus,
+    protocolLiquidationFeePct: seizedCollateral?.info.protocolLiquidationFeePct ?? 0,
     ...(closeFactorPct !== 100 ? { closeFactorPct } : {}),
     ...(debtReserveInfo?.flashLoanFeeRate ? { flashLoanFeeRate: debtReserveInfo.flashLoanFeeRate } : {}),
   });
@@ -120,6 +124,8 @@ export function obligationToCandidate(
     depositedValueUsd: Number(stats.userTotalDeposit.toFixed(4)),
     borrowedValueUsd: Number(stats.userTotalBorrow.toFixed(4)),
     largestDebt,
+    repayDebt,
+    estimatedRepayUsd: repayDebt.amountUsd * closeFactorPct / 100,
     collateralSymbols: obligation.getDeposits().map((deposit) => {
       const info = marketReserves.get(deposit.reserveAddress);
       if (!info) return deposit.reserveAddress.slice(0, 4);
@@ -183,8 +189,8 @@ export function filterLiquidatable(
       skipped.healthy += 1;
       continue;
     }
-    const debtReserve = marketReserves.get(candidate.largestDebt.reserve);
-    const debtUsd = candidate.largestDebt.amountUsd;
+    const debtReserve = marketReserves.get((candidate.repayDebt ?? candidate.largestDebt).reserve);
+    const debtUsd = (candidate.repayDebt ?? candidate.largestDebt).amountUsd;
     // minDebtUsd/maxDebtUsd == 0 disables the debt band (full-market research mode).
     if (options.minDebtUsd > 0 && debtUsd < options.minDebtUsd) {
       skipped.outOfBand += 1;
@@ -194,7 +200,7 @@ export function filterLiquidatable(
       skipped.outOfBand += 1;
       continue;
     }
-    if (!debtReserve || !debtReserve.flashLoanEnabled || debtReserve.availableUsd < debtUsd) {
+    if (!debtReserve || !debtReserve.flashLoanEnabled || debtReserve.availableUsd < (candidate.estimatedRepayUsd ?? debtUsd)) {
       skipped.noFlashDebt += 1;
       continue;
     }
@@ -207,7 +213,7 @@ export function filterLiquidatable(
     // bonusByReserve (scan-side override) still wins when provided.
     const seizedCollateral = obligation.getDeposits()
       .map((deposit) => ({ deposit, info: marketReserves.get(deposit.reserveAddress) }))
-      .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info))
+      .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info && entry.info.availableUsd > 0 && (entry.info.loanToValuePct ?? 1) > 0))
       .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
     const bonus = bonusByReserve?.get(seizedCollateral?.deposit.reserveAddress ?? candidate.largestDebt.reserve)
       ?? seizedCollateral?.info.liquidationBonus
@@ -217,6 +223,7 @@ export function filterLiquidatable(
     const estProfit = estimateLiquidationProfit({
       debtUsd,
       liquidationBonus: bonus,
+      protocolLiquidationFeePct: seizedCollateral?.info.protocolLiquidationFeePct ?? 0,
       ...(closeFactorPct !== 100 ? { closeFactorPct } : {}),
       ...(debtReserve.flashLoanFeeRate ? { flashLoanFeeRate: debtReserve.flashLoanFeeRate } : {}),
     });
@@ -248,7 +255,7 @@ export function buildMarketReserveMap(
       getOracleMarketPrice(): { div(value: number | string): { toFixed(digits?: number): string } };
       hasValidOraclePrice(): boolean;
       getFlashLoanFee(): { toString(): string };
-      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number; liquidationThresholdPct: number } };
+      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number; liquidationThresholdPct: number; protocolLiquidationFeePct?: number; borrowFactorPct?: { toString(): string }; loanToValuePct?: number } };
     }>;
   },
   marketCloseFactorPct?: number,
@@ -262,7 +269,7 @@ export function buildMarketReserveMap(
   for (const reserve of market.getReserves()) {
     const flashLoanFeeRate = Number(reserve.getFlashLoanFee().toString());
     const liquidityAvailable = Number(reserve.getLiquidityAvailableAmount().toFixed(0));
-    const oraclePrice = Number(reserve.getOracleMarketPrice().div(10 ** reserve.getMintDecimals()).toFixed(6));
+    const oraclePrice = Number(reserve.getOracleMarketPrice().div(10 ** reserve.getMintDecimals()).toFixed(18));
     map.set(reserve.address, {
       symbol: reserve.getTokenSymbol(),
       liquidityMint: reserve.getLiquidityMint().toString(),
@@ -275,6 +282,9 @@ export function buildMarketReserveMap(
       availableUsd: liquidityAvailable * oraclePrice,
       priceValid: reserve.hasValidOraclePrice(),
       liquidationThresholdPct: reserve.state.config.liquidationThresholdPct,
+      protocolLiquidationFeePct: reserve.state.config.protocolLiquidationFeePct ?? 0,
+      borrowFactorPct: Number(reserve.state.config.borrowFactorPct?.toString() ?? 100),
+      loanToValuePct: reserve.state.config.loanToValuePct ?? 1,
     });
   }
   return map;

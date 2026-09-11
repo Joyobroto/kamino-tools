@@ -45,11 +45,12 @@ test("trackerEventToAlert maps DUE events", () => {
   assert.ok(alert!.lines.some((l) => l.includes("Health: 0.9900")));
 });
 
-test("trackerEventToAlert reports only real liquidations (console-following)", () => {
+test("trackerEventToAlert does not claim a liquidation from a watchlist exit", () => {
   const liquidated = trackerEventToAlert({ type: "taken", obligation: "ABC", satSeconds: 68, wasDue: true, dueSince: "2026-09-04T00:00:00Z", lastHealth: 0.998, debtUsd: 50859.99, debtSymbol: "USDC" });
   const managed = trackerEventToAlert({ type: "taken", obligation: "ABC", satSeconds: 120, wasDue: false, dueSince: undefined });
-  assert.equal(liquidated!.kind, "taken-liquidated");
-  assert.equal(liquidated!.title, "⚡ LIQUIDATED BY OTHERS");
+  assert.equal(liquidated!.kind, "taken-gone");
+  assert.equal(liquidated!.title, "⚡ LEFT WATCHLIST");
+  assert.ok(liquidated!.lines.some((l) => l.includes("unverified")));
   assert.ok(liquidated!.lines.some((l) => l.includes("68s")));
   assert.ok(liquidated!.lines.some((l) => l.includes("50859.99 USDC")));
   // Band exits (healed/managed) are suppressed — no alert, matching the console.

@@ -116,8 +116,8 @@ test("estimateLiquidationProfit uses reserve bonus when available", () => {
   assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05 }), 50);
 });
 
-test("estimateLiquidationProfit falls back to 3 percent", () => {
-  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0 }), 30);
+test("estimateLiquidationProfit preserves a configured zero bonus", () => {
+  assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0 }), 0);
 });
 
 test("estimateLiquidationProfit applies the market close-factor cap (program economics)", () => {
@@ -378,4 +378,25 @@ test("isRateLimitError detects kit-wrapped SolanaError with statusCode in contex
   const notRateLimit = new Error("Solana error #8100002");
   (notRateLimit as Error & { context?: unknown }).context = { statusCode: 500 };
   assert.equal(isRateLimitError(notRateLimit), false);
+});
+
+test("screening margin subtracts protocol share and flash fee", () => {
+  assert.equal(estimateLiquidationProfit({debtUsd:1000,closeFactorPct:10,liquidationBonus:0.01,protocolLiquidationFeePct:50}),0.5);
+  assert.equal(estimateLiquidationProfit({debtUsd:1000,closeFactorPct:10,liquidationBonus:0.01,protocolLiquidationFeePct:50,flashLoanFeeRate:0.003}),0.2);
+});
+
+test("candidate margin follows borrow-factor priority rather than largest debt", () => {
+  const reserves=fakeMarketReserveMap([{address:RESERVE_USDC,symbol:"USDC"},{address:RESERVE_WSOL,symbol:"SOL",liquidationBonus:0.01}]);
+  reserves.get(RESERVE_USDC)!.borrowFactorPct=100;
+  reserves.get(RESERVE_WSOL)!.borrowFactorPct=200;
+  reserves.get(RESERVE_WSOL)!.protocolLiquidationFeePct=50;
+  reserves.set("__market__",{__marketCloseFactorPct:10} as never);
+  const candidate=obligationToCandidate(fakeObligation({collateralUsd:2000,borrowedUsd:1100,
+    borrows:[{reserve:RESERVE_USDC,symbol:"USDC",usd:1000},{reserve:RESERVE_WSOL,symbol:"SOL",usd:100}],
+    deposits:[{reserve:RESERVE_WSOL,symbol:"SOL",usd:2000}],
+  }),reserves);
+  assert.equal(candidate.largestDebt.amountUsd,1000);
+  assert.equal(candidate.repayDebt?.amountUsd,100);
+  assert.equal(candidate.estimatedRepayUsd,10);
+  assert.equal(candidate.estimatedProfitUsd,0.05);
 });

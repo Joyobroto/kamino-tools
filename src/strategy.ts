@@ -126,6 +126,7 @@ export function externalInstructionsToStrategy(
   swapInstructions: ExternalInstruction[],
   computeBudgetInstructions: ExternalInstruction[],
   owner: TransactionSigner,
+  refreshInstructions: Instruction[] = [],
 ): LoadedStrategy {
   const toInstruction = (input: ExternalInstruction): Instruction => {
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(input.programId)) throw new Error(`Invalid program address ${input.programId}`);
@@ -156,7 +157,15 @@ export function externalInstructionsToStrategy(
   }
   return {
     name: "lst-depeg-atomic",
-    preInstructions: computeBudgetInstructions.map(toInstruction),
+    preInstructions: [...computeBudgetInstructions.map(toInstruction), ...refreshInstructions],
     instructions: swapInstructions.map(toInstruction),
   };
+}
+
+/** Replace a compute-budget setting by decoded discriminator, not encoded prefix. */
+export function upsertComputeBudget(instructions: ExternalInstruction[], replacement: ExternalInstruction): ExternalInstruction[] {
+  if (replacement.programId !== COMPUTE_BUDGET_PROGRAM) throw new Error("Expected compute budget instruction");
+  const discriminator = Buffer.from(replacement.data, "base64")[0];
+  return [...instructions.filter((ix) => ix.programId !== COMPUTE_BUDGET_PROGRAM
+    || Buffer.from(ix.data, "base64")[0] !== discriminator), replacement];
 }

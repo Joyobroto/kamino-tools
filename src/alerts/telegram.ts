@@ -216,13 +216,11 @@ export function trackerEventToAlert(event: TrackerLikeEvent): TelegramAlert | nu
     return null;
   }
   if (event.type === "taken") {
-    // Telegram follows the console: only surface real LIQUIDATIONS (candidates that
-    // went DUE and were taken by another liquidator). Healed/managed band exits stay
-    // in the JSONL only — no alert, no console line.
+    // A disappearance does not establish whether liquidation or recovery occurred.
     if (!event.wasDue) return null;
     const lines = [
       `Obligation: ${event.obligation}`,
-      `We tracked it DUE for ${event.satSeconds}s, then another bot took it.`,
+      `We tracked it DUE for ${event.satSeconds}s, then it left the watchlist; liquidation is unverified.`,
     ];
     if (event.lastHealth !== undefined) {
       lines.push(`Last health seen: ${event.lastHealth.toFixed(4)}`);
@@ -230,10 +228,10 @@ export function trackerEventToAlert(event: TrackerLikeEvent): TelegramAlert | nu
     if (event.debtUsd !== undefined && event.debtSymbol) {
       lines.push(`Debt: ${event.debtUsd.toFixed(2)} ${event.debtSymbol}`);
     }
-    lines.push(`Missed execution window.`);
+    lines.push(`On-chain verification is required to identify a liquidation.`);
     return {
-      kind: "taken-liquidated",
-      title: "⚡ LIQUIDATED BY OTHERS",
+      kind: "taken-gone",
+      title: "⚡ LEFT WATCHLIST",
       lines,
     };
   }
@@ -467,5 +465,18 @@ export function dueAttemptAlert(params: {
       `Worst-case profit: $${params.worstProfitUsd.toFixed(2)}${lane}`,
       timing ? `Latency: ${timing}` : "",
     ].filter(Boolean),
+  };
+}
+
+/** Confirmation is not a measurement of realized wallet P&L. */
+export function liquidationQuoteAlert(params: { signature: string; quotedUsd: number; worstUsd: number }): TelegramAlert {
+  return {
+    kind: "profit", title: "Liquidation confirmed — estimated surplus",
+    lines: [
+      `Quoted surplus: $${params.quotedUsd.toFixed(4)}`,
+      `Swap-floor surplus: $${params.worstUsd.toFixed(4)}`,
+      "After flash fee; excludes network fee and account rent. Not realized P&L.",
+      `https://solscan.io/tx/${params.signature}`,
+    ],
   };
 }

@@ -9,7 +9,11 @@ export interface LiquidatableCandidate {
     symbol: string;
     amountUsd: number;
   };
+  /** Executor-priority debt; largestDebt remains portfolio display metadata. */
+  repayDebt?: LiquidatableCandidate["largestDebt"];
+  estimatedRepayUsd?: number;
   collateralSymbols: string[];
+  /** Margin after protocol share and flash fee; excludes swap/network costs. */
   estimatedProfitUsd?: number;
 }
 

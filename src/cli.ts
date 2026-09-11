@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createTaskQueue } from "./strategies/liquidation/pipeline.js";
 import { config as loadEnv } from "dotenv";
 import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { Command } from "commander";
@@ -46,6 +47,7 @@ import {
   trackerEventToAlert,
   executionAlert, // kept for test compat
   profitAlert,
+  liquidationQuoteAlert,
   liquidationFailedAlert,
   budgetPausedAlert,
   heartbeatAlert,
@@ -144,8 +146,8 @@ function printCandidateLine(candidate: LiquidatableCandidate, label: string): st
     `${label}`,
     `OBLIGATION=${color.cyan(candidate.obligation)}`,
     `HEALTH=${color.white(candidate.healthFactor.toFixed(4))}`,
-    `DEBT=${color.yellow(`${candidate.largestDebt.amountUsd.toFixed(2)} ${candidate.largestDebt.symbol}`)}`,
-    `EST.PROFIT=${color.green(`${(candidate.estimatedProfitUsd ?? 0).toFixed(2)} USD`)}`,
+    `DEBT=${color.yellow(`${(candidate.repayDebt ?? candidate.largestDebt).amountUsd.toFixed(2)} ${(candidate.repayDebt ?? candidate.largestDebt).symbol}`)}`,
+    `EST.MARGIN=${color.green(`${(candidate.estimatedProfitUsd ?? 0).toFixed(2)} USD`)}`,
     color.dim(`COLLATERAL=${candidate.collateralSymbols.join(",") || "n/a"}`),
   ].join("  ");
 }
@@ -162,7 +164,7 @@ function printAdlLine(candidate: AdlCandidate): string {
     `LTV=${color.white(`${candidate.currentLtvPct.toFixed(1)}%`)}`,
     `ADL TARGET=${color.magenta(`${candidate.adlTargetLtvPct}%`)}`,
     color.dim(`MARGIN-CALL AGE=${candidate.marginCallAgeHours}h`),
-    `DEBT=${color.yellow(`${candidate.largestDebt.amountUsd.toFixed(2)} ${candidate.largestDebt.symbol}`)}`,
+    `DEBT=${color.yellow(`${(candidate.repayDebt ?? candidate.largestDebt).amountUsd.toFixed(2)} ${(candidate.repayDebt ?? candidate.largestDebt).symbol}`)}`,
     color.dim(`COLLATERAL=${candidate.collateralSymbols.join(",") || "n/a"}`),
   ].join("  ");
 }
@@ -649,24 +651,30 @@ program
       watchHealth: hotBand,
       maxWatch: maxHotWatch,
     });
+    const scanRpc = rpcClient(options.rpc);
     let preloaded: PreloadedMarket | undefined;
-    if (options.watch) preloaded = await preloadMarket(rpcClient(options.rpc), options.market);
+    if (options.watch) preloaded = await preloadMarket(scanRpc, options.market);
 
     // ── In-process executor (unified pipeline: monitor → risk → execute → notify) ──
     // When --execute is set, DUE events emitted anywhere in this process (full
     // scan, hot tick) flow straight into the verdict chain — no separate
     // container, no file bridge, zero extra detection latency. The scan's
     // preloaded market is reused (no second market-load RPC burst).
-    const executeMarket = options.execute ? (preloaded?.market ?? await loadMarket(rpcClient(options.rpc), options.market)) : undefined;
+    let executeMarket = options.execute ? (preloaded?.market ?? await loadMarket(scanRpc, options.market)) : undefined;
     const executorAltState = loadAltState();
     const executorAltTables = altTableAddresses(executorAltState);
     // Warm the fire path BEFORE the first fire: blockhash + every chained ALT
     // contents are fetched in the background so the first DUE never eats the
     // cold-fetch round-trips on the critical path (ALT contents ~80-100ms each;
     // with companion tables that same cost every fire would be).
-    if (executorAltTables.length) {
-      const { warmAltTables, warmBlockhash } = await import("./strategies/liquidation/hotcache.js");
-      warmBlockhash(rpcClient(options.rpc));
+    if (options.execute) {
+      const { warmAltTables, warmBlockhash, warmScopeConfigurations } = await import("./strategies/liquidation/hotcache.js");
+      const warmExecution = () => {
+        warmBlockhash(scanRpc, options.rpc);
+        warmScopeConfigurations(scanRpc);
+      };
+      warmExecution();
+      if (options.watch) setInterval(warmExecution, 20_000).unref();
       warmAltTables(options.rpc, executorAltTables);
     }
     const executorAutoOptions: AutofireOptions = {
@@ -689,11 +697,6 @@ program
       minPrizeUsd: Number(options.minPrize),
     };
     const HEALTH_GATE_TOLERANCE = Math.max(0, Number(options.raceTolerance));
-    // Learning-mode blind-fire ceiling: WS-rail DUE plays with an estimated
-    // prize below this skip the sim round-trip entirely (LionX same-slot
-    // shape; wrong guess ≈ $0.001). Bigger prizes keep the full verdict chain —
-    // a $500+ miss on a failed sim is tuition we don't need to pay twice.
-    const BLIND_FIRE_MAX_PRIZE_USD = 2.0;
     const executorCooldownMs = 30_000;
     const executorRecentlyTried = new Map<string, number>();
     // Bounded-concurrency fire lanes: LionX's census shows they fire PARALLEL txs
@@ -705,23 +708,10 @@ program
     // key). Guards/budget caps are evaluated INSIDE each lane, so the caps bind
     // exactly the same; ledger writes are single-line JSONL appends.
     const MAX_FIRE_LANES = 3;
-    const fireLanes = new Set<Promise<void>>();
-    const fireWaiters: Array<() => void> = [];
-    const acquireLane = (): Promise<void> | null =>
-      fireLanes.size < MAX_FIRE_LANES ? Promise.resolve() : new Promise<void>((resolve) => fireWaiters.push(resolve));
-    const enqueueFire = (run: () => Promise<void>): void => {
-      const startLane = () => {
-        const lane = run().finally(() => {
-          fireLanes.delete(lane);
-          const next = fireWaiters.shift();
-          if (next) next();
-        });
-        fireLanes.add(lane);
-      };
-      const slot = acquireLane();
-      if (slot) void slot.then(startLane);
-      else startLane();
-    };
+    const enqueueFire = createTaskQueue(MAX_FIRE_LANES, (error) => {
+      console.error(`executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    const enqueueForensics = createTaskQueue(1, () => {});
     const executorBusy = new Set<string>();
     // Runtime stats for the heartbeat alert — the post-mortem data when things
     // don't work as expected. Every counter is a REAL event that happened in
@@ -738,9 +728,7 @@ program
       selfHealed: 0,
       lastFailure: undefined as string | undefined,
     };
-    // Race-loss truth: ONE row per obligation per hour — the tracker's "taken"
-    // event and the forensics' "lost-race" both fire for the same loss; the
-    // Map dedups them and carries the prize we had on the table.
+    // Count only verified on-chain liquidations, deduplicated per obligation/hour.
     const lostRaces = new Map<string, { prizeUsd: number; at: number }>();
     const LOST_RACE_DEDUP_MS = 60 * 60_000;
     const markRaceLost = (obligation: string, prizeUsd: number): void => {
@@ -777,7 +765,7 @@ program
     const EXECUTOR_RACE_RETRY_MS = 5_000;
     const EXECUTOR_RACE_RETRY_WINDOW_MS = 120_000;
     const executorStillDue = new Map<string, number>(); // obligation → last WS-seen-DUE timestamp
-    const executeDue = (obligation: string, opts: { bypassHealth?: boolean; rail?: "ws" | "scan" | "hot" } = {}): void => {
+    const executeDue = (obligation: string, opts: { bypassHealth?: boolean; rail?: "ws" | "scan" | "hot"; streamSnapshot?: import("./strategies/liquidation/screener.js").StreamAccountSnapshot; prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>; preparedAt?: number } = {}): void => {
       const triggeredAtMs = Date.now();
       executorStats.dueTriggers++;
       const rail = opts.rail ?? "scan";
@@ -821,8 +809,8 @@ program
           });
           return;
         }
-        void (async () => {
-          const fate = await resolveVetoFate({ rpcUrl: options.rpc, obligation, triggeredAtMs });
+        enqueueForensics(async () => {
+          const fate = await resolveVetoFate({ rpcUrl: "https://api.mainnet-beta.solana.com", obligation, triggeredAtMs });
           logLedgerEntry(executorAutoOptions.ledgerPath, {
             at: new Date().toISOString(),
             type: "vetoed",
@@ -831,6 +819,10 @@ program
             outcome: fate.outcome,
             ...(fate.winner ? { winner: fate.winner } : {}),
             ...(fate.winnerSignature ? { winnerSignature: fate.winnerSignature } : {}),
+            ...(fate.feePayer ? { feePayer: fate.feePayer } : {}),
+            ...(fate.slot !== undefined ? { liquidationSlot: fate.slot } : {}),
+            ...(fate.raceLostAfterMs !== undefined ? { raceLostAfterMs: fate.raceLostAfterMs } : {}),
+            triggeredAt: new Date(triggeredAtMs).toISOString(),
             latencyMs,
             ...(detail.liveHealth !== undefined ? { liveHealth: detail.liveHealth } : {}),
             ...(detail.prizeUsd !== undefined ? { prizeUsd: detail.prizeUsd } : {}),
@@ -842,16 +834,14 @@ program
             const lostAfter = ((fate.raceLostAfterMs ?? 0) / 1000).toFixed(1);
             console.log(
               color.bold(color.red(`✗ LOST RACE ${obligation.slice(0, 8)}…`)) +
-                color.dim(`  ${reason} @+${(latencyMs / 1000).toFixed(1)}s — winner ${fate.winner?.slice(0, 8) ?? "?"}… liquidated it ${lostAfter}s after our trigger  https://solscan.io/tx/${fate.winnerSignature}`),
+                color.dim(`  ${reason} @+${(latencyMs / 1000).toFixed(1)}s — winner ${fate.winner?.slice(0, 8) ?? "?"}… liquidation delta ${lostAfter}s relative to our trigger  https://solscan.io/tx/${fate.winnerSignature}`),
             );
           } else {
-            executorStats.selfHealed++;
-            boardUpdate(obligation, { status: "HEALED" });
             console.log(
-              color.dim(`[${localTimestamp(new Date().toISOString())}] veto ${obligation.slice(0, 8)}…  ${reason} — SELF-HEALED (no liquidation on-chain; borrower/price recovered, nothing was taken)`),
+              color.dim(`[${localTimestamp(new Date().toISOString())}] veto ${obligation.slice(0, 8)}…  ${reason} — ${fate.outcome.toUpperCase()} (recovery is not proven)`),
             );
           }
-        })();
+        });
       };
       // Bounded fire lane: up to MAX_FIRE_LANES pipelines run in PARALLEL (the
       // LionX same-slot burst shape); extras queue until a lane frees.
@@ -866,7 +856,10 @@ program
             return;
           }
           executorStats.dueAttempted++;
-          let hydrated: Awaited<ReturnType<typeof refreshTrackedObligations>> = { candidates: [], obligations: new Map() };
+          const hydrationStartedAt = Date.now();
+          let hydrated: Awaited<ReturnType<typeof refreshTrackedObligations>> =
+            opts.prepared && opts.preparedAt !== undefined && Date.now() - opts.preparedAt < 1000
+              ? opts.prepared : { candidates: [], obligations: new Map(), market: executeMarket! };
           // ── Race rail (#1 of the LionX gap analysis) ──
           // A WS-triggered DUE skips the ~800ms client-side health gate: the
           // slice's stored sf already said < 1.0, and SIMULATION (~50ms) runs the
@@ -882,7 +875,7 @@ program
             // in that health is never gated afterwards — sim arbitrates.
             for (let tryIndex = 0; tryIndex < 3 && !hydrated.candidates.length; tryIndex++) {
               try {
-                hydrated = await refreshTrackedObligations({ rpc: rpcClient(options.rpc), preloaded: preloaded!, pubkeys: [address(obligation)] });
+                hydrated = await refreshTrackedObligations({ rpc: scanRpc, preloaded: preloaded!, pubkeys: [address(obligation)], ...(opts.streamSnapshot ? { streamSnapshot: opts.streamSnapshot } : {}) });
               } catch {
                 if (tryIndex === 2) {
                   // Race rail: RPC hiccup must NOT end the attempt — re-arm via
@@ -914,8 +907,8 @@ program
               status: "EXECUTOR",
               ...(raceCandidate ? {
                 health: raceCandidate.healthFactor,
-                debtSymbol: raceCandidate.largestDebt.symbol,
-                debtUsd: raceCandidate.largestDebt.amountUsd,
+                debtSymbol: (raceCandidate.repayDebt ?? raceCandidate.largestDebt).symbol,
+                debtUsd: (raceCandidate.repayDebt ?? raceCandidate.largestDebt).amountUsd,
                 prizeUsd: Math.max(0, raceCandidate.estimatedProfitUsd ?? 0),
               } : {}),
             });
@@ -937,8 +930,8 @@ program
             boardUpdate(obligation, {
               status: "EXECUTOR",
               health: candidate.healthFactor,
-              debtSymbol: candidate.largestDebt.symbol,
-              debtUsd: candidate.largestDebt.amountUsd,
+              debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+              debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
               prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0),
             });
           }
@@ -959,29 +952,41 @@ program
           }
           const runExecutor = () =>
             executeLiquidationOnce({
-              rpc: rpcClient(options.rpc),
+              rpc: scanRpc,
               rpcUrl: options.rpc,
-              market: executeMarket,
+              market: hydrated.market,
               obligationAddress: address(obligation),
               slippageBps: executorAutoOptions.slippageBps,
               minProfitUsd: executorAutoOptions.minProfitUsd,
               ...(executorAltTables.length ? { lookupTableAddresses: executorAltTables.map(address) } : {}),
               ...(options.fast ? { fast: true } : {}),
-              // Learning-mode blind fire (LionX same-slot shape): for small
-              // prizes on the race rail the sim round-trip costs us the window
-              // (12:47 post-mortem: every sim'd dust attempt flipped healthy
-              // mid-sim; every fired one would have cost $0.001). The net-
-              // profit guard still runs client-side before this tx is built.
-              ...(raceRail && prizeUsd > 0 && prizeUsd < BLIND_FIRE_MAX_PRIZE_USD ? { skipSimulate: true, fast: true } : {}),
+              // Every automatic attempt must pass simulation before broadcast.
               ...(raceRail ? { healthGateTolerance: 1.5 } : marginalBand ? { healthGateTolerance: HEALTH_GATE_TOLERANCE } : {}),
               ...(hydrated.obligations.get(obligation) ? { prehydratedObligation: hydrated.obligations.get(obligation) as KaminoObligation } : {}),
               ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd, bypassHealth: opts.bypassHealth ?? false }),
             }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
+          const hydrateMs = Date.now() - hydrationStartedAt;
+          const queueMs = hydrationStartedAt - triggeredAtMs;
           let outcome = await runExecutor();
+          if ("timings" in outcome && outcome.timings) {
+            outcome.timings.queue = queueMs;
+            outcome.timings.hydrateInput = hydrateMs;
+          }
           // ReserveStale / RPC-throttle retries NO LONGER sleep inside the fire
           // lane (a sleeping lane blocks the queue — 2 retries × 15s held = the
           // same 3-lane stall shape as a hung send). The retry re-triggers
           // executeDue on a timer, OUTSIDE the lane, and this lane exits now.
+          if (!outcome.passed) {
+            logLedgerEntry(executorAutoOptions.ledgerPath, {
+              at: new Date().toISOString(), type: "skipped", obligation, stage: outcome.stage,
+              reason: outcome.reason.slice(0, 2000), rail,
+              ...(opts.streamSnapshot?.slot !== undefined ? { triggerSlot: opts.streamSnapshot.slot.toString() } : {}),
+              triggeredAt: new Date(triggeredAtMs).toISOString(), latencyMsTotal: Date.now() - triggeredAtMs,
+              ...("timings" in outcome && outcome.timings ? { timingsMs: outcome.timings } : {}),
+              simulationPerformed: "timings" in outcome && outcome.timings ? outcome.timings.simulate !== undefined : false,
+              ...("logs" in outcome ? { simulationLogs: outcome.logs.slice(-40) } : {}),
+            });
+          }
           const retryable =
             !outcome.passed && (/ReserveStale|6009|price_status/.test(outcome.reason)
               || /8100002|429|too many|rate.?limit/i.test(outcome.reason));
@@ -993,13 +998,17 @@ program
             return;
           }
           if (!outcome.passed) {
-            logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "skipped", obligation, stage: outcome.stage, reason: outcome.reason.slice(0, 200) });
             if (!options.json) console.log(color.yellow(`[${localTimestamp(new Date().toISOString())}] executor ✗ ${obligation.slice(0, 8)}… ${outcome.stage}: ${outcome.reason.slice(0, 160)}`));
             // Only alert on late-stage failures (assemble/simulate) — plan-stage rejections
             // (not liquidatable, no flash debt) are normal market noise, not incidents.
             if (outcome.stage !== "plan") {
               executorStats.lastFailure = `${outcome.stage}: ${outcome.reason.slice(0, 160)}`;
               alerter.push(liquidationFailedAlert({ obligation: obligation.slice(0, 12), stage: outcome.stage, reason: outcome.reason.slice(0, 300) }));
+            }
+            if (/6016|ObligationHealthy/.test(outcome.reason)) {
+              logVeto("simulation found a healthy obligation", {
+                liveHealth: candidate.healthFactor, prizeUsd, forensics: true,
+              });
             }
             // ── Smart retry policy ──
             // Cooldown-clear on healthy: the play was taken or repaid by someone else —
@@ -1008,7 +1017,7 @@ program
             // keeps reporting < 1.0 means OSCILLATION — arm the 5s fast-retry
             // instead of clearing, so our next attempt lands inside the +3..+43s
             // window the 2026-09-09 winners actually took.
-            if (/ObligationHealthy|IllegalLiquidation|0x1780|0xbbf|not liquidatable/i.test(outcome.reason)) {
+            if (/6016|ObligationHealthy|IllegalLiquidation|0x1780|0xbbf|not liquidatable/i.test(outcome.reason)) {
               executorFailStreak.delete(obligation);
               if (raceRail) {
                 executorStillDue.set(obligation, Date.now());
@@ -1071,11 +1080,18 @@ program
             priorityLane: outcome.priorityLane,
             tipUsd: outcome.tipUsd,
           }));
+          logLedgerEntry(executorAutoOptions.ledgerPath, {
+            at: new Date().toISOString(), type: "pass", stage: "ready", obligation, rail,
+            triggeredAt: new Date(triggeredAtMs).toISOString(), latencyMsTotal: Date.now() - triggeredAtMs,
+            ...(opts.streamSnapshot?.slot !== undefined ? { triggerSlot: opts.streamSnapshot.slot.toString() } : {}),
+            timingsMs: outcome.timings, simulationPerformed: true,
+            quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd,
+          });
           if (!options.broadcast) {
             logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "skipped", obligation, reason: "shadow — executable play not broadcast", quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd });
             return;
           }
-          const signature = await sendAndConfirm(options.rpc, rpcClient(options.rpc), outcome.transaction as Parameters<typeof sendAndConfirm>[2]).catch((error: unknown) => {
+          const signature = await sendAndConfirm(options.rpc, scanRpc, outcome.transaction as Parameters<typeof sendAndConfirm>[2]).catch((error: unknown) => {
             const failReason = error instanceof Error ? error.message : "unknown";
             logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, reason: `broadcast failed: ${failReason.slice(0, 100)}`, lossUsdEstimate: 0.0011 });
             console.log(color.red(`✗ broadcast failed: ${failReason}`));
@@ -1088,37 +1104,39 @@ program
           boardUpdate(obligation, { status: "FIRED", prizeUsd: outcome.plan.worstCaseProfitUsd });
           console.log(color.bold(color.green(`✅ FIRED ${obligation.slice(0, 8)}…`)) + `  ${color.white(`https://solscan.io/tx/${signature}`)}`);
           logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature, quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd, lossUsdEstimate: 0.0011 });
-          alerter.push(profitAlert({ signature, grossUsd: outcome.plan.quotedProfitUsd, feesUsd: 0, netUsd: outcome.plan.worstCaseProfitUsd }));
+          alerter.push(liquidationQuoteAlert({ signature, quotedUsd: outcome.plan.quotedProfitUsd, worstUsd: outcome.plan.worstCaseProfitUsd }));
         } finally {
           executorBusy.delete(obligation);
         }
       });
     };
 
-    const emitTrackerEvents = (events: TrackerEvent[]) => {
+    const emitTrackerEvents = (events: TrackerEvent[], prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>, preparedAt?: number) => {
       for (const event of events) {
         if (event.type === "spotted") {
           log?.({ type: "spotted", at: event.at, candidate: event.candidate });
           console.log(`${color.bold(color.red("⚡ DUE"))} ${printCandidateLine(event.candidate, "")}`);
-          executeDue(event.candidate.obligation);
+          executeDue(event.candidate.obligation, prepared ? {
+            rail: "hot", prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
+          } : {});
         } else if (event.type === "promoted") {
           log?.({ type: "promoted", at: event.at, candidate: event.candidate, fromHealth: event.fromHealth });
           console.log(`${color.bold(color.red("⚡ PROMOTED→DUE"))} ${printCandidateLine(event.candidate, color.yellow(`(was ${event.fromHealth.toFixed(4)})`))}`);
-          executeDue(event.candidate.obligation);
+          executeDue(event.candidate.obligation, prepared ? {
+            rail: "hot", prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
+          } : {});
         } else if (event.type === "watching") {
           // Near-miss entries below the watch band — no console chatter (the cycle
           // panel's NEAR MISS list + Telegram digest are the visibility for this tier).
           log?.({ type: "watching", at: event.at, candidate: event.candidate });
         } else if (event.type === "taken") {
           log?.({ type: "taken", at: event.at, obligation: event.obligation, firstSpottedAt: event.firstSpottedAt, satSeconds: event.satSeconds, wasDue: event.wasDue, ...(event.dueSince ? { dueSince: event.dueSince } : {}) });
-          // Only surface LIQUIDATIONS: a tracked candidate that went DUE and was taken
-          // by another liquidator. Healed/managed band exits stay in the JSONL only.
+          // Watchlist disappearance is a state transition, not proof of liquidation.
           if (event.wasDue) {
-            markRaceLost(event.obligation, event.debtUsd ?? 0);
             const debt = `${(event.debtUsd ?? 0).toFixed(2)} ${event.debtSymbol ?? "?"}`;
             console.log(
-              `${color.bold(color.red("⚡ LIQUIDATED"))} ${color.red(event.obligation)}` +
-              color.dim(`  last health ${(event.lastHealth ?? 0).toFixed(4)}, debt ${debt}, DUE ${event.satSeconds}s — taken by another liquidator`),
+              `${color.bold(color.yellow("⚡ LEFT WATCHLIST"))} ${color.red(event.obligation)}` +
+              color.dim(`  last health ${(event.lastHealth ?? 0).toFixed(4)}, debt ${debt}, DUE ${event.satSeconds}s — liquidation unverified`),
             );
           }
         } else {
@@ -1144,7 +1162,7 @@ program
         const hotAddresses = tracker.hotObligations();
         if (!hotAddresses.length) return;
         const updates = await refreshTrackedObligations({
-          rpc: rpcClient(options.rpc),
+          rpc: scanRpc,
           preloaded,
           pubkeys: hotAddresses.map((value) => address(value)),
         });
@@ -1154,15 +1172,15 @@ program
           if (candidate.healthFactor < 1.05) {
             boardUpdate(candidate.obligation, {
               health: candidate.healthFactor,
-              debtSymbol: candidate.largestDebt.symbol,
-              debtUsd: candidate.largestDebt.amountUsd,
+              debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+              debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
               prizeUsd: candidate.estimatedProfitUsd ?? 0,
               ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
             });
           }
         }
         const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString());
-        if (events.length) emitTrackerEvents(events);
+        if (events.length) emitTrackerEvents(events, updates, Date.now());
       } finally {
         hotTickRunning = false;
       }
@@ -1206,8 +1224,12 @@ program
     const runOnce = async (cycle: number) => {
       executorStats.cycles = cycle;
       if (!options.json) console.log(color.dim(`\n[${localTimestamp(new Date().toISOString())}] cycle #${cycle} scanning${surgeActive ? color.red(" [SURGE MODE]") : ""}...`));
+      if (!preloaded || Date.now() - preloaded.loadedAt >= 30_000) {
+        preloaded = await preloadMarket(scanRpc, options.market);
+        if (options.execute) executeMarket = preloaded.market;
+      }
       const result = await scanOnce({
-        rpc: rpcClient(options.rpc),
+        rpc: scanRpc,
         marketAddress: options.market,
         options: scanConfig,
         preloaded,
@@ -1218,16 +1240,16 @@ program
       for (const candidate of result.nearMiss) {
         boardUpdate(candidate.obligation, {
           health: candidate.healthFactor,
-          debtSymbol: candidate.largestDebt.symbol,
-          debtUsd: candidate.largestDebt.amountUsd,
+          debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+          debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
           prizeUsd: candidate.estimatedProfitUsd ?? 0,
         });
       }
       for (const candidate of result.liquidatable) {
         boardUpdate(candidate.obligation, {
           health: candidate.healthFactor,
-          debtSymbol: candidate.largestDebt.symbol,
-          debtUsd: candidate.largestDebt.amountUsd,
+          debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+          debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
           prizeUsd: candidate.estimatedProfitUsd ?? 0,
           status: "UNHEALTHY",
         });
@@ -1251,7 +1273,7 @@ program
         mintBySymbol.set("WSOL", "So11111111111111111111111111111111111111112");
         const pairs = new Set<string>();
         for (const candidate of [...result.liquidatable, ...result.nearMiss]) {
-          const debtMint = mintBySymbol.get(candidate.largestDebt.symbol);
+          const debtMint = mintBySymbol.get((candidate.repayDebt ?? candidate.largestDebt).symbol);
           if (!debtMint) continue;
           for (const symbol of candidate.collateralSymbols) {
             const collMint = mintBySymbol.get(symbol);
@@ -1326,14 +1348,14 @@ program
           const dueCount = rows.filter((r) => r.status === "UNHEALTHY" || r.status === "EXECUTOR").length;
           console.log(
             color.bold(color.cyan("▤ WATCHBOARD")) +
-            color.dim(`  ${watchboard.size} live · WS+hot+scan merged · last 15m`) +
+            color.dim(`  ${watchboard.size} live · EST.$ after protocol/flash fees, before swap/network costs`) +
             (dueCount ? color.bold(color.red(`  ⚡ ${dueCount} IN DUE TIER`) as string) : ""),
           );
           // Column header — built with the SAME pads as the rows below so every
           // column left-aligns exactly with its data cells.
           console.log(color.dim(
             "  " + "STATUS".padEnd(11) + "OBLIGATION".padEnd(46) + "HEALTH".padEnd(8)
-              + "DEBT".padEnd(15) + "PRIZE".padEnd(7) + "HELD",
+              + "DEBT".padEnd(15) + "EST.$".padEnd(7) + "HELD",
           ));
           for (const row of rows) {
             const statusPlain = {
@@ -1387,7 +1409,7 @@ program
     }
     console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] watching every ${intervalMs / 1000}s (hot ${hotIntervalMs / 1000}s, band ${hotBand}) — Ctrl+C to stop`));
     if (alerter.enabled) {
-      alerter.push(startupAlert({ cyclesPerHour: Math.round(3_600_000 / intervalMs), hotIntervalSec: hotIntervalMs / 1000, broadcast: options.broadcast, wsLive: options.watch && !options.json }));
+      alerter.push(startupAlert({ cyclesPerHour: Math.round(3_600_000 / intervalMs), hotIntervalSec: hotIntervalMs / 1000, broadcast: options.broadcast, wsLive: options.watch }));
       console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] telegram alerts enabled (chat ${process.env.TELEGRAM_CHAT_ID})`));
     }
     // Periodic Telegram heartbeat — the eval surface for "is the system alive and
@@ -1397,7 +1419,7 @@ program
       setInterval(() => {
         void (async () => {
           const wallet = await loadWalletSigner({ privateKey: privateKeyFromEnv(), keypairPath: undefined });
-          const walletSol = await rpcClient(options.rpc)
+          const walletSol = await scanRpc
             .getBalance(wallet.address)
             .send()
             .then((r) => Number(r.value) / 1e9)
@@ -1522,7 +1544,7 @@ program
     let activeWsEndpoint = "";
     let wsHandle: LiquidationWsHandle | undefined;
     let wsReadyPromise: Promise<void> | null = null;
-    if (options.watch && !options.json) {
+    if (options.watch) {
       const wsLogged = new Map<string, number>();
       // The raw subscription promise (handle intact) — the first-cycle gate and
       // the wsHandle assignment both consume it.
@@ -1551,26 +1573,28 @@ program
            }
           // Still < 1.0: if a fast-retry is armed (sim said healthy but WS disagrees),
           // every further slice re-triggers the 5s race until the window closes.
-          if (executorStillDue.has(obligation)) executeDue(obligation, { rail: "ws" });
+          executeDue(obligation, { rail: "ws", streamSnapshot: slice });
           const lastLogged = wsLogged.get(obligation) ?? 0;
           if (Date.now() - lastLogged < 30_000) return;
           wsLogged.set(obligation, Date.now());
-          console.log(`${color.bold(color.red("⚡ WS DUE"))} ${shortAddress(obligation)}  health ${slice.cachedHealth.toFixed(4)}`);
+          const wsEvent = { type: "ws-due", at: new Date(slice.receivedAt ?? Date.now()).toISOString(), obligation, health: slice.cachedHealth, slot: slice.slot?.toString() };
+          log?.(wsEvent as never);
+          if (options.json) console.log(safeJsonStringify(wsEvent));
+          else console.log(`${color.bold(color.red("⚡ WS DUE"))} ${shortAddress(obligation)}  health ${slice.cachedHealth.toFixed(4)}`);
           // The WS slice's stored-sf ratio is the health at the moment the program last
           // wrote the account — a low-latency TRIGGER, not proof. Prices move between that
           // write and our fire: the race rail runs the executor with SIM as the single
           // arbiter (the tx's own RefreshObligation re-checks on fresh prices).
-          executeDue(obligation, { rail: "ws" });
         },
         onReady: (endpoint: string) => {
           wsRailState = "live";
           activeWsEndpoint = endpoint;
           const host = safeWebsocketHost(endpoint);
-          console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live${host ? ` (${host})` : ""}`));
+          if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live${host ? ` (${host})` : ""}`));
         },
         onError: (error: unknown) => {
           if (wsRailState === "live") wsRailState = "down";
-          console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
+          if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
         },
       });
       wsSubscription

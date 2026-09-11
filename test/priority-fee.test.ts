@@ -40,3 +40,8 @@ test("auto mode tiny prizes still bid the minimum (beat base-fee spam)", () => {
   assert.ok(r.tipUsd > 0);
   assert.ok(r.microlamportsPerCu >= 1);
 });
+test("auto bid scales to the requested compute limit", () => {
+  const normal = choosePriorityFee({priorityMode:"auto",prizeUsd:100});
+  const full = choosePriorityFee({priorityMode:"auto",prizeUsd:100,computeUnitLimit:1_400_000});
+  assert.ok(Math.abs(full.microlamportsPerCu * 4 - normal.microlamportsPerCu) <= 4);
+});

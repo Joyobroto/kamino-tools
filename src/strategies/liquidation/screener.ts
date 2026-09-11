@@ -50,7 +50,7 @@ export async function withBackoff<T>(operation: () => Promise<T>, label: string)
     try {
       return await operation();
     } catch (error) {
-      if (!isRateLimitError(error) || delay > MAX_BACKOFF_MS) {
+      if (!isRateLimitError(error) || attempt >= 6) {
         throw error;
       }
       console.warn(`${label} hit rate limit (attempt ${attempt}); retrying in ${delay}ms`);
@@ -156,7 +156,7 @@ export async function hydrateShortlist(params: {
       const batch = batches[nextBatch];
       nextBatch += 1;
       await runBatch(batch!);
-      await sleep(HYDRATE_DELAY_MS);
+      if (nextBatch < batches.length) await sleep(HYDRATE_DELAY_MS);
     }
   });
   await Promise.all(workers);
@@ -362,34 +362,68 @@ export async function scanOnce(params: ScreenerDeps & {
  * The raw hydrated KaminoObligation objects (keyed by address) come back alongside
  * the candidates so the executor can skip its duplicate hydrate RPC.
  */
+export interface StreamAccountSnapshot {
+  pubkey: Address;
+  accountData?: Buffer;
+  slot?: bigint;
+  receivedAt?: number;
+}
+
+const slotInstants = new WeakMap<object, Map<bigint, Promise<LedgerInstant>>>();
+/** Share block-time resolution for every account delivered in the same slot. */
+export function ledgerInstantAtSlot(rpc: Rpc<SolanaRpcApi>, slot: bigint): Promise<LedgerInstant> {
+  let cache = slotInstants.get(rpc);
+  if (!cache) { cache = new Map(); slotInstants.set(rpc, cache); }
+  const existing = cache.get(slot);
+  if (existing) return existing;
+  const promise = rpc.getBlockTime(slot).send().then((blockTime) => {
+    if (blockTime === null) throw new Error("Notification slot block time unavailable");
+    return { slot, blockTime };
+  }).catch((error) => { cache!.delete(slot); throw error; });
+  cache.set(slot, promise);
+  if (cache.size > 128) cache.delete(cache.keys().next().value!);
+  return promise;
+}
+
+export function streamSnapshotFresh(snapshot: StreamAccountSnapshot | undefined, pubkey: Address, now = Date.now()): boolean {
+  return Boolean(snapshot?.pubkey === pubkey && snapshot.accountData && snapshot.slot !== undefined
+    && snapshot.receivedAt !== undefined && now >= snapshot.receivedAt && now - snapshot.receivedAt < 1500);
+}
+
 export async function refreshTrackedObligations(params: {
   rpc: Rpc<SolanaRpcApi>;
   preloaded: PreloadedMarket;
   pubkeys: Address[];
-}): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation> }> {
+  streamSnapshot?: StreamAccountSnapshot;
+}): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation>; market: KaminoMarket }> {
   const { rpc, preloaded, pubkeys } = params;
-  if (!pubkeys.length) return { candidates: [], obligations: new Map() };
-  const market = freshPreloaded(preloaded) ? preloaded.market : (await preloadMarket(rpc, preloaded.marketAddress)).market;
-  const ledgerInstant = await fetchLedgerInstant(rpc, "hot ledger instant");
-  const hydrated = await hydrateShortlist({
-    rpc,
-    market,
-    ledgerInstant,
-    pubkeys,
-    onProgress: () => {},
-  });
+  if (!pubkeys.length) return { candidates: [], obligations: new Map(), market: preloaded.market };
+  const loaded = freshPreloaded(preloaded) ? preloaded : await preloadMarket(rpc, preloaded.marketAddress);
+  const market = loaded.market;
+  let hydrated: KaminoObligation[] | undefined;
+  const snapshot = params.streamSnapshot;
+  if (pubkeys.length === 1 && streamSnapshotFresh(snapshot, pubkeys[0]!)) {
+    try {
+      const ledgerInstant = await ledgerInstantAtSlot(rpc, snapshot!.slot!);
+      // A slow block-time call must not extend the account snapshot's lifetime.
+      if (streamSnapshotFresh(snapshot, pubkeys[0]!)) {
+        const obligation = KaminoObligation.fromAccountData(
+          new Map([[market.getAddress(), market]]), pubkeys[0]!, snapshot!.accountData!, ledgerInstant,
+        );
+        if (obligation) hydrated = [obligation];
+      }
+    } catch { /* unavailable slot time or incompatible data: use fresh RPC account */ }
+  }
+  if (!hydrated) {
+    const ledgerInstant = await fetchLedgerInstant(rpc, "hot ledger instant");
+    hydrated = await hydrateShortlist({ rpc, market, ledgerInstant, pubkeys, onProgress: () => {} });
+  }
   const vanilla = hydrated.filter((obligation) => obligation.obligationTag === 0);
   const obligations = new Map(vanilla.map((obligation) => [obligation.obligationAddress.toString(), obligation]));
-  const candidates = vanilla
-    .map((obligation) => {
-      try {
-        return obligationToCandidate(obligation, preloaded.marketReserves);
-      } catch {
-        return null;
-      }
-    })
-    .filter((candidate): candidate is LiquidatableCandidate => candidate !== null);
-  return { candidates, obligations };
+  const candidates = vanilla.map((obligation) => {
+    try { return obligationToCandidate(obligation, loaded.marketReserves); } catch { return null; }
+  }).filter((candidate): candidate is LiquidatableCandidate => candidate !== null);
+  return { candidates, obligations, market };
 }
 
 export function freshPreloaded(preloaded: PreloadedMarket | undefined): boolean {

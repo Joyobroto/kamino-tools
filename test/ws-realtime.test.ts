@@ -40,3 +40,10 @@ test("adlTargetLtvPct is forwarded from the slice", () => {
 test("parseFullObligationAccount rejects wrong-length payloads", () => {
   assert.throws(() => parseFullObligationAccount(Buffer.alloc(100).toString("base64"), TEST_ADDR), /Unexpected obligation account length/);
 });
+test("WS parsing preserves the full account payload and notification slot", () => {
+  const buffer=makeObligationBuffer({debtSf:100n,unhealthySf:99n});
+  const slice=parseFullObligationAccount(buffer.toString("base64"),TEST_ADDR,123n);
+  assert.deepEqual(slice.accountData,buffer);
+  assert.equal(slice.slot,123n);
+  assert.ok(slice.receivedAt!<=Date.now());
+});
