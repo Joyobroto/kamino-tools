@@ -583,6 +583,18 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   ];
   let kswapPromise: Promise<SwapPlan | null> | undefined;
   const kswapPlan = () => kswapPromise ??= withDeadline(buildKswapPlan(), 2_000);
+  // Hedge the slow/no-route case instead of waiting for all HTTP routes to
+  // time out before trying KSwap. The 250ms delay gives a warm local/Jupiter
+  // route first refusal, while shaving the long tail when those routes are
+  // unavailable. If a route already won, the hedge resolves without issuing
+  // another RPC request.
+  let routeSettled = false;
+  const kswapHedge = new Promise<SwapPlan | null>((resolve) => {
+    setTimeout(() => {
+      if (routeSettled) { resolve(null); return; }
+      void kswapPlan().then(resolve).catch(() => resolve(null));
+    }, 250);
+  });
   // Fire-path trim: ATA existence (OUR hot ATAs — created once by liq-setup)
   // is cached process-lifetime once seen; a known-existing ATA needs NO
   // getAccountInfo round-trip. Only genuinely unknown states hit the RPC.
@@ -604,7 +616,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     });
   };
   const [firstPlan, debtAtaState, collAtaState, cTokenAtaState, farmAccounts] = await Promise.all([
-    firstUsable(routePromises),
+    firstUsable([...routePromises, kswapHedge]).finally(() => { routeSettled = true; }),
     fetchAtaWithCache(debtAta, repayReserve.getLiquidityMint(), repayReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(collAta, withdrawReserve.getLiquidityMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(cTokenAta, withdrawReserve.getCTokenMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
