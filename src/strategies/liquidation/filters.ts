@@ -12,6 +12,7 @@ export interface MarketReserveInfo {
   flashLoanFeeRate: number;
   liquidationBonus: number;
   liquidationBonusMax: number;
+  badDebtLiquidationBonus?: number;
   availableUsd: number;
   priceValid: boolean;
   /** The liquidation threshold (% of value) — drives the program's pair-priority. */
@@ -41,6 +42,30 @@ export function wsolAwareSymbol(reserveAddress: string, marketReserves: MarketRe
 export function healthFactorFromSf(debtSf: bigint, unhealthySf: bigint): number {
   if (debtSf <= 0n) return Number.POSITIVE_INFINITY;
   return Number(unhealthySf) / Number(debtSf);
+}
+
+/** Kamino's reserve bonus grows with the depth of the LTV breach, then is
+ * capped by max bonus and solvency. For an ordinary position the health factor
+ * lets us approximate current LTV as liquidation threshold / health. */
+export function dynamicLiquidationBonus(input: {
+  healthFactor: number;
+  liquidationThresholdPct: number;
+  minBonus: number;
+  maxBonus: number;
+  badDebtBonus?: number;
+}): number {
+  const thresholdBps = Math.max(0, Math.min(10_000, input.liquidationThresholdPct * 100));
+  const health = Number.isFinite(input.healthFactor) && input.healthFactor > 0 ? input.healthFactor : 0;
+  const currentLtvBps = Math.min(10_000, health > 0 ? thresholdBps / health : 10_000);
+  const minBps = Math.max(0, input.minBonus * 10_000);
+  const maxBps = Math.max(minBps, input.maxBonus * 10_000);
+  const breachBonusBps = Math.max(minBps, currentLtvBps - thresholdBps);
+  const solvencyCapBps = Math.max(0, 10_000 - currentLtvBps);
+  let bonusBps = Math.min(breachBonusBps, maxBps, solvencyCapBps);
+  if (currentLtvBps >= 9_900 && input.badDebtBonus !== undefined) {
+    bonusBps = Math.min(input.badDebtBonus * 10_000, solvencyCapBps);
+  }
+  return Math.max(0, bonusBps) / 10_000;
 }
 
 /** Estimated margin after protocol share and flash fee, BEFORE swap/network costs.
@@ -109,7 +134,15 @@ export function obligationToCandidate(
     .map((deposit) => ({ deposit, info: marketReserves.get(deposit.reserveAddress) }))
     .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info && entry.info.availableUsd > 0 && (entry.info.loanToValuePct ?? 1) > 0))
     .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
-  const bonus = seizedCollateral?.info.liquidationBonus ?? 0;
+  const bonus = seizedCollateral
+    ? dynamicLiquidationBonus({
+      healthFactor: healthFactor(obligation),
+      liquidationThresholdPct: seizedCollateral.info.liquidationThresholdPct,
+      minBonus: seizedCollateral.info.liquidationBonus,
+      maxBonus: seizedCollateral.info.liquidationBonusMax,
+      ...(seizedCollateral.info.badDebtLiquidationBonus !== undefined ? { badDebtBonus: seizedCollateral.info.badDebtLiquidationBonus } : {}),
+    })
+    : 0;
   const estimatedProfitUsd = estimateLiquidationProfit({
     debtUsd: repayDebt.amountUsd,
     liquidationBonus: bonus,
@@ -216,8 +249,15 @@ export function filterLiquidatable(
       .filter((entry): entry is { deposit: (typeof entry)["deposit"]; info: NonNullable<(typeof entry)["info"]> } => Boolean(entry.info && entry.info.availableUsd > 0 && (entry.info.loanToValuePct ?? 1) > 0))
       .sort((a, b) => a.info.liquidationThresholdPct - b.info.liquidationThresholdPct)[0];
     const bonus = bonusByReserve?.get(seizedCollateral?.deposit.reserveAddress ?? candidate.largestDebt.reserve)
-      ?? seizedCollateral?.info.liquidationBonus
-      ?? debtReserve.liquidationBonus;
+      ?? (seizedCollateral
+        ? dynamicLiquidationBonus({
+          healthFactor: health,
+          liquidationThresholdPct: seizedCollateral.info.liquidationThresholdPct,
+          minBonus: seizedCollateral.info.liquidationBonus,
+          maxBonus: seizedCollateral.info.liquidationBonusMax,
+          ...(seizedCollateral.info.badDebtLiquidationBonus !== undefined ? { badDebtBonus: seizedCollateral.info.badDebtLiquidationBonus } : {}),
+        })
+        : debtReserve.liquidationBonus);
     const marketMeta = marketReserves.get("__market__");
     const closeFactorPct = marketMeta?.__marketCloseFactorPct ?? 100;
     const estProfit = estimateLiquidationProfit({
@@ -255,7 +295,7 @@ export function buildMarketReserveMap(
       getOracleMarketPrice(): { div(value: number | string): { toFixed(digits?: number): string } };
       hasValidOraclePrice(): boolean;
       getFlashLoanFee(): { toString(): string };
-      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number; liquidationThresholdPct: number; protocolLiquidationFeePct?: number; borrowFactorPct?: { toString(): string }; loanToValuePct?: number } };
+      state: { config: { fees: { flashLoanFeeSf: { toString(): string } }; minLiquidationBonusBps: number; maxLiquidationBonusBps: number; badDebtLiquidationBonusBps?: number; liquidationThresholdPct: number; protocolLiquidationFeePct?: number; borrowFactorPct?: { toString(): string }; loanToValuePct?: number } };
     }>;
   },
   marketCloseFactorPct?: number,
@@ -275,10 +315,11 @@ export function buildMarketReserveMap(
       liquidityMint: reserve.getLiquidityMint().toString(),
       flashLoanEnabled: reserve.state.config.fees.flashLoanFeeSf.toString() !== U64_MAX,
       flashLoanFeeRate,
-      // Conservative: borderline-healthy positions liquidate at the MINIMUM bonus
-      // (empirically verified 2026-09-03: tx 3LUqFmbW… executed at min 100bps, not max 1000bps)
+      // Keep the reserve's dynamic bonus bounds; the live obligation health
+      // selects the current value in dynamicLiquidationBonus().
       liquidationBonus: reserve.state.config.minLiquidationBonusBps / 10_000,
       liquidationBonusMax: reserve.state.config.maxLiquidationBonusBps / 10_000,
+      ...(reserve.state.config.badDebtLiquidationBonusBps !== undefined ? { badDebtLiquidationBonus: reserve.state.config.badDebtLiquidationBonusBps / 10_000 } : {}),
       availableUsd: liquidityAvailable * oraclePrice,
       priceValid: reserve.hasValidOraclePrice(),
       liquidationThresholdPct: reserve.state.config.liquidationThresholdPct,

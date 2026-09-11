@@ -6,6 +6,7 @@ import { parseObligationSlice } from "../src/strategies/liquidation/screener.js"
 import { isRateLimitError } from "../src/strategies/liquidation/screener.js";
 import {
   buildMarketReserveMap,
+  dynamicLiquidationBonus,
   estimateLiquidationProfit,
   filterLiquidatable,
   healthFactor,
@@ -114,6 +115,28 @@ test("sfToUsd divides by 1e18", () => {
 
 test("estimateLiquidationProfit uses reserve bonus when available", () => {
   assert.equal(estimateLiquidationProfit({ debtUsd: 1000, liquidationBonus: 0.05 }), 50);
+});
+
+test("dynamicLiquidationBonus scales between min and max with LTV breach", () => {
+  // threshold 80%, health .95 => current LTV ~=84.21%, so breach bonus ~=4.21%.
+  const bonus = dynamicLiquidationBonus({
+    healthFactor: 0.95,
+    liquidationThresholdPct: 80,
+    minBonus: 0.02,
+    maxBonus: 0.08,
+  });
+  assert.ok(Math.abs(bonus - 0.0421052632) < 1e-8);
+});
+
+test("dynamicLiquidationBonus applies bad-debt and solvency caps", () => {
+  const bonus = dynamicLiquidationBonus({
+    healthFactor: 80 / 99,
+    liquidationThresholdPct: 80,
+    minBonus: 0.05,
+    maxBonus: 0.1,
+    badDebtBonus: 0.01,
+  });
+  assert.equal(bonus, 0.01);
 });
 
 test("estimateLiquidationProfit preserves a configured zero bonus", () => {

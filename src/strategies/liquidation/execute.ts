@@ -66,7 +66,7 @@ import { PublicKey } from "@solana/web3.js";
 import BNImport from "bn.js";
 import { fetchKswapRoutes } from "./kswap.js";
 import { safeJsonStringify } from "../../ui.js";
-import { buildMarketReserveMap, healthFactor, obligationToCandidate } from "./filters.js";
+import { buildMarketReserveMap, dynamicLiquidationBonus, healthFactor, obligationToCandidate } from "./filters.js";
 import { hydrateShortlist, withBackoff } from "./screener.js";
 import { applySlippage, fetchRawQuote, fetchSwapInstructions } from "../arb/lst-arb.js";
 
@@ -428,10 +428,19 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //    BONUS comes from the WITHDRAW (collateral) reserve's config, not the debt
   //    side (docs: the bonus is paid in extra collateral, so the collateral
   //    reserve governs it; e.g. tBTC collateral = 5% min bonus vs 1% on majors).
-  //    Conservative floor: minLiquidationBonusBps (just-past-threshold positions
-  //    liquidate at the min — verified on-chain 2026-09-03).
+  //    Model Kamino's dynamic bonus from the live health factor. The program
+  //    applies min/max, solvency, and bad-debt caps on-chain; the estimate is
+  //    still only a quote input and the transaction is simulation-gated.
   const collPriceBase = usdPerBaseUnit(withdrawReserve);
-  const bonus = Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000;
+  const bonus = dynamicLiquidationBonus({
+    healthFactor: health,
+    liquidationThresholdPct: withdrawReserve.state.config.liquidationThresholdPct,
+    minBonus: Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000,
+    maxBonus: Number(withdrawReserve.state.config.maxLiquidationBonusBps) / 10_000,
+    ...(withdrawReserve.state.config.badDebtLiquidationBonusBps !== undefined
+      ? { badDebtBonus: Number(withdrawReserve.state.config.badDebtLiquidationBonusBps) / 10_000 }
+      : {}),
+  });
   const protocolFeePct = Number(withdrawReserve.state.config.protocolLiquidationFeePct ?? 0);
   const estCollateralBaseUnits = estimateCollateralForRepay({
     repayAmountBaseUnits,
