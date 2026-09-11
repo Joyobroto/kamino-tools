@@ -1169,15 +1169,14 @@ program
         // Watchboard ingest: hot-tick refreshes carry the freshest per-position
         // health of the tracked cohort — update rows without changing status.
         for (const candidate of updates.candidates) {
-          if (candidate.healthFactor < 1.05) {
-            boardUpdate(candidate.obligation, {
-              health: candidate.healthFactor,
-              debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
-              debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
-              prizeUsd: candidate.estimatedProfitUsd ?? 0,
-              ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
-            });
-          }
+          boardUpdate(candidate.obligation, {
+            health: candidate.healthFactor,
+            healthSource: "hot",
+            debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+            debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
+            prizeUsd: candidate.estimatedProfitUsd ?? 0,
+            ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
+          });
         }
         const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString());
         if (events.length) emitTrackerEvents(events, updates, Date.now());
@@ -1240,6 +1239,7 @@ program
       for (const candidate of result.nearMiss) {
         boardUpdate(candidate.obligation, {
           health: candidate.healthFactor,
+          healthSource: "scan",
           debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
           debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
           prizeUsd: candidate.estimatedProfitUsd ?? 0,
@@ -1248,6 +1248,7 @@ program
       for (const candidate of result.liquidatable) {
         boardUpdate(candidate.obligation, {
           health: candidate.healthFactor,
+          healthSource: "scan",
           debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
           debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
           prizeUsd: candidate.estimatedProfitUsd ?? 0,
@@ -1353,9 +1354,9 @@ program
           );
           // Column header — built with the SAME pads as the rows below so every
           // column left-aligns exactly with its data cells.
-          console.log(color.dim(
-            "  " + "STATUS".padEnd(11) + "OBLIGATION".padEnd(46) + "HEALTH".padEnd(8)
-              + "DEBT".padEnd(15) + "EST.$".padEnd(7) + "HELD",
+            console.log(color.dim(
+            "  " + "STATUS".padEnd(11) + "OBLIGATION".padEnd(46) + "HEALTH".padEnd(11)
+              + "AGE".padEnd(7) + "DEBT".padEnd(15) + "EST.$".padEnd(7) + "HELD",
           ));
           for (const row of rows) {
             const statusPlain = {
@@ -1380,13 +1381,16 @@ program
             // tracked row at panel-print time (data-age would always read 0s).
             const statusForSec = Math.max(0, Math.round((Date.now() - row.statusSince) / 1000));
             const forText = statusForSec >= 3600 ? `${(statusForSec / 3600).toFixed(1)}h` : statusForSec >= 60 ? `${Math.round(statusForSec / 60)}m` : `${statusForSec}s`;
-            const healthText = Number.isFinite(row.health) ? row.health.toFixed(4) : "     ?";
+            const healthText = Number.isFinite(row.health) ? row.health.toFixed(6) : "       ?";
             const healthCell = Number.isFinite(row.health)
               ? (row.health < 1 ? color.bold(color.red(healthText))
                 : row.health < 1.01 ? color.white(healthText)
                 : color.dim(healthText))
               : color.dim(healthText);
-            const healthPad = (Number.isFinite(row.health) ? row.health.toFixed(4) : "     ?").padEnd(8);
+            const healthPad = (Number.isFinite(row.health) ? row.health.toFixed(6) : "       ?").padEnd(11);
+            const healthAgeSec = row.healthAt > 0 ? Math.max(0, Math.round((Date.now() - row.healthAt) / 1000)) : -1;
+            const healthAgeText = healthAgeSec < 0 ? "?" : healthAgeSec >= 3600 ? `${(healthAgeSec / 3600).toFixed(1)}h` : healthAgeSec >= 60 ? `${Math.round(healthAgeSec / 60)}m` : `${healthAgeSec}s`;
+            const healthAgeCell = color.dim(healthAgeText.padEnd(7));
             const debtText = row.debtUsd > 0
               ? `${row.debtUsd >= 10000 ? `${(row.debtUsd / 1000).toFixed(1)}k` : row.debtUsd.toFixed(0)} ${row.debtSymbol}`
               : "—";
@@ -1396,7 +1400,7 @@ program
             const forCell = color.dim(forText);
             console.log(
               `  ${statusCell}${" ".repeat(Math.max(1, 11 - statusPlain.length))}${color.cyan(row.obligation)}  ` +
-                `${healthCell}${" ".repeat(Math.max(1, healthPad.length - healthText.length + 2))}${debtCell}${prizeCell}${forCell}`,
+                `${healthCell}${" ".repeat(Math.max(1, healthPad.length - healthText.length + 2))}${healthAgeCell}${debtCell}${prizeCell}${forCell}`,
             );
           }
         }
@@ -1469,6 +1473,8 @@ program
     interface WatchboardRow {
       obligation: string;
       health: number;
+      healthAt: number;
+      healthSource: "scan" | "hot" | "ws" | "executor";
       lastSeen: number;
       debtSymbol: string;
       debtUsd: number;
@@ -1482,9 +1488,12 @@ program
     const boardUpdate = (obligation: string, patch: Partial<WatchboardRow> & { health?: number }): void => {
       const existing = watchboard.get(obligation);
       const status = patch.status ?? existing?.status ?? "WATCH";
+      const hasHealth = patch.health !== undefined;
       const row: WatchboardRow = {
         obligation,
         health: patch.health ?? existing?.health ?? Number.NaN,
+        healthAt: hasHealth ? (patch.healthAt ?? Date.now()) : (existing?.healthAt ?? 0),
+        healthSource: hasHealth ? (patch.healthSource ?? "scan") : (existing?.healthSource ?? "scan"),
         lastSeen: Date.now(),
         debtSymbol: patch.debtSymbol ?? existing?.debtSymbol ?? "?",
         debtUsd: patch.debtUsd ?? existing?.debtUsd ?? 0,
@@ -1557,8 +1566,8 @@ program
           // Feed every tracked-band slice to the board (WATCH ↔ UNHEALTHY
           // transitions), not just the <1.0 triggers.
           const health = slice.cachedHealth;
-          if (Number.isFinite(health) && health < 1.05) {
-            boardUpdate(obligation, { health, ...(health < 1 ? { status: "UNHEALTHY" } : {}) });
+          if (Number.isFinite(health) && (health < 1.05 || watchboard.has(obligation))) {
+            boardUpdate(obligation, { health, ...(slice.receivedAt !== undefined ? { healthAt: slice.receivedAt } : {}), healthSource: "ws", ...(health < 1 ? { status: "UNHEALTHY" } : {}) });
           }
            if (health >= 1) {
              // Healed back above 1.0 — disarm any armed fast-retry (position
@@ -1567,7 +1576,7 @@ program
              // mid-verdict-chain.
              if (executorStillDue.has(obligation) || (watchboard.get(obligation)?.status === "EXECUTOR" || watchboard.get(obligation)?.status === "UNHEALTHY")) {
                executorStillDue.delete(obligation);
-               boardUpdate(obligation, { status: "HEALED", health });
+               boardUpdate(obligation, { status: "HEALED", health, ...(slice.receivedAt !== undefined ? { healthAt: slice.receivedAt } : {}), healthSource: "ws" });
              }
              return;
            }
