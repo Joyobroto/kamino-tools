@@ -8,6 +8,7 @@ import {
   type KaminoReserve,
 } from "@kamino-finance/klend-sdk";
 import { SYSVAR_INSTRUCTIONS_ADDRESS } from "@solana/sysvars";
+import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { deriveAssociatedTokenAccount, fetchTokenAccount, createAtaInstruction } from "../../kamino.js";
 
 export const ALT_STATE_PATH = process.env.LIQ_ALT_STATE ?? "data/liq_alt.json";
@@ -60,7 +61,7 @@ export async function liquidationAltKeys(input: {
       await deriveAssociatedTokenAccount({
         mint: reserve.getCTokenMint(),
         owner: authority,
-        tokenProgram: reserve.getLiquidityTokenProgram(),
+        tokenProgram: TOKEN_PROGRAM_ADDRESS,
       }),
     );
   }
@@ -167,11 +168,13 @@ export async function buildLiquidationSetup(input: {
   if (!input.skipAta) {
     for (const reserve of reserves) {
       for (const mint of [reserve.getLiquidityMint(), reserve.getCTokenMint()]) {
+        // Kamino collateral mints use SPL Token even when liquidity is Token-2022.
+        const tokenProgram = mint === reserve.getCTokenMint() ? TOKEN_PROGRAM_ADDRESS : reserve.getLiquidityTokenProgram();
         const ata = address(
           await deriveAssociatedTokenAccount({
             mint,
             owner: signer.address,
-            tokenProgram: reserve.getLiquidityTokenProgram(),
+            tokenProgram,
           }),
         );
         const exists = await fetchTokenAccount(rpc, ata.toString());
@@ -180,7 +183,7 @@ export async function buildLiquidationSetup(input: {
             payer: signer,
             mint,
             owner: signer.address,
-            tokenProgram: reserve.getLiquidityTokenProgram(),
+            tokenProgram,
             ata,
           });
           current.push(ix);

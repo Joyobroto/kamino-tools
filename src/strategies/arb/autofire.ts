@@ -90,6 +90,9 @@ export interface LedgerEntry {
   quotedProfitUsd?: number;
   worstCaseProfitUsd?: number;
   lossUsdEstimate?: number;
+  /** Actual network fee, only when transaction metadata is available. */
+  feeLamports?: number;
+  transactionStatus?: "confirmed" | "failed" | "unknown";
   /** For "vetoed": how the veto was resolved — "lost-race" (another bot
    *  liquidated it on-chain) or "self-healed" (no liquidation ever landed). */
   outcome?: "lost-race" | "self-healed" | "no-liquidation-found" | "unknown";
@@ -172,4 +175,3 @@ export function logLedgerEntry(path: string, entry: LedgerEntry): void {
 export function clearStopFile(path: string): void {
   if (existsSync(path)) writeFileSync(path, "");
 }
-

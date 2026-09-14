@@ -1,11 +1,25 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { address, type Rpc, type SolanaRpcApi } from "@solana/kit";
-import { KaminoObligation, type LedgerInstant } from "@kamino-finance/klend-sdk";
+import { KaminoMarket, KaminoObligation, type LedgerInstant } from "@kamino-finance/klend-sdk";
 import { Decimal } from "decimal.js";
 import { hydrateShortlist, ledgerInstantAtSlot, refreshTrackedObligations, streamSnapshotFresh, streamLedgerInstant, type PreloadedMarket } from "../src/strategies/liquidation/screener.js";
 
 const key = address("11111111111111111111111111111111");
+
+test("hot checks replace 20-second-old market data and share the refresh", async (t) => {
+  let loads = 0;
+  const rpc = {} as Rpc<SolanaRpcApi>;
+  const oldMarket = { getAddress: () => key } as unknown as KaminoMarket;
+  const market = { getAddress: () => key, getReserves: () => [], state: { liquidationMaxDebtCloseFactorPct: 10 } } as unknown as KaminoMarket;
+  t.mock.method(KaminoMarket, "load", async () => { loads++; return market; });
+  t.mock.method(KaminoObligation, "fromAccountData", () => ({ obligationTag: 0, obligationAddress: key }) as KaminoObligation);
+  const params = { rpc, preloaded: { market: oldMarket, marketAddress: key, marketReserves: new Map(), loadedAt: Date.now() - 20_000 },
+    pubkeys: [key], streamSnapshot: { pubkey: key, accountData: Buffer.alloc(3344), slot: 1n, receivedAt: Date.now() } };
+  const results = await Promise.all([refreshTrackedObligations(params), refreshTrackedObligations(params)]);
+  assert.equal(loads, 1);
+  assert.ok(results.every(result => result.market === market));
+});
 
 test("single-account hydration does not schedule the old 500ms trailing sleep", async (t) => {
   let slept = false;

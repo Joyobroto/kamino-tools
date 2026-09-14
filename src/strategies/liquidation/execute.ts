@@ -22,6 +22,7 @@ import { firstUsable, withDeadline } from "./pipeline.js";
  */
 
 import BN from "bn.js";
+import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { Decimal } from "decimal.js";
 import {
   KaminoObligation,
@@ -480,7 +481,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     await deriveAssociatedTokenAccount({
       mint: withdrawReserve.getCTokenMint(),
       owner: signer.address,
-      tokenProgram: withdrawReserve.getLiquidityTokenProgram(),
+      tokenProgram: TOKEN_PROGRAM_ADDRESS,
     }),
   );
 
@@ -667,7 +668,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         payer: signer,
         mint: withdrawReserve.getCTokenMint(),
         owner: signer.address,
-        tokenProgram: withdrawReserve.getLiquidityTokenProgram(),
+        tokenProgram: TOKEN_PROGRAM_ADDRESS,
         ata: cTokenAta,
       }),
     );
@@ -827,10 +828,12 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // mode that burned the 2026-09-08 ledger: KSwap multi-hop routes stack more
   // accounts than the ALTs cover). Measure the PRIMARY plan first; if it busts,
   // try every already-fetched fallback (jupiter → kswap) before giving up.
+  const packetSizes: string[] = [];
   const wireSizeOf = async (plan: SwapPlan): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; tx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null; tooLarge: boolean }> => {
     const built = await buildSwapChain(plan);
     const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]);
     const wire = tx ? Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length : Number.POSITIVE_INFINITY;
+    packetSizes.push(`${plan.source ?? "unknown"}=${wire} bytes`);
     return { build: built, tx, tooLarge: wire > 1232 };
   };
 
@@ -859,7 +862,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       if (!signedTx) {
         // Every backend busts the packet (account-heavy multi-hop market) —
         // fail the fire here rather than sending an RPC-rejected tx.
-        return { stage: "assemble", passed: false, reason: `tx exceeds 1232-byte packet on every swap backend (${[activeSwapPlan, ...fallbackPlans].map((p) => p.source).join(", ")})`, timings };
+        done();
+        return { stage: "assemble", passed: false, reason: `tx exceeds 1232-byte packet with resolved LUTs (${packetSizes.join(", ")})`, timings };
       }
     } else {
       signedTx = primary.tx;

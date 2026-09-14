@@ -124,13 +124,33 @@ export async function sendAndConfirm(
   // permanently (the "bot froze overnight" failure mode). The blockhash
   // lifetime is ≤60s; 90s covers worst-case confirmation latency.
   const SEND_CONFIRM_TIMEOUT_MS = 90_000;
-  await Promise.race([
-    sender(transaction, { commitment: "confirmed", skipPreflight: true }),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`sendAndConfirm timeout after ${SEND_CONFIRM_TIMEOUT_MS}ms — tx likely expired (blockhash) or lost the blockspace race`)), SEND_CONFIRM_TIMEOUT_MS),
-    ),
-  ]);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      sender(transaction, { commitment: "confirmed", skipPreflight: true }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`sendAndConfirm timeout after ${SEND_CONFIRM_TIMEOUT_MS}ms (sig ${signature}) — confirmation unknown`)), SEND_CONFIRM_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
   return signature;
+}
+
+/** Missing metadata is unknown, never proof that a transaction paid zero fees. */
+export async function transactionReceipt(rpc: Rpc<SolanaRpcApi>, signature: string): Promise<{
+  transactionStatus: "confirmed" | "failed" | "unknown"; feeLamports?: number;
+}> {
+  try {
+    const tx = await rpc.getTransaction(signature as never, {
+      encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0,
+    }).send({ abortSignal: AbortSignal.timeout(3_000) });
+    if (!tx?.meta) return { transactionStatus: "unknown" };
+    return { transactionStatus: tx.meta.err ? "failed" : "confirmed", feeLamports: Number(tx.meta.fee) };
+  } catch {
+    return { transactionStatus: "unknown" };
+  }
 }
 
 /**

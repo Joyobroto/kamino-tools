@@ -171,6 +171,9 @@ export interface PreloadedMarket {
 }
 
 const MARKET_CACHE_TTL_MS = 60_000;
+// Hot health checks must not reuse a minute-old oracle/reserve snapshot.
+// Keep the broad scan cache, but refresh tracked positions at the hot cadence.
+const HOT_MARKET_CACHE_TTL_MS = 10_000;
 
 // Single-flight: every caller (scan cycle, hot tick, executeDue, executeLiquidationOnce)
 // hits preloadMarket whenever the 60s cache is stale; without dedup those concurrent loads
@@ -248,10 +251,10 @@ function preloadKey(rpc: Rpc<SolanaRpcApi>, marketAddress: string): string {
   return `${endpoint}|${marketAddress}`;
 }
 
-export async function preloadMarket(rpc: Rpc<SolanaRpcApi>, marketAddress: string): Promise<PreloadedMarket> {
+export async function preloadMarket(rpc: Rpc<SolanaRpcApi>, marketAddress: string, maxAgeMs = MARKET_CACHE_TTL_MS): Promise<PreloadedMarket> {
   const key = preloadKey(rpc, marketAddress);
   const fresh = preloadCache.get(key);
-  if (fresh && Date.now() - fresh.loadedAt < MARKET_CACHE_TTL_MS) return fresh;
+  if (fresh && Date.now() - fresh.loadedAt < maxAgeMs) return fresh;
 
   const inFlight = preloadInFlight.get(key);
   if (inFlight) return inFlight;
@@ -411,7 +414,8 @@ export async function refreshTrackedObligations(params: {
 }): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation>; market: KaminoMarket }> {
   const { rpc, preloaded, pubkeys } = params;
   if (!pubkeys.length) return { candidates: [], obligations: new Map(), market: preloaded.market };
-  const loaded = freshPreloaded(preloaded) ? preloaded : await preloadMarket(rpc, preloaded.marketAddress);
+  const loaded = freshPreloaded(preloaded, HOT_MARKET_CACHE_TTL_MS)
+    ? preloaded : await preloadMarket(rpc, preloaded.marketAddress, HOT_MARKET_CACHE_TTL_MS);
   const market = loaded.market;
   let hydrated: KaminoObligation[] | undefined;
   const snapshot = params.streamSnapshot;
@@ -439,8 +443,8 @@ export async function refreshTrackedObligations(params: {
   return { candidates, obligations, market };
 }
 
-export function freshPreloaded(preloaded: PreloadedMarket | undefined): boolean {
-  return Boolean(preloaded && Date.now() - preloaded.loadedAt < MARKET_CACHE_TTL_MS);
+export function freshPreloaded(preloaded: PreloadedMarket | undefined, maxAgeMs = MARKET_CACHE_TTL_MS): boolean {
+  return Boolean(preloaded && Date.now() - preloaded.loadedAt < maxAgeMs);
 }
 
 export function createScreener(deps: { loadMarket?: typeof import("../../kamino.js").loadMarket } = {}) {

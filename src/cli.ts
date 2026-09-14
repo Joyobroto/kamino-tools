@@ -4,7 +4,7 @@ import { config as loadEnv } from "dotenv";
 import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { Command } from "commander";
 import "./quiet-bigint.js";
-import { address, createNoopSigner, type Instruction } from "@solana/kit";
+import { address, createNoopSigner, getSignatureFromTransaction, type Instruction } from "@solana/kit";
 import { formatTokenAmount, parseTokenAmount } from "./amount.js";
 import {
   configuredValue,
@@ -26,7 +26,7 @@ import {
   selectReserve,
 } from "./kamino.js";
 import { instructionSummary, loadStrategy, externalInstructionsToStrategy } from "./strategy.js";
-import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, sendAndConfirmPoll, simulate } from "./transaction.js";
+import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, sendAndConfirmPoll, simulate, transactionReceipt } from "./transaction.js";
 import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket } from "./strategies/liquidation/screener.js";
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
@@ -681,10 +681,10 @@ program
       const warmExecution = () => {
         warmBlockhash(scanRpc, options.rpc);
         warmScopeConfigurations(scanRpc);
+        warmAltTables(options.rpc, executorAltTables);
       };
       warmExecution();
       if (options.watch) setInterval(warmExecution, 20_000).unref();
-      warmAltTables(options.rpc, executorAltTables);
     }
     const executorAutoOptions: AutofireOptions = {
       lsts: [],
@@ -1001,6 +1001,15 @@ program
               ...("logs" in outcome ? { simulationLogs: outcome.logs.slice(-40) } : {}),
             });
           }
+          if (!outcome.passed && outcome.reason.startsWith("ALT unavailable:")) {
+            // Infrastructure failure is not an unquotable route or a broken obligation.
+            executorNoRouteUntil.set(obligation, Date.now() + 5_000);
+            executorRecentlyTried.delete(obligation);
+            boardUpdate(obligation, { status: "WATCH" });
+            executorStats.lastFailure = outcome.reason;
+            if (!options.json) console.log(color.yellow(`[${localTimestamp(new Date().toISOString())}] executor: ${outcome.reason}`));
+            return;
+          }
           const retryable =
             !outcome.passed && (/ReserveStale|6009|price_status/.test(outcome.reason)
               || /8100002|429|too many|rate.?limit/i.test(outcome.reason));
@@ -1105,19 +1114,24 @@ program
             logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "skipped", obligation, reason: "shadow — executable play not broadcast", quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd });
             return;
           }
-          const signature = await sendAndConfirm(options.rpc, scanRpc, outcome.transaction as Parameters<typeof sendAndConfirm>[2]).catch((error: unknown) => {
+          const attemptedSignature = getSignatureFromTransaction(outcome.transaction as Parameters<typeof sendAndConfirm>[2]);
+          // Budget estimate remains explicitly separate from the measured lamport fee.
+          const lossUsdEstimate = 0.0011 + outcome.tipUsd;
+          const signature = await sendAndConfirm(options.rpc, scanRpc, outcome.transaction as Parameters<typeof sendAndConfirm>[2]).catch(async (error: unknown) => {
             const failReason = error instanceof Error ? error.message : "unknown";
-            logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, reason: `broadcast failed: ${failReason.slice(0, 100)}`, lossUsdEstimate: 0.0011 });
+            const receipt = await transactionReceipt(scanRpc, attemptedSignature);
+            logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature: attemptedSignature, ...receipt, reason: `broadcast failed: ${failReason.slice(0, 100)}`, lossUsdEstimate });
             console.log(color.red(`✗ broadcast failed: ${failReason}`));
             executorStats.lastFailure = `broadcast: ${failReason.slice(0, 160)}`;
-            alerter.push(liquidationFailedAlert({ obligation: obligation.slice(0, 12), stage: "broadcast", reason: failReason.slice(0, 300), gasBurnedUsd: 0.0011 }));
+            alerter.push(liquidationFailedAlert({ obligation: obligation.slice(0, 12), stage: "broadcast", reason: failReason.slice(0, 300) }));
             return null;
           });
           if (!signature) return;
           executorStats.dueFired++;
           boardUpdate(obligation, { status: "FIRED", prizeUsd: outcome.plan.worstCaseProfitUsd });
           console.log(color.bold(color.green(`✅ FIRED ${obligation.slice(0, 8)}…`)) + `  ${color.white(`https://solscan.io/tx/${signature}`)}`);
-          logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature, quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd, lossUsdEstimate: 0.0011 });
+          const receipt = await transactionReceipt(scanRpc, signature);
+          logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature, ...receipt, quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd, lossUsdEstimate });
           alerter.push(liquidationQuoteAlert({ signature, quotedUsd: outcome.plan.quotedProfitUsd, worstUsd: outcome.plan.worstCaseProfitUsd }));
         } finally {
           executorBusy.delete(obligation);

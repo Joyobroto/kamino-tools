@@ -1,4 +1,4 @@
-import type { Address, Instruction, Rpc, SolanaRpcApi, TransactionSigner } from "@solana/kit";
+import { address, type Address, type Instruction, type Rpc, type SolanaRpcApi, type TransactionSigner } from "@solana/kit";
 import { compressTransactionMessageUsingAddressLookupTables, appendTransactionMessageInstructions, createTransactionMessage, pipe, setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash, signTransactionMessageWithSigners } from "@solana/kit";
 
 /**
@@ -74,9 +74,6 @@ export function warmBlockhash(rpc: Rpc<SolanaRpcApi>, rpcUrl?: string): void {
 
 // ─── ALT contents cache ────────────────────────────────────────────────────
 
-type AltInfoResponse = { result?: { value?: { data?: { parsed?: { info?: { addresses?: string[] } } } } } };
-const parseAltResponse = async (r: Response): Promise<AltInfoResponse | null> => r.json().catch(() => null);
-
 interface CachedAlt {
   addresses: Address[];
   fetchedAt: number;
@@ -85,10 +82,12 @@ const ALT_MAX_AGE_MS = 10 * 60_000; // tables are append-only; 10 min is generou
 const altCache = new Map<string, CachedAlt>();
 const altInFlight = new Map<string, Promise<CachedAlt>>();
 
-/** Fetch (and cache) an ALT's full address list. jsonParsed fetch with 429 backoff. */
+/** Resolve tables through the same failover transport as execution. Never
+ * silently omit a requested table: that misreports RPC outages as packet errors. */
 export async function getCachedAltAddresses(
   rpcUrl: string,
   tableAddress: string,
+  rpc?: Rpc<SolanaRpcApi>,
 ): Promise<Address[]> {
   const cacheKey = `${rpcUrl}|${tableAddress}`;
   const fresh = altCache.get(cacheKey);
@@ -96,24 +95,25 @@ export async function getCachedAltAddresses(
   const inflight = altInFlight.get(cacheKey);
   if (inflight) return inflight.then((cached) => cached.addresses);
   const promise = (async (): Promise<CachedAlt> => {
-    let response: Awaited<ReturnType<typeof parseAltResponse>> | null = null;
-    for (let attempt = 1; attempt <= 4 && !response?.result?.value?.data?.parsed?.info?.addresses?.length; attempt += 1) {
-      const raw = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAccountInfo", params: [tableAddress, { encoding: "jsonParsed" }] }),
-        signal: AbortSignal.timeout(2_000),
-      }).catch(() => null);
-      if (!raw) continue;
-      if (raw.status === 429) {
-        await new Promise((resolve) => setTimeout(resolve, 1_500 * attempt));
-        continue;
-      }
-      response = (await raw.json().catch(() => null)) as Awaited<ReturnType<typeof parseAltResponse>>;
+    const client = rpc ?? (await import("../../kamino.js")).rpcClient(rpcUrl);
+    let value;
+    try {
+      ({ value } = await client.getAccountInfo(address(tableAddress), {
+        encoding: "jsonParsed", commitment: "confirmed",
+      }).send({ abortSignal: AbortSignal.timeout(3_000) }));
+    } catch {
+      throw new Error(`ALT unavailable: ${tableAddress} (RPC failed or timed out)`);
     }
-    const addresses = response?.result?.value?.data?.parsed?.info?.addresses ?? [];
-    const cached: CachedAlt = { addresses: addresses.map((a) => a as Address), fetchedAt: Date.now() };
-    if (cached.addresses.length) altCache.set(cacheKey, cached);
+    const data = value?.data as { parsed?: { info?: { addresses?: string[]; deactivationSlot?: string | number | bigint } } } | undefined;
+    const info = data?.parsed?.info;
+    if (value?.owner !== "AddressLookupTab1e1111111111111111111111111" || !info?.addresses?.length) {
+      throw new Error(`ALT unavailable: ${tableAddress} (missing, empty or invalid account)`);
+    }
+    if (String(info.deactivationSlot) !== "18446744073709551615") {
+      throw new Error(`ALT unavailable: ${tableAddress} (table is deactivating)`);
+    }
+    const cached: CachedAlt = { addresses: info.addresses.map((a) => address(a)), fetchedAt: Date.now() };
+    altCache.set(cacheKey, cached);
     return cached;
   })().finally(() => altInFlight.delete(cacheKey));
   altInFlight.set(cacheKey, promise);
@@ -139,7 +139,7 @@ export async function createSignedTransactionWithAltCached(
   const uniqueTables = [...new Set(lookupTableAddresses.map(String))];
   const [latestBlockhash, altResults] = await Promise.all([
     getCachedBlockhash(rpc, rpcUrl),
-    Promise.all(uniqueTables.map(async (table) => [table, await getCachedAltAddresses(rpcUrl, table)] as const)),
+    Promise.all(uniqueTables.map(async (table) => [table, await getCachedAltAddresses(rpcUrl, table, rpc)] as const)),
   ]);
   let message = pipe(
     createTransactionMessage({ version: 0 }),
