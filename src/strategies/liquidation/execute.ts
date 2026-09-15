@@ -1,4 +1,5 @@
 import { firstUsable, withDeadline } from "./pipeline.js";
+import { isHealthyLiquidationVeto } from "./simulation-error.js";
 /**
  * Kamino liquidation executor — builds the atomic flash-borrow liquidation
  * sandwich for one DUE obligation, replicating the exact on-chain shape the
@@ -934,6 +935,9 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   const logs = simulation.value?.logs ?? [];
   const simErr = simulation.value?.err;
   if (simErr) {
+    if (isHealthyLiquidationVeto(simErr, logs)) {
+      return { stage: "simulate", passed: false, reason: "ObligationHealthy (6016): Kamino refreshed the position and found it not liquidatable", logs, timings };
+    }
     return { stage: "simulate", passed: false, reason: `simulation failed: ${safeJsonStringify(simErr)}`, logs, timings };
   }
   // RPC reports total transaction consumption; the final program log is only

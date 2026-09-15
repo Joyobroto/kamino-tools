@@ -1024,7 +1024,7 @@ program
             if (!options.json) console.log(color.yellow(`[${localTimestamp(new Date().toISOString())}] executor ✗ ${obligation.slice(0, 8)}… ${outcome.stage}: ${outcome.reason.slice(0, 160)}`));
             // Only alert on late-stage failures (assemble/simulate) — plan-stage rejections
             // (not liquidatable, no flash debt) are normal market noise, not incidents.
-            if (outcome.stage !== "plan") {
+            if (outcome.stage !== "plan" && !outcome.reason.startsWith("ObligationHealthy (6016):")) {
               executorStats.lastFailure = `${outcome.stage}: ${outcome.reason.slice(0, 160)}`;
               alerter.push(liquidationFailedAlert({ obligation: obligation.slice(0, 12), stage: outcome.stage, reason: outcome.reason.slice(0, 300) }));
             }
