@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import ./test/network-guard.mjs --import tsx --test test/*.test.ts",
     "start": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
     "cli": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
     "interactive": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts interactive",

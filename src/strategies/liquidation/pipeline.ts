@@ -45,3 +45,35 @@ export function createTaskQueue(capacity: number, onError: (error: unknown) => v
     drain();
   };
 }
+
+/** Validate candidates as they arrive; every fallback shares one wall-clock budget.
+ * Timed-out work cannot return an accepted transaction to the caller. */
+export async function validateRoutes<T, R>(input: {
+  first: T;
+  alternatives: () => Array<Promise<T | null>>;
+  validate: (route: T) => Promise<{ value?: R; terminal?: boolean }>;
+  budgetMs: number;
+}): Promise<R | null> {
+  const until = Date.now() + input.budgetMs;
+  const seen = new Set<T>();
+  let pending: Map<number, Promise<{ id: number; route: T | null }>> | undefined;
+  let route: T | null = input.first;
+  while (Date.now() < until) {
+    if (route !== null && !seen.has(route)) {
+      seen.add(route);
+      const result = await withDeadline(input.validate(route), Math.max(1, until - Date.now()));
+      if (!result) return null;
+      if (result.value !== undefined) return result.value;
+      if (result.terminal) return null;
+    }
+    pending ??= new Map(input.alternatives().map((p, id) => [id, p.then(
+      (route) => ({ id, route }), () => ({ id, route: null }),
+    )]));
+    if (!pending.size) break;
+    const next = await withDeadline(Promise.race(pending.values()), Math.max(1, until - Date.now()));
+    if (!next) break;
+    pending.delete(next.id);
+    route = next.route;
+  }
+  return null;
+}

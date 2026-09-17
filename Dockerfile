@@ -17,8 +17,8 @@ COPY examples ./examples
 # Non-root user for safety
 USER node
 
-# Healthcheck: node responds while the watcher loop is alive
+# Healthcheck reads scanner and subscription heartbeats from the watcher.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
-  CMD node -e "process.exit(0)"
+  CMD node --import tsx src/healthcheck.ts
 
 CMD ["node", "--disable-warning=ExperimentalWarning", "--import", "tsx", "src/cli.ts", "scan", "--watch", "--interval", "60", "--log", "/data/opportunities.jsonl"]

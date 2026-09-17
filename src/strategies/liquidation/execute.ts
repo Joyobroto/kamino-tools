@@ -1,5 +1,5 @@
-import { firstUsable, withDeadline } from "./pipeline.js";
-import { isHealthyLiquidationVeto } from "./simulation-error.js";
+import { firstUsable, withDeadline, validateRoutes } from "./pipeline.js";
+import { isHealthyLiquidationVeto, isClmmRouteFailure } from "./simulation-error.js";
 /**
  * Kamino liquidation executor — builds the atomic flash-borrow liquidation
  * sandwich for one DUE obligation, replicating the exact on-chain shape the
@@ -71,10 +71,25 @@ import { safeJsonStringify } from "../../ui.js";
 import { buildMarketReserveMap, dynamicLiquidationBonus, healthFactor, obligationToCandidate } from "./filters.js";
 import { hydrateShortlist, withBackoff } from "./screener.js";
 import { applySlippage, fetchRawQuote, fetchSwapInstructions } from "../arb/lst-arb.js";
+import { buildSenderTipInstruction, chooseSenderLane, FALLBACK_SOL_USD, priorityMicrolamports, type SenderConfig, type SenderLane, type SenderTier } from "./sender.js";
 
 const ATA_PROGRAM = "ATokenGPvbdgxrpT2sgsWoLtT8H9y6hktjssKpsrjqer";
 const DEFAULT_CLOSE_FACTOR = 0.5;
 const PRECISION_MARGIN_BPS = 20; // safety haircut on the collateral estimate
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const EXECUTOR_CU_LIMIT = 1_400_000;
+
+/** SOL/USD from the market's own WSOL oracle — no extra RPC, no hardcoded price. */
+function solUsdFromMarket(market: KaminoMarket): number {
+  try {
+    const reserve = market.getReservesByMint(address(WSOL_MINT))[0];
+    const price = reserve?.getOracleMarketPrice()?.toNumber?.();
+    if (typeof price === "number" && Number.isFinite(price) && price > 0) return price;
+  } catch {
+    // fall through to the conservative constant
+  }
+  return FALLBACK_SOL_USD;
+}
 
 type FarmAccounts = {
   obligationFarmUserState: Option<Address>;
@@ -181,11 +196,21 @@ export interface LiquidationInput {
    *  bounded by the caller (seconds, not minutes); the tx itself refreshes
    *  on-chain anyway. */
   prehydratedObligation?: KaminoObligation;
+  /** Helius Sender execution lane (tip + tier + cost gate). When omitted the
+   *  executor builds a plain transaction and the caller broadcasts it directly. */
+  sender?: SenderConfig;
+  /** Test seam: inject the transaction builder / simulator. Defaults to the real
+   *  implementations; lets an offline E2E exercise the full verdict chain without
+   *  an on-chain ALT or a live RPC. */
+  deps?: {
+    createSignedTransaction?: typeof createSignedTransactionWithAltCached;
+    simulate?: typeof simulate;
+  };
 }
 
-export type LiquidationOutcome =
+type LiquidationOutcomeBody =
   | { stage: "plan"; passed: false; reason: string; timings?: Record<string, number> }
-  | { stage: "assemble"; passed: false; reason: string; timings?: Record<string, number> }
+  | { stage: "assemble"; passed: false; reason: string; logs?: string[]; timings?: Record<string, number> }
   | { stage: "simulate"; passed: false; reason: string; logs: string[]; timings?: Record<string, number> }
   | {
       stage: "ready";
@@ -201,6 +226,10 @@ export type LiquidationOutcome =
         estCollateralUsd: number;
         quotedProfitUsd: number;
         worstCaseProfitUsd: number;
+        /** Helius Sender lane cost (tip + priority + base) in USD, when enabled. */
+        senderCostUsd?: number;
+        /** worstCaseProfitUsd − senderCostUsd — the number the fire gate uses. */
+        netWorstCaseProfitUsd?: number;
         /** Which swap backend produced the plan: clmm-local | jupiter | kswap/<router>. */
         swapSource?: string;
       };
@@ -214,7 +243,19 @@ export type LiquidationOutcome =
       priorityLane: string;
       /** FASTLANE tip in USD (0 when off). */
       tipUsd: number;
+      /** Helius Sender lane built into this transaction (when enabled). */
+      sender?: {
+        tier: SenderTier;
+        /** Max-tier fires are submitted as an atomic Jito-routed bundle. */
+        bundle: boolean;
+        tipLamports: bigint;
+        tipUsd: number;
+        priorityFeeUsd: number;
+        estimatedCostUsd: number;
+      };
     };
+
+export type LiquidationOutcome = LiquidationOutcomeBody & { simulationSlot?: number; routeDiagnostics?: string[] };
 
 /** Convert signed token base units using a price that already includes mint decimals. */
 export function profitBaseUnitsToUsd(amount: bigint, pricePerBaseUnit: Decimal): number {
@@ -346,6 +387,8 @@ export function choosePriorityFee(params: {
 
 export async function executeLiquidationOnce(input: LiquidationInput): Promise<LiquidationOutcome> {
   const { rpc, market, obligationAddress } = input;
+  const buildTransaction = input.deps?.createSignedTransaction ?? createSignedTransactionWithAltCached;
+  const simulateTransaction = input.deps?.simulate ?? simulate;
   const timings: Record<string, number> = {};
   const mark = (label: string): (() => void) => {
     const start = Date.now();
@@ -462,6 +505,26 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // process-immutable — the shared hot cache serves it with zero work.
   const signer = await getCachedWalletSigner();
 
+  // ── Helius Sender execution lane (execution-only; data RPC untouched) ──
+  // The tip must live INSIDE the transaction, so the tier is chosen before the
+  // sandwich is assembled. Small prizes take SWQOS-only (min 0.000005 SOL),
+  // high prizes take Sender Max (min 0.001 SOL, multi-path + tip buffer).
+  // Both require a CU-price instruction; the bid moves into the tip.
+  const solUsd = input.sender?.enabled ? solUsdFromMarket(market) : FALLBACK_SOL_USD;
+  const prizeGuessUsd = input.prizeUsd
+    ?? (input.sender?.enabled ? (obligationToCandidate(obligation, marketReserves).estimatedProfitUsd ?? 0) : 0);
+  const senderLane: SenderLane | null = input.sender?.enabled
+    ? chooseSenderLane({ prizeUsd: prizeGuessUsd, solUsd, computeUnitLimit: EXECUTOR_CU_LIMIT, config: input.sender })
+    : null;
+  if (input.sender?.enabled && !senderLane) {
+    return {
+      stage: "plan",
+      passed: false,
+      reason: `sender cost gate: prize $${prizeGuessUsd.toFixed(4)} does not cover tip+priority+base (min-profit $${input.sender.minProfitUsd})`,
+      timings,
+    };
+  }
+
   // ATAs: debt-liquidity (userSourceLiquidity + flash ATA), collateral-liquidity
   // (userDestinationLiquidity + swap input), collateral cToken (userDestinationCollateral).
   const debtAta = address(
@@ -486,6 +549,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     }),
   );
 
+  const quoteDiagnostics: string[] = [];
   interface SwapPlan {
     swapInstructions: ExternalInstruction[];
     lookupTables: Address[];
@@ -499,23 +563,25 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // A DIRECT-route variant is quoted in parallel: multi-hop routes stack 2+ swap
   // ix (~80 accounts) and can bust the 1232-byte packet; the direct variant is
   // the packet-safe fallback at a slightly worse price.
-  const buildJupiterPlan = async (onlyDirectRoutes: boolean): Promise<SwapPlan | null> => {
+  const buildJupiterPlan = async (onlyDirectRoutes: boolean, maxAccounts?: number): Promise<SwapPlan | null> => {
     const quote = await fetchRawQuote({
       inputMint: withdrawReserve.getLiquidityMint().toString(),
       outputMint: repayReserve.getLiquidityMint().toString(),
       amount: estCollateralBaseUnits.toString(),
       slippageBps: input.slippageBps,
-      onlyDirectRoutes,
+      onlyDirectRoutes, ...(maxAccounts ? { maxAccounts } : {}),
+      signal: AbortSignal.timeout(2_000),
+      onDiagnostic: (message) => { quoteDiagnostics.push(`jupiter: ${message}`); },
     });
     if (!quote) return null;
-    const plan = await fetchSwapInstructions(quote, signer.address.toString());
+    const plan = await fetchSwapInstructions(quote, signer.address.toString(), undefined, { signal: AbortSignal.timeout(1_000), onDiagnostic: (message) => { quoteDiagnostics.push(`jupiter-swap: ${message}`); } });
     if (!plan) return null;
     return {
       swapInstructions: plan.swapInstructions,
       lookupTables: plan.addressLookupTableAddresses.map((a: string) => address(a)),
       swapOut: BigInt(quote.outAmount),
       swapOutMin: applySlippage(BigInt(quote.outAmount), input.slippageBps),
-      source: onlyDirectRoutes ? "jupiter-direct" : "jupiter",
+      source: maxAccounts ? `jupiter-compact-${maxAccounts}` : onlyDirectRoutes ? "jupiter-direct" : "jupiter",
     };
   };
   const buildKswapPlan = async (): Promise<SwapPlan | null> => {
@@ -528,7 +594,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       slippageBps: input.slippageBps,
       executor: signer.address,
     });
-    if (!kswap?.best) return null;
+    if (!kswap?.best) { quoteDiagnostics.push("kswap: no usable response"); return null; }
     return {
       swapInstructions: kswap.best.swapInstructions.map((ix) => instructionToExternal(ix)),
       lookupTables: kswap.best.lookupTableAddresses,
@@ -558,6 +624,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         amountIn,
         amountOutMin: new BNImport(quote.amountOutMinBigInt().toString()),
         payer: new PublicKey(signer.address.toString()),
+        quote,
       });
       if (!swap) return null;
       // Raydium's mainnet CLMM lookup table (pool/vault/tick-array accounts) —
@@ -571,7 +638,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         swapOutMin: quote.amountOutMinBigInt(),
         source: `clmm-local/${swap.poolId.toBase58().slice(0, 6)}`,
       };
-    } catch {
+    } catch (error) {
+      quoteDiagnostics.push(`clmm: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
   };
@@ -635,7 +703,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     swapPlan = await kswapPlan();
     done();
   }
-  if (!swapPlan) return { stage: "plan", passed: false, reason: "collateral→debt route unquotable (clmm+jupiter+kswap all failed)" , timings };
+  if (!swapPlan) return { stage: "plan", passed: false, reason: `route unavailable: ${withdrawReserve.getLiquidityMint()}→${repayReserve.getLiquidityMint()} amount=${estCollateralBaseUnits}; ${quoteDiagnostics.join("; ") || "backends returned no route or exceeded deadline"}` , timings };
   const activeSwapPlan: SwapPlan = swapPlan;
   const swapOut = activeSwapPlan.swapOut;
   const swapOutMin = activeSwapPlan.swapOutMin;
@@ -690,6 +758,10 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   for (const borrow of obligation.getBorrows()) refreshAccounts.push({ address: borrow.reserveAddress, writable: true });
   const uniqueReserveAddresses = [...new Set(refreshAccounts.map((meta) => meta.address.toString()))];
   const preInstructions: Instruction[] = [];
+  // Sender tip transfer rides the same sandwich (atomic with borrow/liquidate/
+  // repay): it is rolled back if the liquidation reverts, so a rejected tx only
+  // burns base + priority fee, not the tip.
+  if (senderLane) preInstructions.push(buildSenderTipInstruction({ signer, lamports: senderLane.tipLamports }));
 
   // Scope-priced reserves read a price feed that must itself be refreshed earlier
   // in the SAME transaction — otherwise refreshObligation fails with ReserveStale
@@ -781,12 +853,17 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // FASTLANE: bid the block space. Replaces/sets the CU price ix so the tx
   // outbids base-fee traffic in the race for the next block. Jupiter's own
   // price ix (if present) is dropped for the same discriminator to avoid doubles.
-  const priority = choosePriorityFee({
-    computeUnitLimit: 1_400_000,
-    priorityMode: input.priorityMode ?? "off",
-    ...(input.prizeUsd !== undefined ? { prizeUsd: input.prizeUsd } : {}),
-    ...(input.microlamportsPerCu !== undefined ? { microlamportsPerCu: input.microlamportsPerCu } : {}),
-  });
+  // When Sender is enabled the Sender lane owns the prize-scaled bid (the SOL
+  // tip) and the CU price is pinned to the tier minimum — paying two competing
+  // bids would double-burn the reward.
+  const priority = senderLane
+    ? { microlamportsPerCu: senderLane.microlamportsPerCu, tipUsd: senderLane.priorityFeeUsd, lane: `sender-${senderLane.tier}${senderLane.bundle ? "-bundle" : ""} (tip $${senderLane.tipUsd.toFixed(4)})` }
+    : choosePriorityFee({
+      computeUnitLimit: EXECUTOR_CU_LIMIT,
+      priorityMode: input.priorityMode ?? "off",
+      ...(input.prizeUsd !== undefined ? { prizeUsd: input.prizeUsd } : {}),
+      ...(input.microlamportsPerCu !== undefined ? { microlamportsPerCu: input.microlamportsPerCu } : {}),
+    });
   if (priority.microlamportsPerCu > 0) {
     const cuPriceIx = getSetComputeUnitPriceInstruction({
       microLamports: BigInt(priority.microlamportsPerCu),
@@ -824,125 +901,84 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       setupInstructions,
     });
 
-  // Size guard for EVERY swap backend, not just CLMM: the wire tx must fit
-  // 1232 bytes or the RPC rejects it (-32602 / "too large" — the exact failure
-  // mode that burned the 2026-09-08 ledger: KSwap multi-hop routes stack more
-  // accounts than the ALTs cover). Measure the PRIMARY plan first; if it busts,
-  // try every already-fetched fallback (jupiter → kswap) before giving up.
   const packetSizes: string[] = [];
-  const wireSizeOf = async (plan: SwapPlan): Promise<{ build: Awaited<ReturnType<typeof buildFlashLoan>>; tx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null; tooLarge: boolean }> => {
-    const built = await buildSwapChain(plan);
-    const tx = await createSignedTransactionWithAltCached(rpc, input.rpcUrl, signer, built.instructions, [...plan.lookupTables, ...(input.lookupTableAddresses ?? [])]);
-    const wire = tx ? Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length : Number.POSITIVE_INFINITY;
-    packetSizes.push(`${plan.source ?? "unknown"}=${wire} bytes`);
-    return { build: built, tx, tooLarge: wire > 1232 };
-  };
-
-  // Candidate order: the chosen plan first, then every other fetched plan as
-  // fallback — including the packet-safe jupiter-direct variant. Unknown-null
-  // (never quoted) plans are skipped.
-  const fallbackPlans: SwapPlan[] = [];
-  let chosenPlan = activeSwapPlan;
-  const primary = await wireSizeOf(activeSwapPlan);
-  let buildFinal = primary.build;
-  let signedTx: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | null = null;
-  {
-    if (primary.tooLarge) {
-      // Only pay the fallback wait if the first usable route cannot fit.
-      fallbackPlans.push(...(await Promise.all([...routePromises, kswapPlan()]))
-        .filter((p): p is SwapPlan => p !== null && p !== activeSwapPlan));
-      for (const fallback of fallbackPlans) {
-        const attempt = await wireSizeOf(fallback);
-        if (!attempt.tooLarge) {
-          chosenPlan = fallback;
-          buildFinal = attempt.build;
-          signedTx = attempt.tx;
-          break;
+  const routeFailures: string[] = [];
+  let lastLogs: string[] = [];
+  let simulationSlot: number | undefined;
+  let lastReason = "route validation deadline exceeded";
+  let lastStage: "assemble" | "simulate" = "assemble";
+  let clmmRetried = false;
+  const selected = await validateRoutes({
+    first: activeSwapPlan,
+    budgetMs: 3_000,
+    alternatives: () => [...routePromises, kswapPlan(), buildJupiterPlan(true, 24)],
+    validate: async (initialPlan) => {
+      try {
+        let plan = initialPlan;
+        for (;;) {
+          const built = await buildSwapChain(plan);
+          let uncovered: string[] = [];
+          const tx = await buildTransaction(rpc, input.rpcUrl, signer,
+            built.instructions, [...(input.lookupTableAddresses ?? []), ...plan.lookupTables], (keys) => { uncovered = keys; });
+          const wire = Buffer.from(getBase64EncodedWireTransaction(tx), "base64").length;
+          packetSizes.push(`${plan.source}=${wire} bytes`);
+          if (wire > 1232) {
+            lastStage = "assemble";
+            lastReason = `tx exceeds 1232-byte packet with resolved LUTs (${packetSizes.join(", ")}); uncovered=${uncovered.join(",")}`;
+            return {};
+          }
+          const worst = profitBaseUnitsToUsd(plan.swapOutMin - repayAmountBaseUnits - built.feeBaseUnits, debtPriceBase);
+          if (worst < input.minProfitUsd) {
+            lastReason = `worst-case $${worst.toFixed(4)} < floor $${input.minProfitUsd}`;
+            routeFailures.push(`${plan.source}: ${lastReason}`);
+            return {};
+          }
+          if (input.skipSimulate) return { value: { plan, built, tx, consumedUnits: 0n, logs: [] as string[] } };
+          lastStage = "simulate";
+          const started = Date.now();
+          const simulation = await simulateTransaction(rpc, tx);
+          timings.simulate = (timings.simulate ?? 0) + Date.now() - started;
+          simulationSlot = Number(simulation.context.slot);
+          const logs = simulation.value.logs ?? [];
+          const error = simulation.value.err;
+          lastLogs = logs;
+          if (!error) return { value: { plan, built, tx, consumedUnits: simulation.value.unitsConsumed ?? 0n, logs } };
+          if (isHealthyLiquidationVeto(error, logs)) {
+            lastReason = "ObligationHealthy (6016): Kamino refreshed the position and found it not liquidatable";
+            return { terminal: true };
+          }
+          lastReason = `simulation failed: ${safeJsonStringify(error)}`;
+          routeFailures.push(`${plan.source}: ${lastReason}`);
+          if (!isClmmRouteFailure(error, logs, built.instructions)) return { terminal: true };
+          // Route construction/state failure belongs to the pool, not the obligation.
+          getClmmQuoter(input.rpcUrl).invalidate(
+            new PublicKey(withdrawReserve.getLiquidityMint().toString()),
+            new PublicKey(repayReserve.getLiquidityMint().toString()),
+          );
+          if (clmmRetried || !plan.source.startsWith("clmm-local/")) return {};
+          clmmRetried = true;
+          const refreshed = await withDeadline(buildLocalClmmPlan(), 350);
+          if (!refreshed) return {};
+          plan = refreshed;
         }
+      } catch (error) {
+        lastReason = error instanceof Error ? error.message : String(error);
+        routeFailures.push(`${initialPlan.source}: ${lastReason}`);
+        return {};
       }
-      if (!signedTx) {
-        // Every backend busts the packet (account-heavy multi-hop market) —
-        // fail the fire here rather than sending an RPC-rejected tx.
-        done();
-        return { stage: "assemble", passed: false, reason: `tx exceeds 1232-byte packet with resolved LUTs (${packetSizes.join(", ")})`, timings };
-      }
-    } else {
-      signedTx = primary.tx;
-    }
-  }
-  const activePlan = chosenPlan;
-  const activeSwapOut = activePlan === activeSwapPlan ? swapOut : activePlan.swapOut;
-  const activeSwapOutMin = activePlan === activeSwapPlan ? swapOutMin : activePlan.swapOutMin;
-  const transaction = signedTx
-    ?? (await createSignedTransactionWithAltCached(
-      rpc,
-      input.rpcUrl,
-      signer,
-      buildFinal.instructions,
-      [
-        ...activePlan.lookupTables,
-        ...(input.lookupTableAddresses ?? []),
-      ],
-    ));
-
+    },
+  });
   done();
-
-  // BLIND-FIRE (skipSimulate): the on-chain program arbitrates; we return the
-  // assembled tx immediately. Only viable for cheap tuition plays — a wrong
-  // guess burns ~$0.001 of fee, but the same-slot speed is what wins marginal
-  // dust positions (the 12:47 post-mortem: every sim'd dust attempt lost the
-  // window to price oscillation, not to a competitor).
-  if (input.skipSimulate) {
-    done = mark("guards");
-    const feeBaseUnitsBlind = buildFinal.feeBaseUnits;
-    const netBaseUnitsBlind = activeSwapOutMin - repayAmountBaseUnits - feeBaseUnitsBlind;
-    const quotedNetBaseUnitsBlind = activeSwapOut - repayAmountBaseUnits - feeBaseUnitsBlind;
-    const worstCaseProfitUsdBlind = profitBaseUnitsToUsd(netBaseUnitsBlind, debtPriceBase);
-    const quotedProfitUsdBlind = profitBaseUnitsToUsd(quotedNetBaseUnitsBlind, debtPriceBase);
-    if (worstCaseProfitUsdBlind < input.minProfitUsd) {
-      return { stage: "simulate", passed: false, reason: `worst-case $${worstCaseProfitUsdBlind.toFixed(4)} < floor $${input.minProfitUsd}`, logs: [], timings };
-    }
-    return {
-      stage: "ready",
-      passed: true,
-      plan: {
-        obligation: obligationAddress,
-        healthFactor: health,
-        repayReserveSymbol: repayInfo.symbol,
-        withdrawReserveSymbol: withdrawReserve.getTokenSymbol(),
-        repayAmountBaseUnits,
-        repayUsd,
-        estCollateralBaseUnits,
-        estCollateralUsd: Number(new Decimal(estCollateralBaseUnits.toString()).mul(collPriceBase).toFixed(4)),
-        quotedProfitUsd: quotedProfitUsdBlind,
-        worstCaseProfitUsd: worstCaseProfitUsdBlind,
-        ...(activePlan.source ? { swapSource: activePlan.source } : {}),
-      },
-      transaction,
-      signer,
-      computeUnitsConsumed: 0n,
-      instructions: buildFinal.instructions.length,
-      timings,
-      priorityLane: priority.lane,
-      tipUsd: priority.tipUsd,
-    };
-  }
-
-  // Simulate.
-  done = mark("simulate");
-  const simulation = await withBackoff(() => simulate(rpc, transaction), "simulate");
-  done();
-  const logs = simulation.value?.logs ?? [];
-  const simErr = simulation.value?.err;
-  if (simErr) {
-    if (isHealthyLiquidationVeto(simErr, logs)) {
-      return { stage: "simulate", passed: false, reason: "ObligationHealthy (6016): Kamino refreshed the position and found it not liquidatable", logs, timings };
-    }
-    return { stage: "simulate", passed: false, reason: `simulation failed: ${safeJsonStringify(simErr)}`, logs, timings };
-  }
-  // RPC reports total transaction consumption; the final program log is only
-  // that program's invocation and can understate the whole chain drastically.
-  const consumedUnits = simulation.value.unitsConsumed ?? 0n;
+  if (!selected) return {
+    stage: lastStage, passed: false,
+    reason: lastReason.startsWith("ObligationHealthy") ? lastReason
+      : `${lastReason}; routes: ${routeFailures.join("; ")}; sizes: ${packetSizes.join(", ")}`,
+    routeDiagnostics: [...quoteDiagnostics, ...routeFailures, ...packetSizes],
+    logs: lastLogs, timings, ...(simulationSlot !== undefined ? { simulationSlot } : {}),
+  };
+  const { plan: activePlan, built: buildFinal, tx: transaction, consumedUnits, logs } = selected;
+  const activeSwapOut = activePlan.swapOut;
+  const activeSwapOutMin = activePlan.swapOutMin;
 
   // Gas guard: pin the CU limit to consumption + 25% headroom, then RE-SIMULATE
   // the pinned tx. If the pin (or anything race-y) broke it, we never send.
@@ -952,7 +988,14 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   if (consumedUnits > 0n && !input.fast) {
     const cuLimit = BigInt(Math.min(1_400_000, Math.ceil(Number(consumedUnits) * 1.25)));
     const cuLimitIx = getSetComputeUnitLimitInstruction({ units: Number(cuLimit) });
-    const pinnedBudget = upsertComputeBudget(budgetMerged, instructionToExternal(cuLimitIx));
+    // Priority fees are charged on the requested CU limit: when we tighten the
+    // limit we must raise the CU price to keep the Sender tier's lamport floor.
+    const pinnedBudgetBase = upsertComputeBudget(budgetMerged, instructionToExternal(cuLimitIx));
+    const pinnedBudget = senderLane
+      ? upsertComputeBudget(pinnedBudgetBase, instructionToExternal(getSetComputeUnitPriceInstruction({
+        microLamports: BigInt(priorityMicrolamports(senderLane.priorityFeeLamports, Number(cuLimit))),
+      })))
+      : pinnedBudgetBase;
     const pinnedBuild = await buildFlashLoan({
       market,
       reserve: repayReserve,
@@ -968,7 +1011,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       setupInstructions,
     }).catch(() => null);
     if (pinnedBuild) {
-      const pinnedTx = await createSignedTransactionWithAltCached(
+      const pinnedTx = await buildTransaction(
         rpc,
         input.rpcUrl,
         signer,
@@ -979,7 +1022,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         ],
       );
       done = mark("resim");
-      const recheck = await simulate(rpc, pinnedTx);
+      const recheck = await simulateTransaction(rpc, pinnedTx);
       done();
       if (recheck.value?.err) {
         return {
@@ -1010,6 +1053,24 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     };
   }
 
+  // Sender cost gate (final, on the SIMULATED worst-case profit): the tip is
+  // already baked into the transaction, so if the measured prize no longer
+  // covers tip + priority + base + floor we must NOT broadcast. This is the
+  // "prize tidak menutup biaya" refusal the operator asked for.
+  if (senderLane) {
+    const netAfterCostUsd = worstCaseProfitUsd - senderLane.estimatedCostUsd;
+    const senderFloor = input.sender?.minProfitUsd ?? input.minProfitUsd;
+    if (netAfterCostUsd < senderFloor) {
+      return {
+        stage: "simulate",
+        passed: false,
+        reason: `sender-${senderLane.tier} cost $${senderLane.estimatedCostUsd.toFixed(4)} (tip $${senderLane.tipUsd.toFixed(4)} + priority $${senderLane.priorityFeeUsd.toFixed(4)} + base) leaves $${netAfterCostUsd.toFixed(4)} of worst-case $${worstCaseProfitUsd.toFixed(4)} < floor $${senderFloor}`,
+        logs,
+        timings,
+      };
+    }
+  }
+
   return {
     stage: "ready",
     passed: true,
@@ -1024,14 +1085,30 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       estCollateralUsd: Number(new Decimal(estCollateralBaseUnits.toString()).mul(collPriceBase).toFixed(4)),
       quotedProfitUsd,
       worstCaseProfitUsd,
+      ...(senderLane ? {
+        senderCostUsd: senderLane.estimatedCostUsd,
+        netWorstCaseProfitUsd: worstCaseProfitUsd - senderLane.estimatedCostUsd,
+      } : {}),
       ...(activePlan.source ? { swapSource: activePlan.source } : {}),
     },
     transaction: finalTransaction,
     signer,
     computeUnitsConsumed: consumedUnits,
+    routeDiagnostics: [...quoteDiagnostics, ...routeFailures, ...packetSizes],
+    ...(simulationSlot !== undefined ? { simulationSlot } : {}),
     instructions: buildFinal.instructions.length,
     timings,
     priorityLane: priority.lane,
     tipUsd: priority.tipUsd,
+    ...(senderLane ? {
+      sender: {
+        tier: senderLane.tier,
+        bundle: senderLane.bundle,
+        tipLamports: senderLane.tipLamports,
+        tipUsd: senderLane.tipUsd,
+        priorityFeeUsd: senderLane.priorityFeeUsd,
+        estimatedCostUsd: senderLane.estimatedCostUsd,
+      },
+    } : {}),
   };
 }

@@ -88,6 +88,75 @@ LionX: custom wrapper program (single CPI, 14 static keys) — estimated <1–2s
 - Wallet `AcRF3Zu5…` needs ~0.1 SOL for comfortable operation (0.059 at arming)
 - Telegram delivers: DUE attempts, fires, failures, losses to LionX, hourly heartbeat
 
+## Execution lane: Helius Sender (2026-09-17)
+
+Docs: <https://www.helius.dev/docs/sending-transactions/sender>
+
+The broadcast path is now routed through **Helius Sender** — an execution-only,
+credit-free, tip-based submission service — while blockhash, oracle, screening,
+and confirmation keep using the existing data RPC (`SOLANA_RPC_URL`). Nothing on
+the detection/valuation path changes.
+
+| Tier | When | Routing | Min tip | Priority fee |
+|---|---|---|---|---|
+| **SWQOS-only** | prize < `LIQ_SENDER_MAX_PRIZE_USD` | single SWQOS path (`?swqos_only=true`) | 0.000005 SOL | any CU-price |
+| **Sender Max** | prize ≥ threshold | all pathways + priority tip buffer | 0.001 SOL | ≥ 5,000 lamports |
+
+How it is wired (`src/strategies/liquidation/sender.ts` + `execute.ts`):
+
+1. **Tier selection by prize.** `chooseSenderLane()` picks the lane from the
+   worst-case profit estimate. Small plays take SWQOS; prizes at/above the
+   threshold take Sender Max. The bid moves *into the tip* — the FASTLANE CU
+   price is pinned to the tier minimum so we never pay two competing bids.
+2. **Tip inside the atomic sandwich.** `buildSenderTipInstruction()` adds a
+   `SystemProgram.transfer` to one of the 10 designated Sender tip accounts.
+   Because it is part of the same transaction, it is rolled back on any failure —
+   a rejected fire burns only base + priority fee.
+3. **Cost gate (refuse when the prize does not cover the cost).** The lane's
+   cost = tip + priority fee + base fee, converted with the market's own WSOL
+   oracle price. If `worstCaseProfit − laneCost < minProfit`, the executor
+   refuses at plan stage; after simulation the gate is re-checked against the
+   *measured* worst-case and the fire is refused if it no longer covers.
+4. **CU-pin safety.** When the re-sim pass tightens the CU limit, the CU price is
+   recomputed so the Sender priority-fee floor still holds (priority fees are
+   charged on the requested limit, not consumed units).
+5. **Resilient submission.** `sendViaSender()` posts the signed wire tx to
+   `.../fast` (`maxRetries: 0`, `skipPreflight: true`) and confirmation polls the
+   data RPC. A Sender submission failure falls back to a direct RPC send — the
+   signed tx is idempotent by signature, so a duplicate is a no-op.
+
+### Sender Max bundles (Jito mode)
+
+When a fire's prize clears the Max threshold, it is submitted with
+`method: "sendBundle"` to the same Sender endpoint (`LIQ_SENDER_BUNDLE=true`,
+default on). Per the Helius docs, a Sender Max bundle routes across **every**
+high-speed pathway — **Jito**, Helius, Harmonic, Rakurai, etc. — and Helius adds
+the Jito/pathway tips itself: you provide only the 0.001 SOL Sender tip (already
+in the sandwich) and a ≥5,000-lamport priority fee per tx. Do **not** add a
+separate Jito tip or `jito-region` header for Sender Max bundles (those apply to
+the *basic* RPC-proxied bundles at `mainnet.helius-rpc.com/...sendBundle`).
+
+Bundles are atomic. Fee behaviour on a miss:
+
+- **Local simulation fails** → we never submit → **zero cost** (the sim gate
+  still runs before any broadcast).
+- **Submitted but the bundle fails / is not included** → it is all-or-nothing:
+  the whole bundle is dropped, the tip transfer reverts with it → **tip tidak
+  kepotong**. There is no separate Jito submission fee; you pay only when the
+  bundle lands.
+- **Bundle lands** → tip + priority fee + base fee are all paid.
+
+The worst-case prize gate still applies: `worstCaseProfit − laneCost <
+minProfit` refuses before assembly, so a fire is only attempted when the prize
+covers the Sender bundle cost.
+
+Config: `HELIUS_SENDER_ENDPOINT` (regional endpoint closest to the host),
+`LIQ_SENDER_ENABLED`, `LIQ_SENDER_MAX_PRIZE_USD`, `LIQ_SENDER_MAX_TIP_FRACTION`,
+`LIQ_SENDER_MAX_TIP_CAP_SOL`, `LIQ_SENDER_MIN_PROFIT_USD`; CLI:
+`--sender-endpoint`, `--no-sender`, `--sender-max-prize`. The tip accounts are
+also added to the persistent ALT by `liq-setup` so the extra destination stays
+inside the 1232-byte packet.
+
 ## NEXT PLAN: how we lose to LionX (and the infra guide for winning)
 
 > Source studied: *"Solana Liquidation Bot: Why Yours Loses (Infra Guide 2026)"* by Daniel Yavorovych (Dysnix/RPC Fast), https://yavorovych.medium.com/solana-liquidation-bot-why-yours-loses-infra-guide-2026-cb518c62ff85 — full text fetched & saved to `/tmp/medium-jina.txt` during cleanup.

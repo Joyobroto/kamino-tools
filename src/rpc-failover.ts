@@ -33,6 +33,8 @@ const DEFAULT_COOLDOWN_MS = 120_000;
 
 interface FailoverState {
   fallbackUntil: number;
+  primaryRetryAt: number;
+  fallbackRetryAt: number;
   primaryFailures: number;
   fallbackFailures: number;
   lastFlipAt: number;
@@ -43,7 +45,7 @@ const states = new Map<string, FailoverState>();
 function getState(key: string): FailoverState {
   const existing = states.get(key);
   if (existing) return existing;
-  const fresh: FailoverState = { fallbackUntil: 0, primaryFailures: 0, fallbackFailures: 0, lastFlipAt: 0 };
+  const fresh: FailoverState = { fallbackUntil: 0, primaryRetryAt: 0, fallbackRetryAt: 0, primaryFailures: 0, fallbackFailures: 0, lastFlipAt: 0 };
   states.set(key, fresh);
   return fresh;
 }
@@ -96,35 +98,42 @@ export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRp
   // Wrap BOTH under one transport that selects per request. An RpcTransport is
   // callable with { payload, signal } and returns RpcResponse<TResponse>; the
   // generic is threaded through so kit's RpcFromTransport type-checks.
-  const selectingTransport = (<TResponse>(config: Readonly<{ payload: unknown; signal?: AbortSignal }>) => {
-    const onFallback = Date.now() < state.fallbackUntil;
-    const chosen = onFallback ? fallbackTransport : primaryTransport;
-    const chosenIsPrimary = !onFallback;
-    return (chosenIsPrimary ? primaryTransport(config) : fallbackTransport(config))
-      .then((result: unknown) => {
-        if (chosenIsPrimary) state.primaryFailures = 0;
+  const selectingTransport = (async <TResponse>(config: Readonly<{ payload: unknown; signal?: AbortSignal }>) => {
+    config.signal?.throwIfAborted();
+    const now = Date.now();
+    const order = now < state.fallbackUntil ? [false, true] : [true, false];
+    let lastError: unknown = new Error("RPC endpoints cooling down; no request sent");
+    for (const primary of order) {
+      if (Date.now() < (primary ? state.primaryRetryAt : state.fallbackRetryAt)) continue;
+      config.signal?.throwIfAborted();
+      try {
+        const result = await (primary ? primaryTransport(config) : fallbackTransport(config));
+        if (primary) { state.primaryFailures = 0; state.fallbackUntil = 0; }
         else state.fallbackFailures = 0;
         return result as TResponse;
-      })
-      .catch(async (error: unknown) => {
+      } catch (error: unknown) {
+        if (config.signal?.aborted) throw error;
         const statusCode = (error as { context?: { statusCode?: number } } | null)?.context?.statusCode;
-        const shouldFlip = isRateLimitFailure(statusCode, error) || isConnectionFailure(error) || isServerErrorFailure(statusCode, error);
-        if (!shouldFlip) throw error;
-        if (!chosenIsPrimary) {
-          state.fallbackFailures += 1;
-          throw error;
+        const denied = statusCode === 401 || statusCode === 403;
+        if (!denied && !isRateLimitFailure(statusCode, error) && !isConnectionFailure(error)
+          && !isServerErrorFailure(statusCode, error)) throw error;
+        lastError = error;
+        // A rejected endpoint is not retried by every oracle/quote/scan caller.
+        const retryAt = Date.now() + (denied ? Math.max(300_000, cooldownMs) : cooldownMs);
+        if (primary) {
+          const firstFailure = state.primaryRetryAt <= Date.now();
+          state.primaryRetryAt = retryAt;
+          state.primaryFailures++;
+          state.fallbackUntil = retryAt;
+          state.lastFlipAt = Date.now();
+          if (firstFailure) console.warn(`[rpc-failover] primary ${safeHost(options.primaryUrl)} unavailable; trying configured fallback ${safeHost(options.fallbackUrl)}`);
+        } else {
+          state.fallbackRetryAt = retryAt;
+          state.fallbackFailures++;
         }
-        // Primary throttled or unreachable: flip to the fallback for the
-        // cooldown window and retry the SAME request there — the caller never
-        // sees the failure.
-        state.fallbackUntil = Date.now() + cooldownMs;
-        state.primaryFailures += 1;
-        state.lastFlipAt = Date.now();
-        const primaryHost = safeHost(options.primaryUrl);
-        const fallbackHost = safeHost(options.fallbackUrl);
-        console.warn(`[rpc-failover] primary ${primaryHost} failed; using fallback ${fallbackHost} for ${Math.round(cooldownMs / 1000)}s`);
-        return fallbackTransport(config) as unknown as Promise<TResponse>;
-      });
+      }
+    }
+    throw lastError;
   }) as RpcTransport;
 
   const rpc = createSolanaRpcFromTransport(selectingTransport);

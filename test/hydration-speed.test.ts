@@ -7,7 +7,7 @@ import { hydrateShortlist, ledgerInstantAtSlot, refreshTrackedObligations, strea
 
 const key = address("11111111111111111111111111111111");
 
-test("hot checks replace 20-second-old market data and share the refresh", async (t) => {
+test("hot checks reuse structural market data and avoid a refresh storm", async (t) => {
   let loads = 0;
   const rpc = {} as Rpc<SolanaRpcApi>;
   const oldMarket = { getAddress: () => key } as unknown as KaminoMarket;
@@ -17,8 +17,8 @@ test("hot checks replace 20-second-old market data and share the refresh", async
   const params = { rpc, preloaded: { market: oldMarket, marketAddress: key, marketReserves: new Map(), loadedAt: Date.now() - 20_000 },
     pubkeys: [key], streamSnapshot: { pubkey: key, accountData: Buffer.alloc(3344), slot: 1n, receivedAt: Date.now() } };
   const results = await Promise.all([refreshTrackedObligations(params), refreshTrackedObligations(params)]);
-  assert.equal(loads, 1);
-  assert.ok(results.every(result => result.market === market));
+  assert.equal(loads, 0);
+  assert.ok(results.every(result => result.market === oldMarket));
 });
 
 test("single-account hydration does not schedule the old 500ms trailing sleep", async (t) => {
@@ -72,4 +72,35 @@ test("a missing slot block time is not cached permanently", async () => {
   await assert.rejects(ledgerInstantAtSlot(rpc,5n));
   assert.deepEqual(await ledgerInstantAtSlot(rpc,5n),{slot:5n,blockTime:100n});
   assert.equal(calls,2);
+});
+
+test("oracle rail revalues cached account bytes with prices applied to the hydration market", async (t) => {
+  let applied = false, decoded = false;
+  const market = {getAddress:()=>key,getReserves:()=>[],state:{liquidationMaxDebtCloseFactorPct:10}} as unknown as KaminoMarket;
+  const rpc = {} as Rpc<SolanaRpcApi>; // No RPC methods: a warm oracle evaluation must be local.
+  t.mock.method(KaminoObligation,"fromAccountData",(...[markets, pubkey, bytes, instant]: Parameters<typeof KaminoObligation.fromAccountData>)=>{
+    assert.equal(markets.get(key),market); assert.equal(applied,true); assert.equal(instant.slot,101n); decoded=true;
+    return {obligationTag:1,obligationAddress:key} as KaminoObligation;
+  });
+  const preloaded={market,marketAddress:key,marketReserves:new Map(),loadedAt:Date.now()};
+  const snapshots=new Map([[key,{pubkey:key,slot:100n,receivedAt:Date.now()-2000,accountData:Buffer.alloc(3344)}]]);
+  await refreshTrackedObligations({rpc,preloaded,pubkeys:[key],snapshots,oracleTrigger:{pubkey:key,slot:101n,receivedAt:Date.now()},
+    applyOraclePrices:(actual)=>{assert.equal(actual,market);applied=true;return true;}});
+  assert.equal(decoded,true);
+});
+
+test("oracle bursts never fetch missing accounts or stale market snapshots", async (t) => {
+  const market = {getAddress:()=>key,getReserves:()=>[],state:{liquidationMaxDebtCloseFactorPct:10}} as unknown as KaminoMarket;
+  let rpcCalls = 0;
+  const rpc = new Proxy({}, {get:()=>{rpcCalls++;throw new Error("oracle event attempted RPC");}}) as Rpc<SolanaRpcApi>;
+  t.mock.method(KaminoMarket, "load", async () => {rpcCalls++;throw new Error("oracle event reloaded market");});
+  for (const marketAge of [0,120_000]) {
+    const preloaded={market,marketAddress:key,marketReserves:new Map(),loadedAt:Date.now()-marketAge};
+    for (let i=0;i<100;i++) {
+      const result=await refreshTrackedObligations({rpc,preloaded,pubkeys:[key],snapshots:new Map(),
+        oracleTrigger:{pubkey:key,slot:101n,receivedAt:Date.now()},applyOraclePrices:()=>true});
+      assert.equal(result.candidates.length,0);
+    }
+  }
+  assert.equal(rpcCalls,0);
 });

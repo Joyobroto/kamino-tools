@@ -32,7 +32,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Fetches the RAW Jupiter quote (JSON as returned — bigint-free, reusable for /swap-instructions). */
 export async function fetchRawQuote(
-  input: { inputMint: string; outputMint: string; amount: string; slippageBps: number; onlyDirectRoutes?: boolean },
+  input: { inputMint: string; outputMint: string; amount: string; slippageBps: number; onlyDirectRoutes?: boolean; maxAccounts?: number; signal?: AbortSignal; onDiagnostic?: (message: string) => void },
   fetchImpl?: typeof fetch,
 ): Promise<RawQuote | null> {
   const impl = fetchImpl ?? fetch;
@@ -43,11 +43,16 @@ export async function fetchRawQuote(
     slippageBps: String(input.slippageBps),
   });
   if (input.onlyDirectRoutes) params.set("onlyDirectRoutes", "true");
+  if (input.maxAccounts) params.set("maxAccounts", String(input.maxAccounts));
   for (let attempt = 1; attempt <= 4; attempt += 1) {
-    const response = await impl(`${QUOTE_URL}?${params}`, { headers: { Accept: "application/json" } }).catch(() => null);
+    if (input.signal?.aborted) { input.onDiagnostic?.("deadline exceeded"); return null; }
+    const response = await impl(`${QUOTE_URL}?${params}`, { headers: { Accept: "application/json" }, signal: input.signal ?? null }).catch(() => null);
+    if (response && !response.ok) input.onDiagnostic?.(`HTTP ${response.status}`);
+    if (!response) input.onDiagnostic?.(input.signal?.aborted ? "deadline exceeded" : "network failure");
     if (!response) continue;
     if (response.status === 400) return null; // unquotable
     if (response.status === 429) {
+      if (input.signal) return null;
       await sleep(1_500 * attempt);
       continue;
     }
@@ -84,14 +89,16 @@ export async function fetchSwapInstructions(
   quoteResponse: unknown,
   userPublicKey: string,
   fetchImpl?: typeof fetch,
+  options: { signal?: AbortSignal; onDiagnostic?: (message: string) => void } = {},
 ): Promise<JupSwapPlan | null> {
   const impl = fetchImpl ?? fetch;
   const response = await impl(SWAP_INSTRUCTIONS_URL, {
+    signal: options.signal ?? null,
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: false, dynamicSlippage: false }),
   }).catch(() => null);
-  if (!response || !response.ok) return null;
+  if (!response || !response.ok) { options.onDiagnostic?.(response ? `HTTP ${response.status}` : options.signal?.aborted ? "deadline exceeded" : "network failure"); return null; }
   const payload = (await response.json().catch(() => null)) as {
     swapInstruction?: JupSwapInstruction;
     setupInstructions?: JupSwapInstruction[];

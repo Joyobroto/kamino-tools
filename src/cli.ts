@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { getClmmQuoter } from "./strategies/liquidation/clmm.js";
+import { writeHeartbeat } from "./strategies/liquidation/health.js";
 import { createTaskQueue } from "./strategies/liquidation/pipeline.js";
 import { config as loadEnv } from "dotenv";
 import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
@@ -27,9 +29,11 @@ import {
 } from "./kamino.js";
 import { instructionSummary, loadStrategy, externalInstructionsToStrategy } from "./strategy.js";
 import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, sendAndConfirmPoll, simulate, transactionReceipt } from "./transaction.js";
-import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket } from "./strategies/liquidation/screener.js";
+import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket, type StreamAccountSnapshot } from "./strategies/liquidation/screener.js";
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
+import { senderConfigFromEnv, warmSenderConnection } from "./strategies/liquidation/sender.js";
+import { broadcastLiquidation } from "./strategies/liquidation/execution-lane.js";
 import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
 import { altTableAddresses, buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
 import { deactivateLookupTableIx, closeLookupTableIx } from "@kamino-finance/klend-sdk";
@@ -56,6 +60,7 @@ import {
 import { DEFAULT_AUTOFIRE_OPTIONS, evaluateFireGuards, loadLedger, logLedgerEntry, type AutofireOptions } from "./strategies/arb/autofire.js";
 import { failoverHealth } from "./rpc-failover.js";
 import { resolveVetoFate } from "./strategies/liquidation/veto-forensics.js";
+import { OracleFeedCache, marketOracleFeeds, subscribeOracleFeeds } from "./strategies/liquidation/oracle-realtime.js";
 import { planLstArb, fetchSwapInstructions, applySlippage } from "./strategies/arb/lst-arb.js";
 import {
   centerBlock,
@@ -121,6 +126,11 @@ interface ScanOptions {
   priorityMode: string;
   raceTolerance: string;
   ws?: string;
+  sender: boolean;
+  senderEndpoint: string;
+  senderMaxPrize: string;
+  senderMaxTipFraction: string;
+  senderMaxTipCapSol: string;
 }
 
 function validateScanConfig(config: LiquidationScanConfig): void {
@@ -635,6 +645,11 @@ program
   .option("--priority-mode <mode>", "FASTLANE priority fee: off | fixed | auto (auto scales the bid with the prize, capped at 2% of worst-case profit)", "auto")
   .option("--ws <url>", "WebSocket endpoint for real-time obligation deltas (default: derived from --rpc)", "")
   .option("--race-tolerance <ratio>", "health band ABOVE 1.0 still routed into the pipeline (sim arbitrates) — how aggressively to race marginal positions (default 0.02)", "0.02")
+  .option("--sender-endpoint <url>", "Helius Sender execution endpoint (execution-only; scanning/oracle keep --rpc)", process.env.HELIUS_SENDER_ENDPOINT || process.env.LIQ_SENDER_ENDPOINT || "")
+  .option("--no-sender", "disable Helius Sender and broadcast directly on --rpc")
+  .option("--sender-max-prize <usd>", "prize at/above which Sender Max is used (below it: SWQOS-only)", process.env.LIQ_SENDER_MAX_PRIZE_USD || "5")
+  .option("--sender-max-tip-fraction <n>", "cap the Sender tip at this fraction of the prize", process.env.LIQ_SENDER_MAX_TIP_FRACTION || "0.01")
+  .option("--sender-max-tip-cap-sol <sol>", "absolute Sender Max tip cap per fire, SOL", process.env.LIQ_SENDER_MAX_TIP_CAP_SOL || "0.02")
   .action(async (options: ScanOptions) => {
     const scanConfig: LiquidationScanConfig = {
       minDebtUsd: Number(options.minDebt),
@@ -672,6 +687,20 @@ program
     let executeMarket = options.execute ? (preloaded?.market ?? await loadMarket(scanRpc, options.market)) : undefined;
     const executorAltState = loadAltState();
     const executorAltTables = altTableAddresses(executorAltState);
+    // Helius Sender execution lane: env-driven, CLI-overridable. Only the
+    // BROADCAST rides Sender — blockhash, oracle, scan, and confirmation stay on
+    // the existing data RPC (options.rpc).
+    const senderConfig = senderConfigFromEnv(process.env, {
+      endpoint: options.senderEndpoint,
+      maxPrizeUsd: Number(options.senderMaxPrize),
+      maxTipFraction: Number(options.senderMaxTipFraction),
+      maxTipCapSol: Number(options.senderMaxTipCapSol),
+      minProfitUsd: Number(options.minProfit),
+      ...(options.sender === false ? { enabled: false } : {}),
+    });
+    if (options.execute && options.broadcast) {
+      console.log(color.dim(`execution lane: ${senderConfig.enabled ? `Helius Sender (${senderConfig.endpoint}, Max ≥ $${senderConfig.maxPrizeUsd})` : "direct RPC (--no-sender)"}`));
+    }
     // Warm the fire path BEFORE the first fire: blockhash + every chained ALT
     // contents are fetched in the background so the first DUE never eats the
     // cold-fetch round-trips on the critical path (ALT contents ~80-100ms each;
@@ -682,6 +711,7 @@ program
         warmBlockhash(scanRpc, options.rpc);
         warmScopeConfigurations(scanRpc);
         warmAltTables(options.rpc, executorAltTables);
+        if (senderConfig.enabled) void warmSenderConnection(senderConfig.endpoint);
       };
       warmExecution();
       if (options.watch) setInterval(warmExecution, 20_000).unref();
@@ -774,7 +804,72 @@ program
     const EXECUTOR_RACE_RETRY_MS = 5_000;
     const EXECUTOR_RACE_RETRY_WINDOW_MS = 120_000;
     const executorStillDue = new Map<string, number>(); // obligation → last WS-seen-DUE timestamp
-    const executeDue = (obligation: string, opts: { bypassHealth?: boolean; rail?: "ws" | "scan" | "hot"; streamSnapshot?: import("./strategies/liquidation/screener.js").StreamAccountSnapshot; prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>; preparedAt?: number } = {}): void => {
+    // ── Watchboard: live per-obligation status board across ALL rails ──
+    // Declared BEFORE executeDue/the scan loop: boardUpdate is called from the
+    // very first scan cycle (and from WS slices), so a later `const` would hit
+    // the temporal dead zone and crash the scanner ("Cannot access
+    // 'boardUpdate' before initialization").
+    interface WatchboardRow {
+      obligation: string;
+      health: number;
+      healthAt: number;
+      healthSource: "scan" | "hot" | "ws" | "executor";
+      lastSeen: number;
+      debtSymbol: string;
+      debtUsd: number;
+      prizeUsd: number;
+      status: "WATCH" | "UNHEALTHY" | "EXECUTOR" | "FIRED" | "LOST" | "HEALED";
+      statusSince: number;
+      executedBy?: string;
+    }
+    const watchboard = new Map<string, WatchboardRow>();
+    const WATCHBOARD_TTL_MS = 15 * 60_000;
+    const boardUpdate = (obligation: string, patch: Partial<WatchboardRow> & { health?: number }): void => {
+      const existing = watchboard.get(obligation);
+      const status = patch.status ?? existing?.status ?? "WATCH";
+      const hasHealth = patch.health !== undefined;
+      const row: WatchboardRow = {
+        obligation,
+        health: patch.health ?? existing?.health ?? Number.NaN,
+        healthAt: hasHealth ? (patch.healthAt ?? Date.now()) : (existing?.healthAt ?? 0),
+        healthSource: hasHealth ? (patch.healthSource ?? "scan") : (existing?.healthSource ?? "scan"),
+        lastSeen: Date.now(),
+        debtSymbol: patch.debtSymbol ?? existing?.debtSymbol ?? "?",
+        debtUsd: patch.debtUsd ?? existing?.debtUsd ?? 0,
+        prizeUsd: patch.prizeUsd ?? existing?.prizeUsd ?? 0,
+        status,
+        statusSince: status !== existing?.status ? Date.now() : (existing?.statusSince ?? Date.now()),
+        ...(patch.executedBy ? { executedBy: patch.executedBy } : (existing?.executedBy ? { executedBy: existing.executedBy } : {})),
+      };
+      watchboard.set(obligation, row);
+      // Ticker: only ACTIONABLE transitions print a line — entering the board as
+      // WATCH is silent (the panel lists the cohort every cycle; a restart's
+      // first scan would otherwise dump 50 ◆ WATCH lines). The operator sees:
+      // UNHEALTHY → EXECUTOR → FIRED/LOST, and HEALED only when it mattered
+      // (was in the DUE tier, recovered — not routine band churn).
+      if (!options.json && status !== existing?.status) {
+        const actionable = status === "UNHEALTHY" || status === "EXECUTOR" || status === "FIRED" || status === "LOST"
+          || (status === "HEALED" && (existing?.status === "UNHEALTHY" || existing?.status === "EXECUTOR" || existing?.status === "LOST"));
+        if (actionable) {
+          const label = {
+            WATCH: color.yellow("◆ WATCH"),
+            UNHEALTHY: color.bold(color.red("⚡ UNHEALTHY")),
+            EXECUTOR: color.bold(color.magenta("▶ EXECUTOR")),
+            FIRED: color.bold(color.green("✅ FIRED")),
+            LOST: color.bold(color.red("✗ LOST")),
+            HEALED: color.green("↑ HEALED"),
+          }[status];
+          const prize = row.prizeUsd > 0 ? `  $${row.prizeUsd.toFixed(2)} prize` : "";
+          const winner = row.executedBy ? color.dim(`  (by ${row.executedBy.slice(0, 8)}…)`) : "";
+          console.log(
+            `${label} ${color.cyan(shortAddress(obligation))}` +
+              `  health ${Number.isFinite(row.health) ? row.health.toFixed(4) : "?"}${prize}` +
+              `  ${row.debtUsd > 0 ? `${row.debtUsd.toFixed(0)} ${row.debtSymbol}` : ""}${winner}`,
+          );
+        }
+      }
+    };
+    const executeDue = (obligation: string, opts: { bypassHealth?: boolean; rail?: "ws" | "scan" | "hot" | "oracle"; oracleTrigger?: StreamAccountSnapshot; streamSnapshot?: import("./strategies/liquidation/screener.js").StreamAccountSnapshot; prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>; preparedAt?: number } = {}): void => {
       const triggeredAtMs = Date.now();
       executorStats.dueTriggers++;
       const rail = opts.rail ?? "scan";
@@ -826,6 +921,10 @@ program
             obligation,
             reason,
             outcome: fate.outcome,
+            ...(fate.slot !== undefined && opts.streamSnapshot?.slot !== undefined ? {
+              triggerSlot: opts.streamSnapshot.slot.toString(),
+              postLiquidationNotification: BigInt(fate.slot) <= opts.streamSnapshot.slot,
+            } : {}),
             ...(fate.winner ? { winner: fate.winner } : {}),
             ...(fate.winnerSignature ? { winnerSignature: fate.winnerSignature } : {}),
             ...(fate.feePayer ? { feePayer: fate.feePayer } : {}),
@@ -881,7 +980,7 @@ program
           // roundtrip was pure added latency (the 2026-09-09 winners' failed-tx
           // spam shows they fire with NO pre-check at all). Scan/hot rails keep
           // the full gate below (they arrive with fresh candidates anyway).
-          const raceRail = rail === "ws";
+          const raceRail = rail === "ws" || rail === "oracle";
           {
             // Both rails hydrate for prize/debt metadata — with bounded retries
             // and NO swallowed errors (a swallowed RPC error used to morph into
@@ -889,7 +988,7 @@ program
             // in that health is never gated afterwards — sim arbitrates.
             for (let tryIndex = 0; tryIndex < 3 && !hydrated.candidates.length; tryIndex++) {
               try {
-                hydrated = await refreshTrackedObligations({ rpc: scanRpc, preloaded: preloaded!, pubkeys: [address(obligation)], ...(opts.streamSnapshot ? { streamSnapshot: opts.streamSnapshot } : {}) });
+                hydrated = await refreshTrackedObligations({ rpc: scanRpc, preloaded: preloaded!, pubkeys: [address(obligation)], applyOraclePrices: (market) => oracleCache.refreshMarket(market), ...(opts.streamSnapshot ? { streamSnapshot: opts.streamSnapshot } : {}) });
               } catch {
                 if (tryIndex === 2) {
                   // Race rail: RPC hiccup must NOT end the attempt — re-arm via
@@ -975,9 +1074,10 @@ program
               ...(executorAltTables.length ? { lookupTableAddresses: executorAltTables.map(address) } : {}),
               ...(options.fast ? { fast: true } : {}),
               // Every automatic attempt must pass simulation before broadcast.
-              ...(raceRail ? { healthGateTolerance: 1.5 } : marginalBand ? { healthGateTolerance: HEALTH_GATE_TOLERANCE } : {}),
+              ...(raceRail ? { healthGateTolerance: HEALTH_GATE_TOLERANCE } : marginalBand ? { healthGateTolerance: HEALTH_GATE_TOLERANCE } : {}),
               ...(hydrated.obligations.get(obligation) ? { prehydratedObligation: hydrated.obligations.get(obligation) as KaminoObligation } : {}),
               ...({ priorityMode: (["off", "fixed", "auto"] as const).includes(options.priorityMode as never) ? (options.priorityMode as "off" | "fixed" | "auto") : "auto", prizeUsd, bypassHealth: opts.bypassHealth ?? false }),
+              sender: senderConfig,
             }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
           const hydrateMs = Date.now() - hydrationStartedAt;
           const queueMs = hydrationStartedAt - triggeredAtMs;
@@ -995,8 +1095,13 @@ program
               at: new Date().toISOString(), type: "skipped", obligation, stage: outcome.stage,
               reason: outcome.reason.slice(0, 2000), rail,
               ...(opts.streamSnapshot?.slot !== undefined ? { triggerSlot: opts.streamSnapshot.slot.toString() } : {}),
+              ...(opts.oracleTrigger ? { oracleSlot: opts.oracleTrigger.slot?.toString(), oracleReceivedAt: opts.oracleTrigger.receivedAt,
+                oracleToTriggerMs: triggeredAtMs - (opts.oracleTrigger.receivedAt ?? triggeredAtMs) } : {}),
+              oracleSnapshotAgeMs: oracleCache.snapshotAgeMs,
               triggeredAt: new Date(triggeredAtMs).toISOString(), latencyMsTotal: Date.now() - triggeredAtMs,
               ...("timings" in outcome && outcome.timings ? { timingsMs: outcome.timings } : {}),
+              ...("routeDiagnostics" in outcome && outcome.routeDiagnostics ? { routeDiagnostics: outcome.routeDiagnostics } : {}),
+              ...("simulationSlot" in outcome && outcome.simulationSlot !== undefined ? { simulationSlot: outcome.simulationSlot } : {}),
               simulationPerformed: "timings" in outcome && outcome.timings ? outcome.timings.simulate !== undefined : false,
               ...("logs" in outcome ? { simulationLogs: outcome.logs.slice(-40) } : {}),
             });
@@ -1044,7 +1149,7 @@ program
               executorFailStreak.delete(obligation);
               if (raceRail) {
                 executorStillDue.set(obligation, Date.now());
-                executorRecentlyTried.delete(obligation); // cooldown lookup uses stillDue window anyway
+                // Retain the attempt time so repeated feed updates respect the 5s retry floor.
                 if (!options.json) console.log(color.yellow(`[${localTimestamp(new Date().toISOString())}] race ✗ ${obligation.slice(0, 8)}… sim says healthy — fast-retry armed (5s) while WS keeps it DUE`));
                 return;
               }
@@ -1068,17 +1173,14 @@ program
               return;
             }
             // No-route: Jupiter couldn't quote — back off 10 minutes, don't spam.
-            if (/unquotable|No routes|unavailable/i.test(outcome.reason)) {
-              executorNoRouteUntil.set(obligation, Date.now() + NO_ROUTE_COOLDOWN_MS);
+            if (/unquotable|No routes|unavailable|6024|6035|packet|deadline|worst-case/i.test(outcome.reason)) {
+              executorFailStreak.delete(obligation);
+              executorRecentlyTried.delete(obligation);
+              executorNoRouteUntil.set(obligation, Date.now() + 3_000);
               return;
             }
-            // Structural failures: after a streak, blocklist so it never burns budget again.
-            const streak = (executorFailStreak.get(obligation) ?? 0) + 1;
-            executorFailStreak.set(obligation, streak);
-            if (streak >= BLOCKLIST_AFTER) {
-              executorBlocklist.add(obligation);
-              logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "blocked", obligation, reason: `blocklisted after ${streak} structural failures` });
-            }
+            executorRecentlyTried.delete(obligation);
+            executorNoRouteUntil.set(obligation, Date.now() + 5_000);
             return;
           }
           const line = {
@@ -1087,10 +1189,12 @@ program
             withdraw: outcome.plan.withdrawReserveSymbol,
             quoted: outcome.plan.quotedProfitUsd.toFixed(4),
             worst: outcome.plan.worstCaseProfitUsd.toFixed(4),
+            ...(outcome.plan.netWorstCaseProfitUsd !== undefined
+              ? { net: outcome.plan.netWorstCaseProfitUsd.toFixed(4), cost: outcome.plan.senderCostUsd?.toFixed(4) } : {}),
             ...(outcome.plan.swapSource ? { swap: outcome.plan.swapSource } : {}),
           };
           if (options.json) console.log(safeJsonStringify({ executable: { ...line, shadow: !options.broadcast } }));
-          else console.log(color.bold(color.green(`⚡ EXECUTABLE ${obligation.slice(0, 8)}…`)) + `  repay ${line.repay} → ${line.withdraw}  quoted $${line.quoted} worst $${line.worst}  swap ${line.swap ?? "?"}  ${options.broadcast ? "FIRING" : "SHADOW"}`);
+          else console.log(color.bold(color.green(`⚡ EXECUTABLE ${obligation.slice(0, 8)}…`)) + `  repay ${line.repay} → ${line.withdraw}  gross $${line.quoted}/$${line.worst}${line.net ? `  net $${line.net} (send cost $${line.cost})` : ""}  swap ${line.swap ?? "?"}  ${options.broadcast ? "FIRING" : "SHADOW"}`);
           alerter.push(dueAttemptAlert({
             obligation: obligation.slice(0, 12),
             health: outcome.plan.healthFactor,
@@ -1109,18 +1213,20 @@ program
             ...(opts.streamSnapshot?.slot !== undefined ? { triggerSlot: opts.streamSnapshot.slot.toString() } : {}),
             timingsMs: outcome.timings, simulationPerformed: true,
             quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd,
+            ...(outcome.sender ? { senderTier: outcome.sender.tier, senderTipLamports: outcome.sender.tipLamports.toString(), senderCostUsd: outcome.sender.estimatedCostUsd } : {}),
+            ...(outcome.plan.netWorstCaseProfitUsd !== undefined ? { netWorstCaseProfitUsd: outcome.plan.netWorstCaseProfitUsd } : {}),
           });
           if (!options.broadcast) {
             logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "skipped", obligation, reason: "shadow — executable play not broadcast", quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd });
             return;
           }
-          const attemptedSignature = getSignatureFromTransaction(outcome.transaction as Parameters<typeof sendAndConfirm>[2]);
+          const attemptedSignature = getSignatureFromTransaction(outcome.transaction);
           // Budget estimate remains explicitly separate from the measured lamport fee.
           const lossUsdEstimate = 0.0011 + outcome.tipUsd;
-          const signature = await sendAndConfirm(options.rpc, scanRpc, outcome.transaction as Parameters<typeof sendAndConfirm>[2]).catch(async (error: unknown) => {
+          const signature = await broadcastLiquidation({ outcome, dataRpc: scanRpc, dataRpcUrl: options.rpc, sender: senderConfig }).catch(async (error: unknown) => {
             const failReason = error instanceof Error ? error.message : "unknown";
             const receipt = await transactionReceipt(scanRpc, attemptedSignature);
-            logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature: attemptedSignature, ...receipt, reason: `broadcast failed: ${failReason.slice(0, 100)}`, lossUsdEstimate });
+            logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature: attemptedSignature, ...receipt, reason: `broadcast failed: ${failReason.slice(0, 100)}`, lossUsdEstimate, ...(outcome.sender ? { senderTier: outcome.sender.tier, senderTipLamports: outcome.sender.tipLamports.toString(), senderCostUsd: outcome.sender.estimatedCostUsd } : {}) });
             console.log(color.red(`✗ broadcast failed: ${failReason}`));
             executorStats.lastFailure = `broadcast: ${failReason.slice(0, 160)}`;
             alerter.push(liquidationFailedAlert({ obligation: obligation.slice(0, 12), stage: "broadcast", reason: failReason.slice(0, 300) }));
@@ -1131,7 +1237,7 @@ program
           boardUpdate(obligation, { status: "FIRED", prizeUsd: outcome.plan.worstCaseProfitUsd });
           console.log(color.bold(color.green(`✅ FIRED ${obligation.slice(0, 8)}…`)) + `  ${color.white(`https://solscan.io/tx/${signature}`)}`);
           const receipt = await transactionReceipt(scanRpc, signature);
-          logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature, ...receipt, quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd, lossUsdEstimate });
+          logLedgerEntry(executorAutoOptions.ledgerPath, { at: new Date().toISOString(), type: "fired", obligation, signature, ...receipt, quotedProfitUsd: outcome.plan.quotedProfitUsd, worstCaseProfitUsd: outcome.plan.worstCaseProfitUsd, lossUsdEstimate, ...(outcome.sender ? { senderTier: outcome.sender.tier, senderTipLamports: outcome.sender.tipLamports.toString(), senderCostUsd: outcome.sender.estimatedCostUsd } : {}) });
           alerter.push(liquidationQuoteAlert({ signature, quotedUsd: outcome.plan.quotedProfitUsd, worstUsd: outcome.plan.worstCaseProfitUsd }));
         } finally {
           executorBusy.delete(obligation);
@@ -1139,19 +1245,19 @@ program
       });
     };
 
-    const emitTrackerEvents = (events: TrackerEvent[], prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>, preparedAt?: number) => {
+    const emitTrackerEvents = (events: TrackerEvent[], prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>, preparedAt?: number, oracleTrigger?: StreamAccountSnapshot) => {
       for (const event of events) {
         if (event.type === "spotted") {
           log?.({ type: "spotted", at: event.at, candidate: event.candidate });
           console.log(`${color.bold(color.red("⚡ DUE"))} ${printCandidateLine(event.candidate, "")}`);
           executeDue(event.candidate.obligation, prepared ? {
-            rail: "hot", prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
+            rail: oracleTrigger ? "oracle" : "hot", ...(oracleTrigger ? { oracleTrigger } : {}), prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
           } : {});
         } else if (event.type === "promoted") {
           log?.({ type: "promoted", at: event.at, candidate: event.candidate, fromHealth: event.fromHealth });
           console.log(`${color.bold(color.red("⚡ PROMOTED→DUE"))} ${printCandidateLine(event.candidate, color.yellow(`(was ${event.fromHealth.toFixed(4)})`))}`);
           executeDue(event.candidate.obligation, prepared ? {
-            rail: "hot", prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
+            rail: oracleTrigger ? "oracle" : "hot", ...(oracleTrigger ? { oracleTrigger } : {}), prepared: { ...prepared, candidates: [event.candidate] }, preparedAt: preparedAt!,
           } : {});
         } else if (event.type === "watching") {
           // Near-miss entries below the watch band — no console chatter (the cycle
@@ -1175,15 +1281,35 @@ program
       }
     };
 
+    const snapshots = new Map<string, StreamAccountSnapshot>();
+    // Evict rows that went quiet (healed far above the band / closed) so the
+    // board stays a live cohort, not a growing archive. Declared before the
+    // scan loop that calls it.
+    const boardSweep = (): void => {
+      for (const [obligation, row] of [...watchboard.entries()]) {
+        if (Date.now() - row.lastSeen > WATCHBOARD_TTL_MS) { watchboard.delete(obligation); snapshots.delete(obligation); }
+      }
+    };
+    let lastScanCompletedAt = Date.now();
+    let lastHotCompletedAt = Date.now();
+    let oracleLive = false;
+    let lastOracleTrigger: StreamAccountSnapshot | undefined;
+    // Oracle-first observability: how many tracked positions were revalued from
+    // the oracle tick (and how many came out DUE) — the numbers the race audit
+    // needs to prove the oracle rail fires BEFORE the obligation mutation.
+    let lastOracleRevalue: { revalued: number; due: number; at: number } | undefined;
+    let pendingOracle = false;
     let adaptiveBand = scanConfig.healthWatch;
     let surgeActive = false;
     let hotTickRunning = false;
+    let nextHotRpcAt = 0;
 
-    const hotTick = async () => {
+    const hotTick = async (oracleTrigger?: StreamAccountSnapshot) => {
       // Never overlap: while one hot tick is mid-backoff (the shared key throttled), a
       // second tick starting at its 10s cadence would spawn a parallel RPC chain and
       // double the load — serially re-arm only after the previous tick settled.
-      if (hotTickRunning) return;
+      if (hotTickRunning) { if (oracleTrigger) pendingOracle = true; return; }
+      if (!oracleTrigger && Date.now() < nextHotRpcAt) return;
       hotTickRunning = true;
       try {
         if (!preloaded) return;
@@ -1193,9 +1319,17 @@ program
           rpc: scanRpc,
           preloaded,
           pubkeys: hotAddresses.map((value) => address(value)),
+          snapshots,
+          ...(oracleTrigger ? { oracleTrigger } : {}),
+          applyOraclePrices: (market) => oracleCache.refreshMarket(market),
         });
         // Watchboard ingest: hot-tick refreshes carry the freshest per-position
         // health of the tracked cohort — update rows without changing status.
+        if (oracleTrigger) lastOracleRevalue = {
+          revalued: updates.candidates.length,
+          due: updates.candidates.filter((candidate) => candidate.healthFactor < 1).length,
+          at: Date.now(),
+        };
         for (const candidate of updates.candidates) {
           boardUpdate(candidate.obligation, {
             health: candidate.healthFactor,
@@ -1206,12 +1340,106 @@ program
             ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
           });
         }
-        const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString());
-        if (events.length) emitTrackerEvents(events, updates, Date.now());
+        const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString(), !oracleTrigger);
+        if (events.length) emitTrackerEvents(events, updates, Date.now(), oracleTrigger);
+        // A still-DUE position needs a new attempt after a transient failure,
+        // even if it never crossed back above one. Cooldown/busy guards bound this.
+        const emitted = new Set(events.filter((event) => event.type === "promoted" || event.type === "spotted")
+          .map((event) => event.candidate.obligation));
+        for (const candidate of updates.candidates) {
+          if (candidate.healthFactor < 1 && !emitted.has(candidate.obligation)) executeDue(candidate.obligation, {
+            rail: oracleTrigger ? "oracle" : "hot", ...(oracleTrigger ? { oracleTrigger } : {}),
+            prepared: { ...updates, candidates: [candidate] }, preparedAt: Date.now(),
+          });
+        }
+        lastHotCompletedAt = Date.now();
+      } catch (error) {
+        if (!oracleTrigger) nextHotRpcAt = Date.now() + 30_000;
+        throw error;
       } finally {
+        if (!oracleTrigger) nextHotRpcAt = Math.max(nextHotRpcAt, Date.now() + hotIntervalMs);
         hotTickRunning = false;
+        if (pendingOracle) {
+          pendingOracle = false;
+          setTimeout(() => { void hotTick(lastOracleTrigger).catch(printError); }, 100);
+        }
       }
     };
+
+    // Oracle-driven invalidation: account WS notifications update a process
+    // memory cache and coalesce a targeted hot refresh. The cache is not used
+    // as an unverified price source; simulation and the transaction's oracle
+    // refresh remain the final authority before broadcast.
+    let oracleRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    const oracleBenchmarkEnabled = process.env.ORACLE_BENCHMARK === "1";
+    let oracleUpdateAt = 0;
+    let oracleUpdateCount = 0;
+    let oracleMetricAt = 0;
+    const oracleCache = new OracleFeedCache();
+    if (options.watch && executeMarket) {
+      const oracleFeeds = marketOracleFeeds(executeMarket);
+      const oracleFeedWsUrl = options.ws || options.rpc.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+      const oracleFallbackWsUrl = (process.env.SOLANA_RPC_FALLBACK ?? "").replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+      await oracleCache.prime(scanRpc, executeMarket).catch((error: unknown) => {
+        if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] oracle cache prime failed: ${error instanceof Error ? error.message : String(error)}`));
+      });
+      const oracleWs = await subscribeOracleFeeds({
+        wsUrl: oracleFeedWsUrl,
+        ...(!options.ws ? { wsCandidates: [oracleFeedWsUrl, oracleFallbackWsUrl, "wss://api.mainnet-beta.solana.com"].filter(Boolean) } : {}),
+        feeds: oracleFeeds,
+        cache: oracleCache,
+        onReady: async (endpoint) => {
+          await oracleCache.prime(scanRpc, executeMarket!);
+          oracleLive = true;
+          const safeEndpoint = endpoint.replace(/\?.*$/, "");
+          if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] oracle feeds live (${oracleFeeds.length}) ${safeEndpoint}`));
+        },
+        onError: (error) => {
+          oracleLive = false;
+          if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] oracle rail: ${error instanceof Error ? error.message : String(error)}`));
+        },
+        onUpdate: (update) => {
+          lastOracleTrigger = { pubkey: update.feed, ...(update.slot !== undefined ? { slot: update.slot } : {}), receivedAt: update.receivedAt };
+          if (oracleBenchmarkEnabled) {
+            oracleUpdateAt = Date.now();
+            oracleUpdateCount += 1;
+          }
+          if (hotTickRunning) { pendingOracle = true; return; }
+          if (oracleRefreshTimer) return;
+          // Several feeds update in the same slot. One coalesced refresh avoids
+          // multiplying RPC work while still reacting within one event loop turn.
+          oracleRefreshTimer = setTimeout(() => {
+            oracleRefreshTimer = undefined;
+            const hotStartedAt = oracleBenchmarkEnabled ? Date.now() : 0;
+            const hotRun = hotTick(lastOracleTrigger);
+            if (!oracleBenchmarkEnabled) {
+              void hotRun.catch((error: unknown) => printError(error));
+              return;
+            }
+            void hotRun
+              .then(() => {
+                const finishedAt = Date.now();
+                if (!options.json && finishedAt - oracleMetricAt >= 10_000) {
+                  oracleMetricAt = finishedAt;
+                  console.log(color.dim(
+                    `[${localTimestamp(new Date().toISOString())}] oracle benchmark: updates=${oracleUpdateCount} ` +
+                    `update->hot=${Math.max(0, hotStartedAt - oracleUpdateAt)}ms ` +
+                    `hot=${finishedAt - hotStartedAt}ms tracked=${tracker.hotObligations().length}` +
+                    `${lastOracleRevalue ? ` revalued=${lastOracleRevalue.revalued} due=${lastOracleRevalue.due}` : ""}`,
+                  ));
+                }
+              })
+              .catch((error: unknown) => printError(error));
+          }, 100);
+        },
+      });
+      void oracleWs.ready.catch(() => {});
+      setInterval(() => {
+        void oracleCache.prime(scanRpc, executeMarket!).catch((error: unknown) => {
+          console.warn(`oracle prime: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }, 10_000).unref();
+    }
 
     const printTrace = (cycle: number, result: ScanResult) => {
       if (!traceTargets.length) return;
@@ -1262,6 +1490,7 @@ program
         preloaded,
         effectiveHealthWatch: surgeActive ? adaptiveBand : undefined,
       });
+      lastScanCompletedAt = Date.now();
       log?.({ type: "snapshot", at: result.scannedAt, result });
       // Watchboard ingest: near-miss cohort enters as WATCH, DUE enters red.
       for (const candidate of result.nearMiss) {
@@ -1287,9 +1516,8 @@ program
       // Feed the hot tracker: full scan acts as ground truth for tracked DUE positions
       const absorbEvents = tracker.absorb([...result.liquidatable, ...result.nearMiss], result.scannedAt);
       if (absorbEvents.length) emitTrackerEvents(absorbEvents);
-      // Phase-3: keep the LOCAL CLMM quoter warm for every pair the DUE + near-miss
-      // cohorts actually reference (their largest-debt reserve + collateral reserves).
-      // Warm quotes are ~3-5ms local math — the fire path then skips Jupiter HTTP.
+      // Register observed pairs without issuing requests. Prewarming is a
+      // bounded, paced pass after this scan; fresh fire-path reads are on demand.
       if (executeMarket) {
         const { getClmmQuoter } = await import("./strategies/liquidation/clmm.js");
         const { PublicKey } = await import("@solana/web3.js");
@@ -1316,8 +1544,8 @@ program
         if (pairs.size) {
           const { getClmmQuoter } = await import("./strategies/liquidation/clmm.js");
           const quoter = getClmmQuoter(options.rpc);
-          void quoter.loadAllWarm().then((ok) => {
-            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] clmm quoter warm: ${ok}/${pairs.size} pairs`));
+          await quoter.loadAllWarm().then((ok) => {
+            if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] clmm prewarm: ${ok} refreshed (max 2 per scan; ${pairs.size} observed pairs)`));
           });
         }
       }
@@ -1488,83 +1716,6 @@ program
     let fullScanPromise: Promise<void> | null = null;
     let nextFullScan = 0;
     let nextHotTick = 0;
-    // ── Watchboard: live per-obligation status board across ALL rails ──
-    // Every observation (WS slice, hot tick, scan, executor verdict, veto
-    // resolution) updates one row per obligation. The board surfaces the
-    // transitions that matter for racing:
-    //   WATCH (yellow)  health 1.00–band — tracked, not actionable
-    //   UNHEALTHY (red) health < 1 → row goes RED and is passed to the EXECUTOR
-    //   EXECUTOR (magenta) in the verdict chain (plan/quote/simulate/broadcast)
-    //   FIRED/LOST/HEALED — outcome; a 10%-close-factor liquidation bounces the
-    //   position back above 1.0, so the same obligation re-enters WATCH with its
-    //   post-liquidation health (the "still on the board" effect).
-    interface WatchboardRow {
-      obligation: string;
-      health: number;
-      healthAt: number;
-      healthSource: "scan" | "hot" | "ws" | "executor";
-      lastSeen: number;
-      debtSymbol: string;
-      debtUsd: number;
-      prizeUsd: number;
-      status: "WATCH" | "UNHEALTHY" | "EXECUTOR" | "FIRED" | "LOST" | "HEALED";
-      statusSince: number;
-      executedBy?: string;
-    }
-    const watchboard = new Map<string, WatchboardRow>();
-    const WATCHBOARD_TTL_MS = 15 * 60_000;
-    const boardUpdate = (obligation: string, patch: Partial<WatchboardRow> & { health?: number }): void => {
-      const existing = watchboard.get(obligation);
-      const status = patch.status ?? existing?.status ?? "WATCH";
-      const hasHealth = patch.health !== undefined;
-      const row: WatchboardRow = {
-        obligation,
-        health: patch.health ?? existing?.health ?? Number.NaN,
-        healthAt: hasHealth ? (patch.healthAt ?? Date.now()) : (existing?.healthAt ?? 0),
-        healthSource: hasHealth ? (patch.healthSource ?? "scan") : (existing?.healthSource ?? "scan"),
-        lastSeen: Date.now(),
-        debtSymbol: patch.debtSymbol ?? existing?.debtSymbol ?? "?",
-        debtUsd: patch.debtUsd ?? existing?.debtUsd ?? 0,
-        prizeUsd: patch.prizeUsd ?? existing?.prizeUsd ?? 0,
-        status,
-        statusSince: status !== existing?.status ? Date.now() : (existing?.statusSince ?? Date.now()),
-        ...(patch.executedBy ? { executedBy: patch.executedBy } : (existing?.executedBy ? { executedBy: existing.executedBy } : {})),
-      };
-      watchboard.set(obligation, row);
-      // Ticker: only ACTIONABLE transitions print a line — entering the board as
-      // WATCH is silent (the panel lists the cohort every cycle; a restart's
-      // first scan would otherwise dump 50 ◆ WATCH lines). The operator sees:
-      // UNHEALTHY → EXECUTOR → FIRED/LOST, and HEALED only when it mattered
-      // (was in the DUE tier, recovered — not routine band churn).
-      if (!options.json && status !== existing?.status) {
-        const actionable = status === "UNHEALTHY" || status === "EXECUTOR" || status === "FIRED" || status === "LOST"
-          || (status === "HEALED" && (existing?.status === "UNHEALTHY" || existing?.status === "EXECUTOR" || existing?.status === "LOST"));
-        if (actionable) {
-          const label = {
-            WATCH: color.yellow("◆ WATCH"),
-            UNHEALTHY: color.bold(color.red("⚡ UNHEALTHY")),
-            EXECUTOR: color.bold(color.magenta("▶ EXECUTOR")),
-            FIRED: color.bold(color.green("✅ FIRED")),
-            LOST: color.bold(color.red("✗ LOST")),
-            HEALED: color.green("↑ HEALED"),
-          }[status];
-          const prize = row.prizeUsd > 0 ? `  $${row.prizeUsd.toFixed(2)} prize` : "";
-          const winner = row.executedBy ? color.dim(`  (by ${row.executedBy.slice(0, 8)}…)`) : "";
-          console.log(
-            `${label} ${color.cyan(shortAddress(obligation))}` +
-              `  health ${Number.isFinite(row.health) ? row.health.toFixed(4) : "?"}${prize}` +
-              `  ${row.debtUsd > 0 ? `${row.debtUsd.toFixed(0)} ${row.debtSymbol}` : ""}${winner}`,
-          );
-        }
-      }
-    };
-    // Evict rows that went quiet (healed far above the band / closed) so the
-    // board stays a live cohort, not a growing archive.
-    const boardSweep = (): void => {
-      for (const [obligation, row] of [...watchboard.entries()]) {
-        if (Date.now() - row.lastSeen > WATCHBOARD_TTL_MS) watchboard.delete(obligation);
-      }
-    };
     // ── Realtime detection rail: programNotifications on the obligation stream ──
     // WS deltas are the LOW-LATENCY path (per-account changes arrive within ~1 slot
     // vs the 10s hot loop / 60s full scan). A cached health < 1 here is a signal to
@@ -1591,6 +1742,9 @@ program
         marketAddress: options.market,
         onSlice: (slice) => {
           const obligation = slice.pubkey.toString();
+          const previous = snapshots.get(obligation);
+          if (previous?.slot !== undefined && slice.slot !== undefined && slice.slot < previous.slot) return;
+          if (watchboard.has(obligation) || slice.cachedHealth < 1.05) snapshots.set(obligation, slice);
           // Feed every tracked-band slice to the board (WATCH ↔ UNHEALTHY
           // transitions), not just the <1.0 triggers.
           const health = slice.cachedHealth;
@@ -1650,6 +1804,13 @@ program
         new Promise<void>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
       ]);
     }
+    setInterval(() => {
+      writeHeartbeat({ at: Date.now(), pid: process.pid, scanAt: lastScanCompletedAt,
+        hotAt: lastHotCompletedAt, oracleAt: oracleCache.lastUpdateAt, oracleLive,
+        oracleSnapshotAgeMs: oracleCache.snapshotAgeMs, wsLive: wsRailAlive(),
+        executorBusy: executorBusy.size, scanMaxAgeMs: Math.max(300_000, intervalMs * 3),
+      });
+    }, 10_000).unref();
     while (true) {
       const now = Date.now();
       if (now >= nextFullScan && !fullScanPromise) {
@@ -1764,18 +1925,19 @@ program
       return BigInt(typeof res.result === "number" ? res.result : 0);
     };
     const fetchDeactivationSlot = async (pubkey: string): Promise<bigint> => {
-      const info = (await fetchJson("getAccountInfo", [pubkey, { commitment: "finalized", encoding: "jsonParsed" }])) as {
-        result?: { value?: { data?: { parsed?: { info?: { deactivationSlot?: string | bigint | number } } } } };
+      // jsonParsed responses do not reliably expose the freshly written slot
+      // immediately after deactivate. The ALT state layout stores it at byte
+      // offset 4, so read the raw account data just as the inventory scan does.
+      const info = (await fetchJson("getAccountInfo", [pubkey, { commitment: "finalized", encoding: "base64" }])) as {
+        result?: { value?: { data?: [string, string] } };
       };
-      const raw = info.result?.value?.data?.parsed?.info?.deactivationSlot;
-      if (typeof raw === "bigint") return raw;
-      if (typeof raw === "number") return BigInt(raw);
-      if (typeof raw === "string") {
-        const n = Number(raw);
-        if (Number.isSafeInteger(n)) return BigInt(n);
-        return BigInt(raw);
+      const encoded = info.result?.value?.data?.[0];
+      if (!encoded) return 0xffffffffffffffffn;
+      try {
+        return Buffer.from(encoded, "base64").readBigUInt64LE(4);
+      } catch {
+        return 0xffffffffffffffffn;
       }
-      return 0xffffffffffffffffn;
     };
     for (const row of [...reclaimLuts]) {
       if (keep.has(row.pubkey)) continue;
@@ -1843,9 +2005,22 @@ program
     const reserves = market.getReserves().filter((reserve: KaminoReserve) => !wanted || wanted.has(reserve.getTokenSymbol().toUpperCase()));
     console.log(`reserves in scope (${reserves.length}): ${reserves.map((r: KaminoReserve) => r.getTokenSymbol()).join(", ")} (${mem()})`);
 
-    const reuseAlt = options.reuseAlt ? address(options.reuseAlt) : undefined;
-    const companionAlts = options.companionAlts?.split(",").map((s) => s.trim()).filter(Boolean).map((a) => address(a)) ?? [];
-    const existingKeys = reuseAlt ? await getAccountsInLut(rpc, reuseAlt) : undefined;
+    // Reuse the persisted tables by default. A plain `liq-setup` must be
+    // idempotent; creating another rent-locked LUT requires an explicit
+    // override or an empty state file.
+    const savedState = loadAltState();
+    const reuseAlt = options.reuseAlt
+      ? address(options.reuseAlt)
+      : savedState?.lookupTable
+        ? address(savedState.lookupTable)
+        : undefined;
+    const companionAlts = options.companionAlts
+      ? options.companionAlts.split(",").map((s) => s.trim()).filter(Boolean).map((a) => address(a))
+      : (savedState?.complements?.map((c) => address(c.lookupTable)) ?? []);
+    const tableAddresses = reuseAlt ? [reuseAlt, ...companionAlts] : [];
+    const tableKeys = await Promise.all(tableAddresses.map((table) => getAccountsInLut(rpc, table)));
+    const existingKeys = tableKeys.length ? tableKeys.flat() : undefined;
+    const existingTableKeyCounts = tableKeys.length ? tableKeys.map((keys) => keys.length) : undefined;
     const { transactions, lookupTable, keyCount, complements, kinds } = await buildLiquidationSetup({
       rpc,
       market,
@@ -1855,6 +2030,7 @@ program
       ...(reuseAlt ? { existingLookupTable: reuseAlt } : {}),
       ...(companionAlts.length ? { existingCompanionAlts: companionAlts } : {}),
       ...(existingKeys?.length ? { existingKeys: existingKeys.map((k: string) => address(k)) } : {}),
+      ...(existingTableKeyCounts ? { existingTableKeyCounts } : {}),
       skipAta: true,
     });
     console.log(`ALT ${lookupTable} will hold ${keyCount} keys${existingKeys?.length ? ` (${existingKeys.length} already present)` : ""} across ${transactions.length} transactions… (${mem()})`);
@@ -1907,6 +2083,9 @@ program
   .option("--min-profit <usd>", "minimum worst-case net profit in USD", "0.05")
   .option("--bypass-health", "skip the client-side health gate (E2E mechanics test — program still reverts if truly healthy)", false)
   .option("--yes", "broadcast the transaction after passing guards (default: shadow)", false)
+  .option("--sender-endpoint <url>", "Helius Sender execution endpoint (execution-only)", process.env.HELIUS_SENDER_ENDPOINT || process.env.LIQ_SENDER_ENDPOINT || "")
+  .option("--no-sender", "disable Helius Sender and broadcast directly on --rpc")
+  .option("--sender-max-prize <usd>", "prize at/above which Sender Max is used", process.env.LIQ_SENDER_MAX_PRIZE_USD || "5")
   .action(async (obligation: string, options: {
     rpc: string;
     market: string;
@@ -1914,10 +2093,19 @@ program
     minProfit: string;
     bypassHealth: boolean;
     yes: boolean;
+    sender: boolean;
+    senderEndpoint: string;
+    senderMaxPrize: string;
   }) => {
     const rpc = rpcClient(options.rpc);
     const market = await loadMarket(rpc, options.market);
     const altState = loadAltState();
+    const senderConfig = senderConfigFromEnv(process.env, {
+      endpoint: options.senderEndpoint,
+      maxPrizeUsd: Number(options.senderMaxPrize),
+      minProfitUsd: Number(options.minProfit),
+      ...(options.sender === false ? { enabled: false } : {}),
+    });
     const outcome = await executeLiquidationOnce({
       rpc,
       rpcUrl: options.rpc,
@@ -1927,6 +2115,7 @@ program
       minProfitUsd: Number(options.minProfit),
       ...(options.bypassHealth ? { bypassHealth: true } : {}),
       ...(altTableAddresses(altState).length ? { lookupTableAddresses: altTableAddresses(altState).map(address) } : {}),
+      sender: senderConfig,
     }).catch((error: unknown) => ({ stage: "assemble", passed: false, reason: error instanceof Error ? error.message : String(error) }) as const);
 
     if (!outcome.passed) {
@@ -1953,7 +2142,7 @@ program
       console.log(color.dim("shadow — pass --yes to broadcast"));
       return;
     }
-    const signature = await sendAndConfirm(options.rpc, rpc, outcome.transaction as Parameters<typeof sendAndConfirm>[2]);
+    const signature = await broadcastLiquidation({ outcome, dataRpc: rpc, dataRpcUrl: options.rpc, sender: senderConfig });
     console.log(color.green(`✅ FIRED ${signature}`));
   });
 

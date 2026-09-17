@@ -1,4 +1,4 @@
-import { address, type Address, type Instruction, type Rpc, type SolanaRpcApi, type TransactionSigner } from "@solana/kit";
+import { address, getBase64EncodedWireTransaction, type Address, type Instruction, type Rpc, type SolanaRpcApi, type TransactionSigner } from "@solana/kit";
 import { compressTransactionMessageUsingAddressLookupTables, appendTransactionMessageInstructions, createTransactionMessage, pipe, setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash, signTransactionMessageWithSigners } from "@solana/kit";
 
 /**
@@ -125,6 +125,35 @@ export function warmAltTables(rpcUrl: string, tables: Array<string>): void {
   for (const t of tables) void getCachedAltAddresses(rpcUrl, t).catch(() => {});
 }
 
+/** Avoid paying a 34-byte table header to compress just one 32-byte key.
+ * Prefer tables covering the most still-inline eligible accounts. */
+export function selectLookupTables(instructions: readonly Instruction[], payer: Address,
+  tables: Record<string, Address[]>) {
+  const excluded = new Set<string>([payer, ...instructions.map((ix) => ix.programAddress)]);
+  const eligible = new Set<string>();
+  for (const ix of instructions) for (const account of ix.accounts ?? []) {
+    if (account.role & 2) excluded.add(account.address);
+    eligible.add(account.address);
+  }
+  for (const key of excluded) eligible.delete(key);
+  const selected: Record<string, Address[]> = {};
+  const remaining = new Map(Object.entries(tables));
+  for (;;) {
+    let best: string | undefined;
+    let score = 1;
+    for (const [table, keys] of remaining) {
+      const count = new Set(keys.filter((key) => eligible.has(key))).size;
+      if (count > score) { best = table; score = count; }
+    }
+    if (!best) break;
+    const keys = remaining.get(best)!;
+    selected[best] = keys;
+    keys.forEach((key) => eligible.delete(key));
+    remaining.delete(best);
+  }
+  return { tables: selected, uncovered: [...eligible] };
+}
+
 /** createSignedTransactionWithAlt, minus the two cold RPC round-trips:
  *  blockhash comes from the hot cache (single-flight, <60s old) and ALT contents
  *  from the ALT cache. When either cache is cold we fall back to the fetch path —
@@ -135,6 +164,7 @@ export async function createSignedTransactionWithAltCached(
   signer: TransactionSigner,
   instructions: Instruction[],
   lookupTableAddresses: Address[],
+  onCoverage?: (uncovered: string[]) => void,
 ) {
   const uniqueTables = [...new Set(lookupTableAddresses.map(String))];
   const [latestBlockhash, altResults] = await Promise.all([
@@ -150,15 +180,20 @@ export async function createSignedTransactionWithAltCached(
     ),
     (tx) => appendTransactionMessageInstructions(instructions, tx),
   );
-  if (uniqueTables.length) {
-    const addressesByLookupTableAddress: Record<string, Address[]> = {};
-    for (const [table, addresses] of altResults) {
-      if (addresses.length) addressesByLookupTableAddress[table] = addresses;
-    }
-    const compressed = compressTransactionMessageUsingAddressLookupTables(message, addressesByLookupTableAddress as never);
-    if (compressed) message = compressed as typeof message;
+  const tables: Record<string, Address[]> = {};
+  for (const [table, addresses] of altResults) if (addresses.length) tables[table] = addresses;
+  const optimized = selectLookupTables(instructions, signer.address, tables);
+  onCoverage?.(optimized.uncovered);
+  const candidates = [tables, optimized.tables];
+  let best: Awaited<ReturnType<typeof signTransactionMessageWithSigners>> | undefined;
+  let bestBytes = Infinity;
+  for (const coverage of candidates) {
+    const compressed = compressTransactionMessageUsingAddressLookupTables(message, coverage as never);
+    const signed = await signTransactionMessageWithSigners(compressed);
+    const bytes = Buffer.from(getBase64EncodedWireTransaction(signed), "base64").length;
+    if (bytes < bestBytes) { best = signed; bestBytes = bytes; }
   }
-  return signTransactionMessageWithSigners(message);
+  return best!;
 }
 
 // ─── Scope configuration cache ──────────────────────────────────────────────

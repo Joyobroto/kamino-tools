@@ -23,6 +23,16 @@ const T3 = "2026-09-03T21:36:52.000Z"; // +68s
 
 const TH = { nearMissHealth: 1.05, hotHealth: 1.02, watchHealth: 1.02, maxWatch: 60 };
 
+test("partial oracle observations do not label missing cached positions as taken", () => {
+  const tracker = new HotTracker(TH);
+  tracker.absorb([candidate("A", 0.99),candidate("B",1.01)],T0);
+  assert.deepEqual(tracker.applyHotUpdate([],T1,false),[]);
+  assert.equal(tracker.size,2);
+  const events=tracker.applyHotUpdate([candidate("A",0.98)],T2,false);
+  assert.equal(events.some(event=>event.type==="taken"),false);
+  assert.equal(tracker.size,2);
+});
+
 test("absorb emits spotted for new DUE (<1.0) candidates; near-miss above watch band is ignored", () => {
   const tracker = new HotTracker(TH);
   const events = tracker.absorb([candidate("A", 0.99), candidate("B", 1.03)], T0);

@@ -10,6 +10,7 @@ import {
 import { SYSVAR_INSTRUCTIONS_ADDRESS } from "@solana/sysvars";
 import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { deriveAssociatedTokenAccount, fetchTokenAccount, createAtaInstruction } from "../../kamino.js";
+import { SENDER_TIP_ACCOUNTS } from "./sender.js";
 
 export const ALT_STATE_PATH = process.env.LIQ_ALT_STATE ?? "data/liq_alt.json";
 
@@ -29,6 +30,11 @@ export async function liquidationAltKeys(input: {
   put(market.programId);
   put(market.farmsProgramId);
   put(SYSVAR_INSTRUCTIONS_ADDRESS);
+
+  // Helius Sender tip accounts — when the Sender execution lane is enabled the
+  // tip transfer adds one writable destination to every fire; compressing the
+  // ten candidates keeps the packet inside 1232 bytes.
+  for (const tipAccount of SENDER_TIP_ACCOUNTS) put(tipAccount);
 
   for (const reserve of reserves) {
     put(reserve.address);
@@ -149,6 +155,8 @@ export async function buildLiquidationSetup(input: {
   existingCompanionAlts?: Address[];
   /** Keys already in the ALT (skip re-appending them). */
   existingKeys?: Address[];
+  /** Number of addresses already stored in the primary and companion tables. */
+  existingTableKeyCounts?: number[];
   /** Skip ATA pre-creation (--all market-wide: non-essential — the executor
    *  creates any missing ATA inside the fire's setupInstructions anyway, and the
    *  pre-creation batches were clogging the pipeline with retry storms). */
@@ -208,48 +216,65 @@ export async function buildLiquidationSetup(input: {
   const existing = new Set((input.existingKeys ?? []).map((a) => a.toString()));
   const toAdd = keys.filter((k) => !existing.has(k.toString()));
 
-  const groups: Address[][] = [];
+  const companionCreates: Instruction[][] = [];
+  const extendTransactions: Instruction[][] = [];
+  const existingTables: Address[] = [
+    lookupTable,
+    ...(input.existingCompanionAlts ?? []),
+  ];
+  const existingCounts = input.existingTableKeyCounts ?? [existing.size];
+  const tableGroups: Array<{ table: Address; keys: Address[]; companion: boolean }> = [];
+  let tableIndex = 0;
   let group: Address[] = [];
-  let groupBudget = MAX_ALT_KEYS - existing.size;
+  let groupBudget = Math.max(0, MAX_ALT_KEYS - (existingCounts[tableIndex] ?? 0));
   for (const key of toAdd) {
-    if (groupBudget <= 0) {
-      groups.push(group);
+    while (groupBudget <= 0 && tableIndex < existingTables.length) {
+      if (group.length) tableGroups.push({ table: existingTables[tableIndex]!, keys: group, companion: tableIndex > 0 });
+      tableIndex += 1;
       group = [];
+      groupBudget = Math.max(0, MAX_ALT_KEYS - (existingCounts[tableIndex] ?? 0));
+    }
+    if (tableIndex >= existingTables.length) {
+      if (group.length) {
+        tableGroups.push({ table: address("11111111111111111111111111111111"), keys: group, companion: true });
+        group = [];
+      }
       groupBudget = MAX_ALT_KEYS;
     }
     group.push(key);
     groupBudget -= 1;
   }
-  if (group.length) groups.push(group);
+  if (group.length) {
+    tableGroups.push({ table: tableIndex < existingTables.length ? existingTables[tableIndex]! : address("11111111111111111111111111111111"), keys: group, companion: tableIndex > 0 });
+  }
 
-  const companionCreates: Instruction[][] = [];
-  const complements: AltRef[] = [];
-  const extendTransactions: Instruction[][] = [];
-  let tableForGroup: Address = lookupTable;
+  const complements: AltRef[] = (input.existingCompanionAlts ?? []).map((table, index) => ({
+    lookupTable: table.toString(),
+    keyCount: existingCounts[index + 1] ?? 0,
+  }));
+  let newCompanionNumber = 0;
   // Companion PDAs must be DISTINCT. createLookupTableIx seeds the PDA with the
   // CURRENT finalized slot — two creates back-to-back resolve to the SAME slot
   // (same PDA) and the second create tx fails "already initialized" (seen live
   // on the first --all run). Derive each with an explicit slot offset instead.
   const baseSlot =
-    groups.length > 1
+    tableGroups.some((g) => g.table.toString() === "11111111111111111111111111111111")
       ? (await rpc.getSlot({ commitment: "finalized" }).send())
       : 0n;
-  for (let g = 0; g < groups.length; g += 1) {
-    const keysIn = groups[g]!;
-    if (g > 0) {
-      const resumeTable = input.existingCompanionAlts?.[g - 1];
-      if (resumeTable) {
-        tableForGroup = resumeTable;
-        console.log(`  reuse companion table ${resumeTable.toString()} (was created by an aborted run)`);
-      } else {
-        const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(g));
-        if (createCompanionIx) companionCreates.push([createCompanionIx]);
-        tableForGroup = newTable;
-      }
-      complements.push({ lookupTable: tableForGroup.toString(), keyCount: keysIn.length });
+  for (const tableGroup of tableGroups) {
+    let tableForGroup = tableGroup.table;
+    if (tableForGroup.toString() === "11111111111111111111111111111111") {
+      newCompanionNumber += 1;
+      const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(newCompanionNumber));
+      if (createCompanionIx) companionCreates.push([createCompanionIx]);
+      tableForGroup = newTable;
+      complements.push({ lookupTable: tableForGroup.toString(), keyCount: tableGroup.keys.length });
+    } else if (tableGroup.companion && !complements.some((c) => c.lookupTable === tableForGroup.toString())) {
+      complements.push({ lookupTable: tableForGroup.toString(), keyCount: tableGroup.keys.length });
+      console.log(`  reuse companion table ${tableForGroup.toString()}`);
     }
-    for (let i = 0; i < keysIn.length; i += EXTEND_CHUNK) {
-      extendTransactions.push(extendLookupTableIxs(signer, tableForGroup, keysIn.slice(i, i + EXTEND_CHUNK), signer));
+    for (let i = 0; i < tableGroup.keys.length; i += EXTEND_CHUNK) {
+      extendTransactions.push(extendLookupTableIxs(signer, tableForGroup, tableGroup.keys.slice(i, i + EXTEND_CHUNK), signer));
     }
   }
   // kinds MUST mirror the exact ordering of `transactions` below — keep them in

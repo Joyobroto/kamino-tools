@@ -1,29 +1,11 @@
 import { Connection, PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import BN from "bn.js";
 
-/**
- * LOCAL Raydium CLMM quoter + swap builder — the LionX-class swap backend (phase 3).
- *
- * LionX's decoded flagship swaps via a single Raydium CLMM pool CPI with zero HTTP.
- * This module reproduces that shape on the PUBLIC Raydium program:
- *
- *   - Pool discovery: pure PDA derivation (getPdaPoolId per ammConfig 0..7) — no API.
- *   - Registry: deepest-liquidity pool per unordered mint pair, TTL-refreshed.
- *   - State cache: pool + tick arrays + ex-bitmap decoded from chain, refreshed in the
- *     background (call keepWarm from the scan cycle / hot tick); fires only read cache.
- *   - Quote: PoolUtils.getOutputAmountAndRemainAccounts — tick-crossing math runs
- *     LOCALLY. Validated vs Jupiter live: within 0.017% (pure fee-rate delta),
- *     computed in ~5ms vs ~80-150ms HTTP.
- *   - Instruction: ClmmInstrument.swapInstruction with the bitmap-derived
- *     tick-array remaining accounts, amountOutMin slippage-protected on-chain.
- *
- * Safety: a stale cache can only cost slippage (bounded by amountOutMin enforced
- * by the on-chain program) — never principal. The executor's simulate() gate
- * re-checks the entire tx against live chain state before broadcast anyway.
- */
-
+/** Cached Raydium pool snapshots. Quotes and builders share one immutable snapshot;
+ * simulation remains mandatory because prices can move after any read. */
 const CLMM_PROGRAM_ID = new PublicKey("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 const MAX_AMM_CONFIG_INDEX = 7;
+export const CLMM_STATE_TTL_MS = 1_000;
 const REGISTRY_TTL_MS = 60_000;
 
 // ─── singleton per RPC endpoint (the executor and the scan-cycle warmer share state) ───
@@ -57,9 +39,8 @@ export function web3InstructionToExternal(instruction: TransactionInstruction): 
 
 /** Static + active-range accounts for a CLMM pair, for OUR persistent ALT:
  *  program, pool, ammConfig, vaults, mints, observation, ex-bitmap, and the
- *  tick-array PDAs around the current tick (these drift with price — when the
- *  pool moves beyond the cached arrays the executor's packet-size guard falls
- *  back to Jupiter automatically, so staleness never breaks a fire). */
+ *  tick-array PDAs around the current tick. The executor measures packet size
+ *  and can try other routes when coverage no longer fits. */
 export async function clmmAltKeys(
   rpcUrl: string,
   pairs: Array<{ mintA: string; mintB: string }>,
@@ -73,11 +54,12 @@ export async function clmmAltKeys(
     const poolInfo = state.poolInfo as Record<string, unknown>;
     keys.add(String((poolInfo.id as PublicKey).toBase58()));
     keys.add(String((poolInfo.ammConfig as { id: string }).id));
-    keys.add(String(state.inputVault.toBase58()));
-    keys.add(String(state.outputVault.toBase58()));
-    keys.add(String(state.inputMint.toBase58()));
-    keys.add(String(state.outputMint.toBase58()));
+    keys.add(String(state.vaultA.toBase58()));
+    keys.add(String(state.vaultB.toBase58()));
+    keys.add(String(state.mintA.toBase58()));
+    keys.add(String(state.mintB.toBase58()));
     keys.add(String((poolInfo.observationId as PublicKey).toBase58()));
+    if (state.bitmapAddress) keys.add(state.bitmapAddress.toBase58());
     keys.add("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
     for (const entry of Object.values(state.tickArrayCache as Record<string, { address?: PublicKey }>)) {
       if (entry?.address) keys.add(entry.address.toBase58());
@@ -91,16 +73,18 @@ interface PairState {
   poolInfo: Record<string, unknown>; // ComputeClmmPoolInfo shape
   tickArrayCache: Record<string, unknown>;
   fetchedAt: number;
-  /** The SDK's remaining-account PDAs for the CURRENT cache snapshot. */
-  inputMint: PublicKey;
-  outputMint: PublicKey;
-  inputVault: PublicKey;
-  outputVault: PublicKey;
-  inputDecimals: number;
-  outputDecimals: number;
+  mintA: PublicKey;
+  mintB: PublicKey;
+  vaultA: PublicKey;
+  vaultB: PublicKey;
+  bitmapAddress?: PublicKey;
+
 }
 
 export interface LocalClmmQuote {
+  snapshot: PairState;
+  tokenIn: PublicKey;
+  tokenOut: PublicKey;
   amountIn: BN;
   amountOut: BN; // expected out, raw units
   amountOutMin: BN; // slippage-protected minimum
@@ -118,7 +102,7 @@ export interface LocalClmmSwap {
 }
 
 interface PairCacheEntry {
-  state: Promise<PairState | null>;
+  inFlight?: Promise<PairState | null>;
   ready: PairState | null;
   /** When discovery last concluded NO pool exists for this pair (negative cache). */
   noPoolAt?: number;
@@ -129,9 +113,31 @@ const NO_POOL_TTL_MS = 10 * 60_000; // pairs with no CLMM pool re-probe every 10
 export class ClmmLocalQuoter {
   private readonly connection: Connection;
   private readonly pairs = new Map<string, PairCacheEntry>();
+  private readonly registry = new Map<string, { poolId: PublicKey; at: number }>();
+  private readonly configs = new Map<string, Record<string, unknown>>();
+  private readonly warmPairs = new Map<string, [PublicKey, PublicKey]>();
+  private warming: Promise<number> | undefined;
+  private activeLoads = 0;
+  private retryAfter = 0;
+
+  invalidate(mintA: PublicKey, mintB: PublicKey): void {
+    this.pairs.delete(this.pairKey(mintA, mintB));
+  }
 
   constructor(rpcUrl: string) {
-    this.connection = new Connection(rpcUrl, "confirmed");
+    this.connection = new Connection(rpcUrl, {
+      commitment: "processed", disableRetryOnRateLimit: true,
+      fetch: async (url, init) => {
+        if (Date.now() < this.retryAfter) throw new Error("CLMM RPC cooldown");
+        const response = await fetch(url, { ...init, signal: AbortSignal.timeout(1_500) });
+        if (!response.ok) {
+          this.retryAfter = Date.now() + ([401, 403].includes(response.status) ? 300_000 : 30_000);
+          await response.body?.cancel();
+          throw new Error(`CLMM RPC HTTP ${response.status}`);
+        }
+        return response;
+      },
+    });
   }
 
   private pairKey(mintA: PublicKey, mintB: PublicKey): string {
@@ -143,43 +149,47 @@ export class ClmmLocalQuoter {
   async loadPairState(mintA: PublicKey, mintB: PublicKey): Promise<PairState | null> {
     const key = this.pairKey(mintA, mintB);
     const cached = this.pairs.get(key);
-    if (cached?.ready && Date.now() - Number(cached.ready.fetchedAt) < REGISTRY_TTL_MS) return cached.ready;
-    // Negative cache: pairs with no CLMM pool re-probe at most every 10 min.
+    if (cached?.ready && Date.now() - cached.ready.fetchedAt < CLMM_STATE_TTL_MS) return cached.ready;
     if (cached?.noPoolAt && Date.now() - cached.noPoolAt < NO_POOL_TTL_MS) return null;
-    if (cached?.state) return cached.state;
-    const promise = this.discoverAndHydrate(mintA, mintB)
+    if (cached?.inFlight) return cached.inFlight;
+    if (Date.now() < this.retryAfter || this.activeLoads >= 2) return null;
+    this.activeLoads++;
+    const entry: PairCacheEntry = { ready: null };
+    this.pairs.set(key, entry);
+    entry.inFlight = this.discoverAndHydrate(mintA, mintB)
       .then((state) => {
-        if (state) this.pairs.set(key, { state: promise, ready: state });
-        else this.pairs.set(key, { state: promise, ready: null, noPoolAt: Date.now() });
+        entry.ready = state;
+        if (!state) entry.noPoolAt = Date.now();
         return state;
       })
-      .catch(() => {
-        this.pairs.set(key, { state: promise, ready: null });
-        return null;
-      });
-    this.pairs.set(key, { state: promise, ready: null });
-    return promise;
+      .catch((error: unknown) => {
+        this.retryAfter = Math.max(this.retryAfter, Date.now() + 30_000);
+        throw error;
+      })
+      .finally(() => { this.activeLoads--; delete entry.inFlight; });
+    return entry.inFlight;
   }
 
-  /** Background refresh — call from the scan cycle so fires never pay the cold load. */
   keepWarm(mintA: PublicKey, mintB: PublicKey): void {
-    const key = this.pairKey(mintA, mintB);
-    const cached = this.pairs.get(key);
-    if (cached?.ready && Date.now() - Number(cached.ready.fetchedAt) < REGISTRY_TTL_MS) return;
-    if (cached?.noPoolAt && Date.now() - cached.noPoolAt < NO_POOL_TTL_MS) return;
-    void this.loadPairState(mintA, mintB).catch(() => {});
+    this.warmPairs.set(this.pairKey(mintA, mintB), [mintA, mintB]);
+    if (this.warmPairs.size > 64) this.warmPairs.delete(this.warmPairs.keys().next().value!);
   }
 
-  /** Resolve every keepWarm-registered pair (paced — one at a time); returns how
-   *  many have live pool state. Called once per scan cycle off the critical path. */
-  async loadAllWarm(paceMs = 250): Promise<number> {
-    let ok = 0;
-    for (const [, entry] of this.pairs) {
-      const state = await entry.state.catch(() => null);
-      if (state) ok += 1;
-      await new Promise((resolve) => setTimeout(resolve, paceMs));
-    }
-    return ok;
+  async loadAllWarm(): Promise<number> {
+    if (this.warming) return this.warming;
+    this.warming = (async () => {
+      let ok = 0;
+      const pairs = [...this.warmPairs.entries()].slice(0, 2);
+      for (let i = 0; i < pairs.length; i++) {
+        if (Date.now() < this.retryAfter) break;
+        const [key, [a, b]] = pairs[i]!;
+        this.warmPairs.delete(key);
+        if (i) await new Promise((resolve) => setTimeout(resolve, 250));
+        if (await this.loadPairState(a, b).catch(() => null)) ok++;
+      }
+      return ok;
+    })().finally(() => { this.warming = undefined; });
+    return this.warming;
   }
 
   private async discoverAndHydrate(mintA: PublicKey, mintB: PublicKey): Promise<PairState | null> {
@@ -187,6 +197,10 @@ export class ClmmLocalQuoter {
       import("@raydium-io/raydium-sdk-v2/lib/raydium/clmm/utils/pda.js"),
       import("@raydium-io/raydium-sdk-v2/lib/raydium/clmm/layout.js"),
     ]);
+    // PDA mint order must be canonical, independently of swap direction.
+    if (mintA.toBuffer().compare(mintB.toBuffer()) > 0) [mintA, mintB] = [mintB, mintA];
+    const key = this.pairKey(mintA, mintB);
+    const registered = this.registry.get(key);
     // ONE getMultipleAccounts for all 8 config-probe pool PDAs — not 8 round-trips.
     const probeKeys: PublicKey[] = [];
     for (let configIndex = 0; configIndex <= MAX_AMM_CONFIG_INDEX; configIndex++) {
@@ -194,6 +208,7 @@ export class ClmmLocalQuoter {
       const { publicKey: poolId } = getPdaPoolId(CLMM_PROGRAM_ID, ammConfigId, mintA, mintB);
       probeKeys.push(poolId);
     }
+    if (registered && Date.now() - registered.at < REGISTRY_TTL_MS) probeKeys.splice(0, probeKeys.length, registered.poolId);
     const accounts = await this.connection.getMultipleAccountsInfo(probeKeys);
     let best: { poolId: PublicKey; raw: Buffer; liquidity: BN } | null = null;
     for (let i = 0; i < accounts.length; i++) {
@@ -204,12 +219,18 @@ export class ClmmLocalQuoter {
       if (liquidity.isZero()) continue;
       if (!best || liquidity.gt(best.liquidity)) best = { poolId: probeKeys[i]!, raw: Buffer.from(account.data), liquidity };
     }
-    if (!best) return null;
+    if (!best) { this.registry.delete(key); return null; }
+    if (!registered || probeKeys.length > 1) this.registry.set(key, { poolId: best.poolId, at: Date.now() });
 
     const state = PoolInfoLayout.decode(best.raw) as Record<string, unknown>;
-    const configAccount = await this.connection.getAccountInfo(state.ammConfig as PublicKey);
-    if (!configAccount?.data) return null;
-    const config = ClmmConfigLayout.decode(configAccount.data) as Record<string, unknown>;
+    const configKey = (state.ammConfig as PublicKey).toBase58();
+    let config = this.configs.get(configKey);
+    if (!config || probeKeys.length > 1) {
+      const account = await this.connection.getAccountInfo(state.ammConfig as PublicKey);
+      if (!account?.data) throw new Error("CLMM config unavailable");
+      config = ClmmConfigLayout.decode(account.data) as Record<string, unknown>;
+      this.configs.set(configKey, config);
+    }
 
     // Ex bitmap (pools whose ticks extend past the default bitmap range)
     const exBitmapInfo: { poolId: PublicKey; positiveTickArrayBitmap: unknown[]; negativeTickArrayBitmap: unknown[] } = { poolId: best.poolId, positiveTickArrayBitmap: [], negativeTickArrayBitmap: [] };
@@ -274,17 +295,15 @@ export class ClmmLocalQuoter {
       exBitmapInfo as never,
     );
 
-    const inputIsA = poolMintA.equals(mintA);
     return {
-      poolInfo,
-      tickArrayCache,
-      fetchedAt: Date.now(),
-      inputMint: mintA,
-      outputMint: mintB,
-      inputVault: (inputIsA ? state.vaultA : state.vaultB) as PublicKey,
-      outputVault: (inputIsA ? state.vaultB : state.vaultA) as PublicKey,
-      inputDecimals: Number(inputIsA ? state.mintDecimalsA : state.mintDecimalsB),
-      outputDecimals: Number(inputIsA ? state.mintDecimalsB : state.mintDecimalsA),
+      // Timestamp AFTER all RPC/decode work: the state's freshness must be
+      // measured from when it became usable, otherwise a cold discovery slower
+      // than CLMM_STATE_TTL_MS would be rejected by every quote even though it
+      // is the freshest data available.
+      poolInfo, tickArrayCache, fetchedAt: Date.now(),
+      mintA: poolMintA, mintB: poolMintB,
+      vaultA: state.vaultA as PublicKey, vaultB: state.vaultB as PublicKey,
+      ...(exAcc?.data ? { bitmapAddress: exBitmapAddr } : {}),
     };
   }
 
@@ -296,7 +315,7 @@ export class ClmmLocalQuoter {
     slippageBps: number;
   }): Promise<LocalClmmQuote | null> {
     const state = await this.loadPairState(input.tokenIn, input.tokenOut);
-    if (!state) return null;
+    if (!state || Date.now() - state.fetchedAt >= CLMM_STATE_TTL_MS) return null;
     const { PoolUtils } = await import("@raydium-io/raydium-sdk-v2/lib/raydium/clmm/utils/pool.js");
     const poolInfo = state.poolInfo as never;
     let result: { expectedAmountOut: BN; remainingAccounts: PublicKey[]; allTrade: boolean };
@@ -316,7 +335,8 @@ export class ClmmLocalQuoter {
     const amountOut = result.expectedAmountOut;
     const allTrade = result.allTrade;
     return {
-      amountIn: input.amountIn,
+      snapshot: state, tokenIn: input.tokenIn, tokenOut: input.tokenOut,
+      amountIn: input.amountIn.clone(),
       amountOut,
       amountOutMin,
       tickArrayAccounts: result.remainingAccounts,
@@ -337,11 +357,16 @@ export class ClmmLocalQuoter {
     amountIn: BN;
     amountOutMin: BN;
     payer: PublicKey;
+    /** Reuse the quote already calculated by the route selector. */
+    quote?: LocalClmmQuote;
   }): Promise<{ instruction: TransactionInstruction; tickArrays: PublicKey[]; poolId: PublicKey } | null> {
-    const state = await this.loadPairState(input.tokenIn, input.tokenOut);
-    if (!state) return null;
-    const quote = await this.quoteExactIn({ tokenIn: input.tokenIn, tokenOut: input.tokenOut, amountIn: input.amountIn, slippageBps: 0 });
+    const quote = input.quote ?? await this.quoteExactIn({ tokenIn: input.tokenIn, tokenOut: input.tokenOut, amountIn: input.amountIn, slippageBps: 0 });
     if (!quote) return null;
+    const state = quote.snapshot;
+    if (Date.now() - state.fetchedAt >= CLMM_STATE_TTL_MS
+      || !quote.tokenIn.equals(input.tokenIn) || !quote.tokenOut.equals(input.tokenOut)
+      || !quote.amountIn.eq(input.amountIn) || !quote.poolId.equals(state.poolInfo.id as PublicKey)
+      || input.amountOutMin.lt(quote.amountOutMin)) return null;
     const { ClmmInstrument } = await import("@raydium-io/raydium-sdk-v2/lib/raydium/clmm/instrument.js");
     const poolInfo = state.poolInfo as Record<string, unknown>;
     const inputIsA = (poolInfo.mintA as { address: string }).address === input.tokenIn.toBase58();
@@ -352,8 +377,8 @@ export class ClmmLocalQuoter {
       new PublicKey(String((poolInfo.ammConfig as { id: string }).id)),
       input.ownerTokenIn,
       input.ownerTokenOut,
-      inputIsA ? state.inputVault : state.outputVault,
-      inputIsA ? state.outputVault : state.inputVault,
+      inputIsA ? state.vaultA : state.vaultB,
+      inputIsA ? state.vaultB : state.vaultA,
       input.tokenIn,
       input.tokenOut,
       quote.tickArrayAccounts,
@@ -361,8 +386,8 @@ export class ClmmLocalQuoter {
       input.amountIn,
       input.amountOutMin,
       new BN(0),
-      inputIsA,
-      undefined,
+      true, // exact-input for both A→B and B→A
+      state.bitmapAddress,
     );
     return { instruction, tickArrays: quote.tickArrayAccounts, poolId: quote.poolId };
   }

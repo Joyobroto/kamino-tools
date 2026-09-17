@@ -83,10 +83,17 @@ export interface LedgerEntry {
   rail?: string;
   triggeredAt?: string;
   triggerSlot?: string;
+  oracleSlot?: string | undefined;
+  oracleReceivedAt?: number | undefined;
+  oracleToTriggerMs?: number;
+  oracleSnapshotAgeMs?: number;
+  postLiquidationNotification?: boolean;
   latencyMsTotal?: number;
   timingsMs?: Record<string, number>;
   simulationLogs?: string[];
   simulationPerformed?: boolean;
+  simulationSlot?: number;
+  routeDiagnostics?: string[];
   quotedProfitUsd?: number;
   worstCaseProfitUsd?: number;
   lossUsdEstimate?: number;
@@ -109,6 +116,12 @@ export interface LedgerEntry {
   liveHealth?: number;
   /** For "vetoed": the prize that was on the table, USD. */
   prizeUsd?: number;
+  /** Helius Sender execution lane actually used (when Sender is enabled). */
+  senderTier?: "swqos" | "max";
+  senderTipLamports?: string;
+  senderCostUsd?: number;
+  /** worstCaseProfitUsd − sender lane cost, USD. */
+  netWorstCaseProfitUsd?: number;
 }
 
 export interface DaemonState {

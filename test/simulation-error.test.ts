@@ -11,3 +11,10 @@ test("recognizes Kamino healthy veto with numeric or serialized custom codes", (
   assert.equal(isHealthyLiquidationVeto({ InstructionError: [9, { Custom: 6009 }] }, logs), false);
   assert.equal(isHealthyLiquidationVeto(null, logs), false);
 });
+
+import { isClmmRouteFailure } from "../src/strategies/liquidation/simulation-error.js";
+test("CLMM retry classification does not confuse Kamino codes with Raydium codes", () => {
+  const error = {InstructionError:[0,{Custom:6035}]};
+  assert.equal(isClmmRouteFailure(error,[],[{programAddress:"KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"}]),false);
+  assert.equal(isClmmRouteFailure(error,[],[{programAddress:"CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"}]),true);
+});

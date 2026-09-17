@@ -148,7 +148,7 @@ export class HotTracker {
    * taken when an obligation disappears (liquidated/closed), healed when it rises
    * above the near-miss band. Unknown addresses are ignored.
    */
-  applyHotUpdate(updates: LiquidatableCandidate[], at: string): TrackerEvent[] {
+  applyHotUpdate(updates: LiquidatableCandidate[], at: string, complete = true): TrackerEvent[] {
     const events: TrackerEvent[] = [];
     const byAddress = new Map(updates.map((candidate) => [candidate.obligation, candidate]));
     for (const candidate of updates) {
@@ -204,7 +204,7 @@ export class HotTracker {
       }
     }
     for (const [obligation, entry] of [...this.tracked.entries()]) {
-      if (!byAddress.has(obligation)) {
+      if (complete && !byAddress.has(obligation)) {
         events.push({
           type: "taken",
           at,

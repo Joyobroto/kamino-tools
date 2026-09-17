@@ -60,3 +60,14 @@ test("blockhash cache separates RPC instances and explicit endpoints", async () 
   await getCachedBlockhash(a,"https://a.invalid",true);
   await getCachedBlockhash(a,"https://a.invalid");assert.equal(aCalls,2);
 });
+
+import { selectLookupTables } from "../src/strategies/liquidation/hotcache.js";
+import { address, AccountRole, type Instruction } from "@solana/kit";
+test("ALT selection avoids single-key overhead, duplicates, signers and program IDs", () => {
+  const key = (n: number) => address(("1".repeat(31) + String(n)) as string);
+  const [payer,program,a,b,c] = [key(1),key(2),key(3),key(4),key(5)] as const;
+  const ix: Instruction = {programAddress:program,accounts:[{address:payer,role:AccountRole.WRITABLE_SIGNER},...[a,b,c,program].map(address=>({address,role:AccountRole.READONLY}))]};
+  const result = selectLookupTables([ix],payer,{small:[a],large:[a,b,program,payer],single:[c]});
+  assert.deepEqual(Object.keys(result.tables),["large"]);
+  assert.deepEqual(result.uncovered,[c]);
+});

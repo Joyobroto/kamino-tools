@@ -119,6 +119,8 @@ export async function hydrateShortlist(params: {
   ledgerInstant: LedgerInstant;
     pubkeys: Address[];
   onProgress: (done: number, total: number) => void;
+  onSnapshot?: (snapshot: StreamAccountSnapshot) => void;
+  beforeDecode?: () => void;
 }): Promise<KaminoObligation[]> {
   const { rpc, market, ledgerInstant, pubkeys } = params;
   if (!pubkeys.length) return [];
@@ -133,10 +135,12 @@ export async function hydrateShortlist(params: {
   let done = 0;
   const runBatch = async (batch: Address[]) => {
     const accounts = await withBackoff(() => rpc.getMultipleAccounts(batch, { encoding: "base64" }).send(), "hydrate batch");
+    params.beforeDecode?.();
     for (let i = 0; i < accounts.value.length; i++) {
       const account = accounts.value[i];
       if (!account) continue;
       const data = account.data[0] ? Buffer.from(account.data[0], "base64") : Buffer.alloc(0);
+      params.onSnapshot?.({ pubkey: batch[i]!, accountData: data, slot: accounts.context?.slot ?? ledgerInstant.slot, receivedAt: Date.now() });
       try {
         const obligation = KaminoObligation.fromAccountData(markets, batch[i]!, data, ledgerInstant);
         if (obligation) obligations.push(obligation);
@@ -173,7 +177,29 @@ export interface PreloadedMarket {
 const MARKET_CACHE_TTL_MS = 60_000;
 // Hot health checks must not reuse a minute-old oracle/reserve snapshot.
 // Keep the broad scan cache, but refresh tracked positions at the hot cadence.
-const HOT_MARKET_CACHE_TTL_MS = 10_000;
+// Streamed obligation bytes are the hot snapshot, and every fire carries
+// on-chain reserve/oracle refresh instructions. Reloading the whole market
+// every 10 seconds repeated dozens of RPC calls during WS bursts; structural
+// market data can use the normal one-minute cache.
+const HOT_MARKET_CACHE_TTL_MS = MARKET_CACHE_TTL_MS;
+
+/**
+ * Oracle-first revaluation budgets. A fresh oracle price is the starting gun
+ * for a liquidation race, so the oracle rail revalues the tracked cohort from
+ * the ALREADY-LOADED reserve accounts + cached obligation bytes instead of
+ * paying an RPC market reload on the critical path:
+ *
+ *   - the market object may be stale up to ORACLE_MARKET_MAX_AGE_MS (structural
+ *     reserve data changes slowly; the executor re-hydrates + simulates before
+ *     any broadcast, so a stale preflight can only cost a wasted attempt);
+ *   - an obligation snapshot may be stale up to ORACLE_SNAPSHOT_MAX_AGE_MS —
+ *     the price is what moved, not the position.
+ *
+ * Beyond those budgets the rail stays silent (a truly stale input must not
+ * fabricate a DUE); the independently paced hot poll refreshes the data.
+ */
+export const ORACLE_MARKET_MAX_AGE_MS = 60_000;
+export const ORACLE_SNAPSHOT_MAX_AGE_MS = 45_000;
 
 // Single-flight: every caller (scan cycle, hot tick, executeDue, executeLiquidationOnce)
 // hits preloadMarket whenever the 60s cache is stale; without dedup those concurrent loads
@@ -411,12 +437,31 @@ export async function refreshTrackedObligations(params: {
   preloaded: PreloadedMarket;
   pubkeys: Address[];
   streamSnapshot?: StreamAccountSnapshot;
+  snapshots?: Map<string, StreamAccountSnapshot>;
+  oracleTrigger?: StreamAccountSnapshot;
+  applyOraclePrices?: (market: KaminoMarket) => boolean;
 }): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation>; market: KaminoMarket }> {
   const { rpc, preloaded, pubkeys } = params;
   if (!pubkeys.length) return { candidates: [], obligations: new Map(), market: preloaded.market };
-  const loaded = freshPreloaded(preloaded, HOT_MARKET_CACHE_TTL_MS)
-    ? preloaded : await preloadMarket(rpc, preloaded.marketAddress, HOT_MARKET_CACHE_TTL_MS);
+  const oracleFresh = params.applyOraclePrices?.(preloaded.market);
+  const oracleTrigger = params.oracleTrigger;
+  // Feed notifications are CPU-only. Missing/stale data is fetched by the
+  // independently paced hot poll, never once per oracle message.
+  // Oracle-first: a fresh oracle price is enough to REVALUE the cached cohort —
+  // requiring the whole market cache to be refreshed on the oracle path added an
+  // RPC burst exactly where the race is won or lost. The market object only has
+  // to be reasonably recent (ORACLE_MARKET_MAX_AGE_MS); simulation arbitrates.
+  if (oracleTrigger && (!oracleFresh || oracleTrigger.slot === undefined
+    || Date.now() - preloaded.loadedAt > ORACLE_MARKET_MAX_AGE_MS)) {
+    return { candidates: [], obligations: new Map(), market: preloaded.market };
+  }
+  const maxAgeMs = params.applyOraclePrices && !oracleFresh ? 10_000 : HOT_MARKET_CACHE_TTL_MS;
+  const loaded = oracleTrigger
+    ? preloaded
+    : freshPreloaded(preloaded, maxAgeMs)
+      ? preloaded : await preloadMarket(rpc, preloaded.marketAddress, maxAgeMs);
   const market = loaded.market;
+  params.applyOraclePrices?.(market);
   let hydrated: KaminoObligation[] | undefined;
   const snapshot = params.streamSnapshot;
   if (pubkeys.length === 1 && streamSnapshotFresh(snapshot, pubkeys[0]!)) {
@@ -432,13 +477,36 @@ export async function refreshTrackedObligations(params: {
     } catch { /* unavailable slot time or incompatible data: use fresh RPC account */ }
   }
   if (!hydrated) {
-    const ledgerInstant = await fetchLedgerInstant(rpc, "hot ledger instant");
-    hydrated = await hydrateShortlist({ rpc, market, ledgerInstant, pubkeys, onProgress: () => {} });
+    const trigger = oracleTrigger;
+    const canRevalue = trigger?.slot !== undefined && params.applyOraclePrices?.(market);
+    const instant = canRevalue ? streamLedgerInstant(trigger!) : await fetchLedgerInstant(rpc, "hot ledger instant");
+    hydrated = [];
+    const missing: Address[] = [];
+    for (const pubkey of pubkeys) {
+      const snapshot = params.snapshots?.get(pubkey);
+      if (canRevalue && snapshot?.accountData && snapshot.receivedAt !== undefined
+        && Date.now() - snapshot.receivedAt < ORACLE_SNAPSHOT_MAX_AGE_MS && snapshot.slot !== undefined && snapshot.slot <= instant.slot) {
+        try {
+          const obligation = KaminoObligation.fromAccountData(new Map([[market.getAddress(), market]]), pubkey, snapshot.accountData, instant);
+          if (obligation) { hydrated.push(obligation); continue; }
+        } catch { /* refresh incompatible snapshots over RPC */ }
+      }
+      if (!oracleTrigger) missing.push(pubkey);
+    }
+    hydrated.push(...await hydrateShortlist({ rpc, market, ledgerInstant: instant, pubkeys: missing, onProgress: () => {},
+      beforeDecode: () => { params.applyOraclePrices?.(market); },
+      onSnapshot: (snapshot) => {
+        const previous = params.snapshots?.get(snapshot.pubkey);
+        if (!previous?.slot || (snapshot.slot !== undefined && snapshot.slot >= previous.slot)) params.snapshots?.set(snapshot.pubkey, snapshot);
+      },
+    }));
   }
   const vanilla = hydrated.filter((obligation) => obligation.obligationTag === 0);
   const obligations = new Map(vanilla.map((obligation) => [obligation.obligationAddress.toString(), obligation]));
+  const reserveMap = params.applyOraclePrices
+    ? buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100) : loaded.marketReserves;
   const candidates = vanilla.map((obligation) => {
-    try { return obligationToCandidate(obligation, loaded.marketReserves); } catch { return null; }
+    try { return obligationToCandidate(obligation, reserveMap); } catch { return null; }
   }).filter((candidate): candidate is LiquidatableCandidate => candidate !== null);
   return { candidates, obligations, market };
 }

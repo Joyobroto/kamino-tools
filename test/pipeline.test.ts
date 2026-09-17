@@ -46,3 +46,17 @@ test("queue prioritizes fresh race work while preserving FIFO ties", async () =>
   await tick();
   assert.equal(started[1], 3);
 });
+
+import { validateRoutes } from "../src/strategies/liquidation/pipeline.js";
+test("bad CLMM simulation falls back to a valid route without waiting for a hung provider", async () => {
+  const seen: string[] = [];
+  const value = await validateRoutes({first:"clmm", alternatives:()=>[new Promise(()=>{}),Promise.resolve("oversized"),Promise.resolve("jupiter")],budgetMs:100,
+    validate:async(route)=>{seen.push(route); return route === "jupiter" ? {value:{tx:"validated",profit:1}} : {};}});
+  assert.deepEqual(seen,["clmm","oversized","jupiter"]); assert.equal(value?.tx,"validated");
+});
+test("terminal healthy veto stops alternative attempts and deadline rejects late validation", async () => {
+  let fetched = false;
+  assert.equal(await validateRoutes({first:1,alternatives:()=>{fetched=true;return [Promise.resolve(2)];},budgetMs:50,validate:async()=>({terminal:true})}),null);
+  assert.equal(fetched,false);
+  assert.equal(await validateRoutes({first:1,alternatives:()=>[],budgetMs:5,validate:async()=>{await new Promise(r=>setTimeout(r,20));return {value:"too late"};}}),null);
+});
