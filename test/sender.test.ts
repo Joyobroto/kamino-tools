@@ -91,3 +91,12 @@ test("env config parses endpoint, enable flag and thresholds", () => {
   const noEndpoint = senderConfigFromEnv({});
   assert.equal(noEndpoint.enabled, false);
 });
+
+test("bundle submission rejects empty success responses and invalid bundle counts", async (t) => {
+  const { sendViaSenderBundle } = await import("../src/strategies/liquidation/sender.js");
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => { requests++; return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1 }), { headers: { "Content-Type": "application/json" } }); });
+  await assert.rejects(sendViaSenderBundle({ endpoint: "https://sender.invalid/fast", transactions: ["wire"] }), /no result/);
+  await assert.rejects(sendViaSenderBundle({ endpoint: "https://sender.invalid/fast", transactions: Array(6).fill("wire") }), /1–5/);
+  assert.equal(requests, 1);
+});

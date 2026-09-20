@@ -123,6 +123,17 @@ export async function liquidationAltKeys(input: {
       if (!tokenIds.length) continue;
       put(configPubkey as string);
       put(config.oraclePrices as string);
+      const feed = config as { oracleMappings?: string; oracleTwaps?: string };
+      put(feed.oracleMappings);
+      put(feed.oracleTwaps);
+      // Enumerate the actual refresh accounts per reserve. Passing every token
+      // in the market to one instruction can overflow the SDK's u8 vector.
+      for (const reserve of reserves) {
+        const ids = [...new Set(getTokenIdsForScopeRefresh(market, [reserve.address]).get(address(String(config.oraclePrices))) ?? [])];
+        if (!ids.length) continue;
+        const ix = await scope.refreshPriceListIx({ config: configPubkey as never }, ids);
+        if (ix) for (const account of ix.accounts ?? []) put(account.address);
+      }
     }
   } catch {
     // Scope keys are best-effort — pyth/switchboard-only markets don't use them.
@@ -146,8 +157,8 @@ export async function liquidationAltKeys(input: {
       const clmmKeys = await clmmAltKeys(input.rpcUrl, pairs);
       for (const key of clmmKeys) put(key);
     }
-  } catch {
-    // CLMM keys are best-effort — klend-side ALT coverage is what's critical.
+  } catch (error) {
+    console.warn(`CLMM ALT coverage incomplete: ${error instanceof Error ? error.message : "pool discovery failed"}`);
   }
   return [...keys.values()];
 }

@@ -61,3 +61,20 @@ test("both swap directions use canonical vaults, exact-input and bitmap before t
     assert.equal(await q.buildSwapInstruction(params),null);
   }
 });
+
+test("CLMM RPC follows the configured fallback and shares rejected-primary cooldown", async (t) => {
+  const previous = process.env.SOLANA_RPC_FALLBACK;
+  process.env.SOLANA_RPC_FALLBACK = "https://clmm-fallback.invalid";
+  t.after(() => { if (previous === undefined) delete process.env.SOLANA_RPC_FALLBACK; else process.env.SOLANA_RPC_FALLBACK = previous; });
+  const hosts: string[] = [];
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const host = new URL(String(input)).host; hosts.push(host);
+    if (host === "clmm-primary.invalid") return new Response("forbidden", { status: 403 });
+    const request = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { context: { slot: 1 }, value: null } }), { headers: { "Content-Type": "application/json" } });
+  });
+  const q = new ClmmLocalQuoter("https://clmm-primary.invalid");
+  assert.equal(await (q as any).connection.getAccountInfo(a), null);
+  assert.equal(await (q as any).connection.getAccountInfo(b), null);
+  assert.deepEqual(hosts, ["clmm-primary.invalid", "clmm-fallback.invalid", "clmm-fallback.invalid"]);
+});

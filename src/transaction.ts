@@ -1,11 +1,10 @@
+import { withTimeout } from "./timeout.js";
 import {
   appendTransactionMessageInstructions,
-  compressTransactionMessageUsingAddressLookupTables,
   createTransactionMessage,
   getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
   pipe,
-  sendAndConfirmTransactionFactory,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   signTransactionMessageWithSigners,
@@ -14,12 +13,10 @@ import {
   type Instruction,
   type Rpc,
   type SolanaRpcApi,
+  type Signature,
   type TransactionSigner,
   type TransactionWithBlockhashLifetime,
 } from "@solana/kit";
-
-type AltInfoResponse = { result?: { value?: { data?: { parsed?: { info?: { addresses?: string[] } } } } } };
-const parseAltResponse = async (r: Response): Promise<AltInfoResponse | null> => r.json().catch(() => null);
 
 export async function createSignedTransaction(rpc: Rpc<SolanaRpcApi>, signer: TransactionSigner, instructions: Instruction[]) {
   const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
@@ -37,7 +34,7 @@ export async function fetchLatestBlockhash(rpc: Rpc<SolanaRpcApi>) {
   let delay = 500;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
-      return await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+      return await withTimeout((abortSignal) => rpc.getLatestBlockhash({ commitment: "confirmed" }).send({ abortSignal }), 3_000, "latest blockhash");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const context = (error as { context?: { statusCode?: unknown } } | null)?.context;
@@ -64,48 +61,16 @@ export async function createSignedTransactionWithAlt(
   instructions: Instruction[],
   lookupTableAddresses: Address[],
 ) {
-  const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
-  let message = pipe(
-    createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
-    (tx) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
-    (tx) => appendTransactionMessageInstructions(instructions, tx)
-  );
-  const uniqueTables = [...new Set(lookupTableAddresses.map((a) => a.toString()))];
-  if (uniqueTables.length) {
-    const addressesByLookupTableAddress: Record<string, Address[]> = {};
-    for (const tableAddress of uniqueTables) {
-      // jsonParsed: the node decodes the ALT and returns the address list directly.
-      let response: Awaited<ReturnType<typeof parseAltResponse>> | null = null;
-      for (let attempt = 1; attempt <= 4 && !response?.result?.value?.data?.parsed?.info?.addresses?.length; attempt += 1) {
-        const raw = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAccountInfo", params: [tableAddress, { encoding: "jsonParsed" }] }),
-        }).catch(() => null);
-        if (!raw) continue;
-        if (raw.status === 429) {
-          await new Promise((resolve) => setTimeout(resolve, 1_500 * attempt));
-          continue;
-        }
-        response = (await raw.json().catch(() => null)) as Awaited<ReturnType<typeof parseAltResponse>>;
-      }
-      const addresses = response?.result?.value?.data?.parsed?.info?.addresses;
-      if (addresses?.length) addressesByLookupTableAddress[tableAddress] = addresses.map((a) => a as Address);
-    }
-    const compressed = compressTransactionMessageUsingAddressLookupTables(message, addressesByLookupTableAddress as never);
-    if (compressed) message = compressed as typeof message;
-  }
-  return signTransactionMessageWithSigners(message);
+  // Share the validated lookup resolver, provider failover and packet guard.
+  const { createSignedTransactionWithAltCached } = await import("./strategies/liquidation/hotcache.js");
+  return createSignedTransactionWithAltCached(rpc, rpcUrl, signer, instructions, lookupTableAddresses);
 }
 
 export async function simulate(rpc: Rpc<SolanaRpcApi>, transaction: FullySignedTransaction) {
   const wire = getBase64EncodedWireTransaction(transaction);
-  return rpc.simulateTransaction(wire, {
-    commitment: "confirmed",
-    encoding: "base64",
-    sigVerify: true,
-  }).send();
+  return withTimeout((abortSignal) => rpc.simulateTransaction(wire, {
+    commitment: "confirmed", encoding: "base64", sigVerify: true,
+  }).send({ abortSignal }), 3_000, "simulation");
 }
 
 export async function sendAndConfirm(
@@ -113,29 +78,9 @@ export async function sendAndConfirm(
   rpc: Rpc<SolanaRpcApi>,
   transaction: FullySignedTransaction & TransactionWithBlockhashLifetime,
 ): Promise<string> {
-  const wsUrl = rpcUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-  const { createSolanaRpcSubscriptions } = await import("@solana/kit");
-  const subscriptions = createSolanaRpcSubscriptions(wsUrl);
-  const sender = sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions: subscriptions });
-  const signature = getSignatureFromTransaction(transaction);
-  // Hard timeout: a tx that never confirms (lost blockspace race, expired
-  // blockhash behind a slow send) must RELEASE the fire lane — without this the
-  // sendAndConfirm promise hangs forever and all 3 MAX_FIRE_LANES stall
-  // permanently (the "bot froze overnight" failure mode). The blockhash
-  // lifetime is ≤60s; 90s covers worst-case confirmation latency.
-  const SEND_CONFIRM_TIMEOUT_MS = 90_000;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      sender(transaction, { commitment: "confirmed", skipPreflight: true }),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`sendAndConfirm timeout after ${SEND_CONFIRM_TIMEOUT_MS}ms (sig ${signature}) — confirmation unknown`)), SEND_CONFIRM_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timeout);
-  }
-  return signature;
+  // Poll through the supplied failover RPC; a new primary-only WebSocket
+  // subscription can strand a successfully submitted transaction during outages.
+  return sendAndConfirmPoll(rpc, transaction, 90_000);
 }
 
 /** Missing metadata is unknown, never proof that a transaction paid zero fees. */
@@ -153,35 +98,36 @@ export async function transactionReceipt(rpc: Rpc<SolanaRpcApi>, signature: stri
   }
 }
 
-/**
- * Deterministic send+confirm WITHOUT the websocket subscription factory.
- * The kit's sendAndConfirmTransactionFactory leans on a WS subscription for
- * confirmation; when the WS endpoint is flaky it silently re-submits the SAME
- * signed tx until the blockhash dies (150 slots) and only THEN surfaces the
- * misleading "currentBlockHeight > lastValidBlockHeight" error — seen live on
- * EVERY one-off admin tx (liq-setup extends, alt-reclaim deactivate/close) while
- * fire-path txs through the same factory confirm fine. One-off txs don't need
- * WS at all: raw send + poll getSignatureStatuses. The fire path is untouched.
- */
+/** Submit once through the configured RPC, then confirm with bounded polling. */
 export async function sendAndConfirmPoll(
   rpc: Rpc<SolanaRpcApi>,
   transaction: FullySignedTransaction & TransactionWithBlockhashLifetime,
   timeoutMs = 20_000,
 ): Promise<string> {
   const signature = getSignatureFromTransaction(transaction);
-  await rpc.sendTransaction(getBase64EncodedWireTransaction(transaction), {
-    skipPreflight: true,
-    encoding: "base64",
-  }).send();
+  await withTimeout((abortSignal) => rpc.sendTransaction(getBase64EncodedWireTransaction(transaction), {
+    skipPreflight: true, encoding: "base64",
+  }).send({ abortSignal }), Math.min(timeoutMs, 5_000), "transaction submission");
+  await confirmTransactionSignature(rpc, signature, timeoutMs);
+  return signature;
+}
+
+/** A transient status-RPC error is not an on-chain transaction failure. */
+export async function confirmTransactionSignature(rpc: Rpc<SolanaRpcApi>, signature: Signature, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    const status = (await rpc.getSignatureStatuses([signature]).send()).value?.[0];
-    if (status) {
-      const rep = (_: unknown, v: unknown) => (typeof v === "bigint" ? v.toString() : v);
-      if (status.err) throw new Error(`tx ${signature} failed on-chain: ${JSON.stringify(status.err, rep)}`);
-      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return signature;
+  while (Date.now() < deadline) {
+    let status;
+    try {
+      status = (await withTimeout((abortSignal) => rpc.getSignatureStatuses([signature]).send({ abortSignal }),
+        Math.min(3_000, Math.max(1, deadline - Date.now())), "signature status")).value?.[0];
+    } catch {
+      // Keep the same signature pending; a dropped RPC response proves nothing
+      // about execution. The outer deadline always releases the fire lane.
     }
-    if (Date.now() > deadline) throw new Error(`sendAndConfirmPoll timeout after ${timeoutMs}ms (sig ${signature})`);
+    if (status?.err) throw new Error(`tx ${signature} failed on-chain: ${JSON.stringify(status.err, (_, v) => typeof v === "bigint" ? v.toString() : v)}`);
+    if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return;
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await new Promise(resolve => setTimeout(resolve, Math.min(500, remaining)));
   }
+  throw new Error(`confirmation timeout after ${timeoutMs}ms (sig ${signature}) — confirmation unknown`);
 }

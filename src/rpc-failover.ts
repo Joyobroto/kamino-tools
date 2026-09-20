@@ -87,7 +87,7 @@ function isServerErrorFailure(statusCode: number | undefined, error: unknown): b
  * fallback. If BOTH fail, the primary's error is thrown (it is the one the
  * operator pays for and needs to see).
  */
-export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRpcApi>; state: () => FailoverState } {
+export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRpcApi>; transport: RpcTransport; state: () => FailoverState } {
   const cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const stateKey = options.primaryUrl;
   const state = getState(stateKey);
@@ -137,7 +137,7 @@ export function createFailoverRpc(options: FailoverOptions): { rpc: Rpc<SolanaRp
   }) as RpcTransport;
 
   const rpc = createSolanaRpcFromTransport(selectingTransport);
-  return { rpc, state: () => ({ ...state }) };
+  return { rpc, transport: selectingTransport, state: () => ({ ...state }) };
 }
 
 function safeHost(url: string): string {

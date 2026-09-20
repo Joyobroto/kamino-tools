@@ -202,7 +202,7 @@ const senderConfig = (enabled: boolean): SenderConfig => ({
   bundle: true,
 });
 
-async function runExecutor(options: { prizeUsd: number; minProfitUsd?: number }): Promise<Awaited<ReturnType<typeof executeLiquidationOnce>>> {
+async function runExecutor(options: { prizeUsd: number; minProfitUsd?: number }, overrides: Partial<LiquidationInput> = {}): Promise<Awaited<ReturnType<typeof executeLiquidationOnce>>> {
   capturedInstructions = [];
   return executeLiquidationOnce({
     rpc,
@@ -215,6 +215,7 @@ async function runExecutor(options: { prizeUsd: number; minProfitUsd?: number })
     prizeUsd: options.prizeUsd,
     sender: senderConfig(true),
     deps: { createSignedTransaction, simulate },
+    ...overrides,
   });
 }
 
@@ -311,4 +312,65 @@ test("E2E: post-simulation gate refuses when the measured profit no longer cover
   } finally {
     quoteOutAmount = previous;
   }
+});
+
+test("E2E: limited flash liquidity scales the loan instead of rejecting the signal", async (t) => {
+  t.mock.method(repayReserve, "getLiquidityAvailableAmount", () => new Decimal(500));
+  const outcome = await runExecutor({ prizeUsd: 1 });
+  assert.equal(outcome.passed, true, outcome.passed ? "" : outcome.reason);
+  if (outcome.passed) assert.equal(outcome.plan.repayAmountBaseUnits, 500n);
+});
+
+test("E2E: Token-2022 liquidity still uses SPL Token for the cToken collateral account", async (t) => {
+  const token2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+  t.mock.method(withdrawReserve, "getLiquidityTokenProgram", () => address(token2022));
+  const outcome = await runExecutor({ prizeUsd: 1 });
+  assert.equal(outcome.passed, true, outcome.passed ? "" : outcome.reason);
+  const liquidate = capturedInstructions.flat().find(ix => Buffer.from(ix.data ?? []).subarray(0, 8).equals(Buffer.from([162,161,35,143,30,187,185,103])));
+  assert.equal(liquidate?.accounts?.[16]?.address, TOKEN_PROGRAM);
+  assert.equal(liquidate?.accounts?.[18]?.address, token2022);
+});
+
+test("E2E: same-mint liquidation requires no CLMM pool or swap instruction", async (t) => {
+  t.mock.method(withdrawReserve, "getLiquidityMint", () => address(USDC_MINT));
+  t.mock.method(withdrawReserve, "getMintDecimals", () => 6);
+  t.mock.method(withdrawReserve, "getOracleMarketPrice", () => new Decimal(1));
+  t.mock.method(obligation, "getBorrows", () => [{ reserveAddress: address(REPAY_RESERVE), marketValueRefreshed: new Decimal(1000), amount: new Decimal(1_000_000_000) }]);
+  let quotes = 0;
+  t.mock.method(ClmmLocalQuoter.prototype, "quoteExactIn", async () => { quotes++; throw new Error("same-mint must not quote"); });
+  const outcome = await runExecutor({ prizeUsd: 1 });
+  assert.equal(outcome.passed, true, outcome.passed ? "" : outcome.reason);
+  assert.equal(quotes, 0);
+  if (outcome.passed) assert.equal(outcome.plan.swapSource, "same-mint");
+  assert.ok(capturedInstructions.flat().every(ix => ix.programAddress !== CLMM_PROGRAM));
+});
+
+test("E2E: invalid slippage and zero collateral prices fail before quote or assembly", async (t) => {
+  const invalid = await runExecutor({ prizeUsd: 1 }, { slippageBps: 10000 });
+  assert.equal(invalid.passed, false);
+  if (!invalid.passed) assert.match(invalid.reason, /slippage/);
+  t.mock.method(withdrawReserve, "getOracleMarketPrice", () => new Decimal(0));
+  const zero = await runExecutor({ prizeUsd: 1 });
+  assert.equal(zero.passed, false);
+  if (!zero.passed) assert.match(zero.reason, /collateral reserve price invalid/);
+});
+
+test("E2E: Scope refresh is included in every simulated liquidation, without a separate warmup", async (t) => {
+  const { Scope } = await import("@kamino-finance/scope-sdk");
+  const feed = address(pk(211)), scopeProgram = address(pk(212));
+  const info = (withdrawReserve as any).state.config.tokenInfo;
+  const previous = info.scopeConfiguration;
+  info.scopeConfiguration = { priceFeed: feed, priceChain: [1,65535,65535,65535], twapChain: [65535,65535,65535,65535] };
+  t.after(() => { info.scopeConfiguration = previous; });
+  t.mock.method(Scope.prototype, "getAllConfigurations", async () => [[pk(213), { oraclePrices: feed }]]);
+  t.mock.method(Scope.prototype, "refreshPriceListIx", async () => ({ programAddress: scopeProgram, accounts: [], data: new Uint8Array([42]) }));
+  const outcome = await runExecutor({ prizeUsd: 1 });
+  assert.equal(outcome.passed, true, outcome.passed ? "" : outcome.reason);
+  assert.ok(capturedInstructions.length > 0);
+  for (const instructions of capturedInstructions) {
+    const refresh = instructions.findIndex(ix => ix.programAddress === scopeProgram);
+    const borrow = instructions.findIndex(ix => Buffer.from(ix.data ?? []).subarray(0, 8).equals(Buffer.from([135,231,52,167,7,52,212,193])));
+    assert.ok(refresh >= 0 && refresh < borrow, "Scope must run before the atomic flash loan");
+  }
+  assert.ok(!("warmupTransaction" in outcome));
 });

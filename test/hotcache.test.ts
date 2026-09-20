@@ -112,3 +112,25 @@ test("real signed packet fits with ALT compression and rejects uncovered oversiz
   assert.ok(Buffer.from(getBase64EncodedWireTransaction(signed), "base64").length < 1232);
   await assert.rejects(createSignedTransactionWithAltCached(rpc, url, signer, [ix], []), /1232-byte packet.*uncovered=/);
 });
+
+import { getCachedAltTables } from "../src/strategies/liquidation/hotcache.js";
+test("cold lookup tables share one batched read, including concurrent consumers", async () => {
+  const other = "4QwAVEF4fqorgzaPDqvGyqJM6kwp3GmypGwf1QLnDy21";
+  let calls = 0;
+  const rpc = { getMultipleAccounts: (keys: unknown[]) => ({ send: async () => {
+    calls++; assert.equal(keys.length, 2); return { value: [validTable, validTable] };
+  } }) } as unknown as Rpc<SolanaRpcApi>;
+  const url = "https://alt-batch.invalid";
+  const [first, second] = await Promise.all([getCachedAltTables(url, [table, other], rpc), getCachedAltTables(url, [table, other], rpc)]);
+  assert.equal(calls, 1); assert.deepEqual(first, second); assert.equal(Object.keys(first).length, 2);
+  await getCachedAltTables(url, [table, other], rpc); assert.equal(calls, 1);
+});
+test("batch lookup failure is recoverable and missing tables cannot be silently omitted", async () => {
+  let calls = 0;
+  const rpc = { getMultipleAccounts: () => ({ send: async () => {
+    calls++; return { value: [calls === 1 ? null : validTable] };
+  } }) } as unknown as Rpc<SolanaRpcApi>;
+  const url = "https://alt-batch-retry.invalid";
+  await assert.rejects(getCachedAltTables(url, [table], rpc), /ALT unavailable/);
+  assert.equal(Object.keys(await getCachedAltTables(url, [table], rpc)).length, 1);
+});

@@ -1,3 +1,4 @@
+import { confirmTransactionSignature } from "../../transaction.js";
 /**
  * Helius Sender — execution-only transaction submission lane.
  *
@@ -297,7 +298,7 @@ export async function sendViaSenderBundle(input: {
   transactions: string[];
   signal?: AbortSignal;
 }): Promise<void> {
-  if (!input.transactions.length) throw new Error("Sender bundle needs at least one transaction");
+  if (!input.transactions.length || input.transactions.length > 5) throw new Error("Sender bundle needs 1–5 transactions");
   const url = senderEndpointForTier(input.endpoint, "max");
   const response = await fetch(url, {
     method: "POST",
@@ -313,6 +314,7 @@ export async function sendViaSenderBundle(input: {
   if (!response.ok) throw new Error(`Sender bundle HTTP ${response.status}`);
   const json = (await response.json()) as { result?: unknown; error?: { code?: number; message?: string } };
   if (json.error) throw new Error(`Sender bundle rejected (${json.error.code ?? "?"}): ${json.error.message ?? "unknown error"}`);
+  if (!json.result) throw new Error("Sender bundle returned no result");
 }
 
 /** Keeps the Sender HTTP connection warm during idle periods (>5s between fires). */export async function warmSenderConnection(endpoint: string, signal?: AbortSignal): Promise<void> {
@@ -337,14 +339,5 @@ export async function confirmSignature(
   signature: Signature,
   timeoutMs = 60_000,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const status = (await rpc.getSignatureStatuses([signature]).send()).value?.[0];
-    if (status) {
-      if (status.err) throw new Error(`tx ${signature} failed on-chain: ${JSON.stringify(status.err)}`);
-      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return;
-    }
-    if (Date.now() > deadline) throw new Error(`confirmation timeout after ${timeoutMs}ms (sig ${signature})`);
-  }
+  return confirmTransactionSignature(rpc, signature, timeoutMs);
 }

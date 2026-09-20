@@ -1,3 +1,4 @@
+import { createFailoverRpc } from "../../rpc-failover.js";
 import { Connection, PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import BN from "bn.js";
 
@@ -125,13 +126,22 @@ export class ClmmLocalQuoter {
   }
 
   constructor(rpcUrl: string) {
+    const fallback = process.env.SOLANA_RPC_FALLBACK;
+    const transport = fallback && fallback !== rpcUrl
+      ? createFailoverRpc({ primaryUrl: rpcUrl, fallbackUrl: fallback }).transport : undefined;
     this.connection = new Connection(rpcUrl, {
       commitment: "processed", disableRetryOnRateLimit: true,
       fetch: async (url, init) => {
-        if (Date.now() < this.retryAfter) throw new Error("CLMM RPC cooldown");
-        const response = await fetch(url, { ...init, signal: AbortSignal.timeout(1_500) });
+        const signal = AbortSignal.timeout(1_500);
+        // Raydium expects web3.js accounts, but its requests must share the
+        // scanner's provider failover and cooldown state.
+        if (transport) {
+          const result = await transport({ payload: JSON.parse(String(init?.body)), signal });
+          return new Response(JSON.stringify(result, (_, value) => typeof value === "bigint" ? Number(value) : value),
+            { headers: { "Content-Type": "application/json" } });
+        }
+        const response = await fetch(url, { ...init, signal });
         if (!response.ok) {
-          this.retryAfter = Date.now() + ([401, 403].includes(response.status) ? 300_000 : 30_000);
           await response.body?.cancel();
           throw new Error(`CLMM RPC HTTP ${response.status}`);
         }

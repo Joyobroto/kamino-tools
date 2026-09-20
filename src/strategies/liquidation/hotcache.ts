@@ -127,9 +127,41 @@ export async function getCachedAltAddresses(
   return promise.then((cached) => cached.addresses);
 }
 
-/** Pre-warm our persistent ALT + the Jupiter route tables in the background. */
+/** Batch cold tables into one RPC call instead of bursting one request per ALT. */
+export async function getCachedAltTables(rpcUrl: string, tables: string[], rpc?: Rpc<SolanaRpcApi>): Promise<Record<string, Address[]>> {
+  const unique = [...new Set(tables)];
+  const missing = unique.filter(table => {
+    const key = `${rpcUrl}|${table}`, cached = altCache.get(key);
+    return (!cached || Date.now() - cached.fetchedAt >= ALT_MAX_AGE_MS) && !altInFlight.has(key);
+  });
+  if (missing.length) {
+    const batch = (async () => {
+      const client = rpc ?? (await import("../../kamino.js")).rpcClient(rpcUrl);
+      const { value } = await client.getMultipleAccounts(missing.map(address), {
+        encoding: "jsonParsed", commitment: "confirmed",
+      }).send({ abortSignal: AbortSignal.timeout(3_000) });
+      return value;
+    })();
+    missing.forEach((table, index) => {
+      const key = `${rpcUrl}|${table}`;
+      const pending = batch.then(values => {
+        const value = values[index];
+        const info = (value?.data as { parsed?: { info?: { addresses?: string[]; deactivationSlot?: unknown } } } | undefined)?.parsed?.info;
+        if (value?.owner !== "AddressLookupTab1e1111111111111111111111111" || !info?.addresses?.length
+          || String(info.deactivationSlot) !== "18446744073709551615") throw new Error(`ALT unavailable: ${table} (missing, empty, invalid or deactivating)`);
+        const cached = { addresses: info.addresses.map(address), fetchedAt: Date.now() };
+        altCache.set(key, cached);
+        return cached;
+      }).finally(() => altInFlight.delete(key));
+      altInFlight.set(key, pending);
+    });
+  }
+  return Object.fromEntries(await Promise.all(unique.map(async table => [table, await getCachedAltAddresses(rpcUrl, table, rpc)])));
+}
+
+/** Pre-warm all configured tables in a single batch. */
 export function warmAltTables(rpcUrl: string, tables: Array<string>): void {
-  for (const t of tables) void getCachedAltAddresses(rpcUrl, t).catch(() => {});
+  void getCachedAltTables(rpcUrl, tables).catch(() => {});
 }
 
 /** Avoid paying a 34-byte table header to compress just one 32-byte key.
@@ -182,7 +214,7 @@ export async function createSignedTransactionWithAltCached(
   const uniqueTables = [...new Set(lookupTableAddresses.map(String))];
   const [latestBlockhash, altResults] = await Promise.all([
     getCachedBlockhash(rpc, rpcUrl),
-    Promise.all(uniqueTables.map(async (table) => [table, await getCachedAltAddresses(rpcUrl, table, rpc)] as const)),
+    getCachedAltTables(rpcUrl, uniqueTables, rpc),
   ]);
   const message = pipe(
     createTransactionMessage({ version: 0 }),
@@ -194,7 +226,7 @@ export async function createSignedTransactionWithAltCached(
     (tx) => appendTransactionMessageInstructions(instructions, tx),
   );
   const tables: Record<string, Address[]> = {};
-  for (const [table, addresses] of altResults) if (addresses.length) tables[table] = addresses;
+  for (const [table, addresses] of Object.entries(altResults)) if (addresses.length) tables[table] = addresses;
   const optimized = selectLookupTables(instructions, signer.address, tables);
   onCoverage?.(optimized.uncovered);
   const compressed = compressTransactionMessageUsingAddressLookupTables(message, optimized.tables as never);

@@ -1,3 +1,4 @@
+import { withTimeout } from "../../timeout.js";
 import { withDeadline, validateRoutes } from "./pipeline.js";
 import { isHealthyLiquidationVeto, isClmmRouteFailure } from "./simulation-error.js";
 /**
@@ -232,9 +233,6 @@ type LiquidationOutcomeBody =
         swapSource?: string;
       };
       transaction: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>>;
-      /** Sender-bundle only: the Scope RefreshPriceList as a preceding tx in the
-       *  same atomic bundle, split out of the sandwich to stay under 1232 bytes. */
-      warmupTransaction?: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>>;
       signer: TransactionSigner;
       computeUnitsConsumed: bigint;
       instructions: number;
@@ -386,8 +384,16 @@ export function choosePriorityFee(params: {
   return { microlamportsPerCu: micro, tipUsd: cappedBid, lane: `${bucket.label} (~$${cappedBid.toFixed(2)})` };
 }
 
-export async function executeLiquidationOnce(input: LiquidationInput): Promise<LiquidationOutcome> {
+export function executeLiquidationOnce(input: LiquidationInput): Promise<LiquidationOutcome> {
+  // Planning never submits transactions. Late read/sign work cannot broadcast,
+  // and a hung provider must release the caller's execution slot.
+  return withTimeout(() => executeLiquidationAttempt(input), 12_000, "liquidation planning");
+}
+
+async function executeLiquidationAttempt(input: LiquidationInput): Promise<LiquidationOutcome> {
   const { rpc, market, obligationAddress } = input;
+  if (!Number.isInteger(input.slippageBps) || input.slippageBps < 0 || input.slippageBps >= 10_000)
+    return { stage: "plan", passed: false, reason: "slippage must be an integer from 0 to 9999 bps" };
   const buildTransaction = input.deps?.createSignedTransaction ?? createSignedTransactionWithAltCached;
   const simulateTransaction = input.deps?.simulate ?? simulate;
   const timings: Record<string, number> = {};
@@ -437,7 +443,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   // Collateral must be seizable: loanToValuePct > 0 (deposit-only reserves cannot be seized).
   const withdrawPick = sortedDeposits.find((d) => d.reserve.state.config.loanToValuePct > 0);
   const withdrawReserve = withdrawPick?.reserve;
-  if (!withdrawReserve) return { stage: "plan", passed: false, reason: "no collateral reserve candidate (none seizable)", timings };
+  if (!withdrawPick || !withdrawReserve) return { stage: "plan", passed: false, reason: "no collateral reserve candidate (none seizable)", timings };
 
   const sortedBorrows = borrows
     .filter((b): b is { borrow: (typeof borrows)[number]["borrow"]; reserve: KaminoReserve } => b.reserve !== undefined && b.borrow.marketValueRefreshed.gt(0))
@@ -451,24 +457,11 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     return { stage: "plan", passed: false, reason: "debt reserve has flash loans disabled", timings };
   }
 
-  // 2. Repay amount: close factor from the MARKET STATE (docs best practice) × the
-  // target borrow position, capped by flash availability.
-  const closeFactorPct = Number(market.state.liquidationMaxDebtCloseFactorPct) || 100;
+  const closeFactorPct = Number(market.state.liquidationMaxDebtCloseFactorPct);
+  if (!Number.isFinite(closeFactorPct) || closeFactorPct <= 0 || closeFactorPct > 100)
+    return { stage: "plan", passed: false, reason: "invalid market close factor", timings };
   const debtPriceBase = usdPerBaseUnit(repayReserve);
-  if (debtPriceBase.lte(0)) return { stage: "plan", passed: false, reason: "repay reserve price invalid" , timings };
-  // Docs best practice: repay = target borrow POSITION (lamports) × close factor —
-  // avoids a USD round-trip that can drift against the program's own math.
-  const repayAmountBaseUnits = BigInt(
-    repayPick.borrow.amount.mul(new Decimal(closeFactorPct)).div(100).floor().toFixed(0),
-  );
-  if (repayAmountBaseUnits <= 0n) return { stage: "plan", passed: false, reason: "repay amount rounds to zero" , timings };
-
-  const repayUsd = Number(new Decimal(repayAmountBaseUnits.toString()).mul(debtPriceBase).toFixed(4));
-
-  const available = BigInt(repayReserve.getLiquidityAvailableAmount().floor().toFixed(0));
-  if (repayAmountBaseUnits > available) {
-    return { stage: "plan", passed: false, reason: `flash borrow ${repayAmountBaseUnits} > available ${available}` , timings };
-  }
+  if (!debtPriceBase.isFinite() || debtPriceBase.lte(0)) return { stage: "plan", passed: false, reason: "repay reserve price invalid", timings };
 
   // 3. Estimate the collateral the program will redeem for us — the LIQUIDATION
   //    BONUS comes from the WITHDRAW (collateral) reserve's config, not the debt
@@ -478,6 +471,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //    applies min/max, solvency, and bad-debt caps on-chain; the estimate is
   //    still only a quote input and the transaction is simulation-gated.
   const collPriceBase = usdPerBaseUnit(withdrawReserve);
+  if (!collPriceBase.isFinite() || collPriceBase.lte(0)) return { stage: "plan", passed: false, reason: "collateral reserve price invalid", timings };
   const bonus = dynamicLiquidationBonus({
     healthFactor: health,
     liquidationThresholdPct: withdrawReserve.state.config.liquidationThresholdPct,
@@ -487,6 +481,21 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       ? { badDebtBonus: Number(withdrawReserve.state.config.badDebtLiquidationBonusBps) / 10_000 }
       : {}),
   });
+  // Borrow only what this collateral position and both reserve vaults can
+  // support. Over-borrowing can leave flash principal unpaid after a partial
+  // liquidation, even if a quote for the assumed collateral looked profitable.
+  const collateralUsd = Decimal.min(withdrawPick.deposit.marketValueRefreshed,
+    withdrawReserve.getLiquidityAvailableAmount().mul(collPriceBase));
+  const maxBonus = Math.max(bonus, Number(withdrawReserve.state.config.maxLiquidationBonusBps) / 10_000);
+  const repayAmountBaseUnits = BigInt(Decimal.min(
+    repayPick.borrow.amount.mul(closeFactorPct).div(100),
+    repayReserve.getLiquidityAvailableAmount(),
+    new Decimal(market.state.maxLiquidatableDebtMarketValueAtOnce?.toString() ?? Infinity).div(debtPriceBase),
+    collateralUsd.div(new Decimal(1).add(maxBonus)).div(debtPriceBase),
+  ).floor().toFixed(0));
+  if (repayAmountBaseUnits <= 0n) return { stage: "plan", passed: false, reason: "repay amount rounds to zero or collateral liquidity unavailable", timings };
+  const repayUsd = Number(new Decimal(repayAmountBaseUnits.toString()).mul(debtPriceBase).toFixed(4));
+
   const protocolFeePct = Number(withdrawReserve.state.config.protocolLiquidationFeePct ?? 0);
   const estCollateralBaseUnits = estimateCollateralForRepay({
     repayAmountBaseUnits,
@@ -595,7 +604,10 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   };
   done();
   done = mark("quoteWait");
-  const localPlan = withDeadline(buildLocalClmmPlan(), 2_000);
+  const sameMint = withdrawReserve.getLiquidityMint() === repayReserve.getLiquidityMint();
+  const localPlan: Promise<SwapPlan | null> = sameMint
+    ? Promise.resolve({ swapInstructions: [], lookupTables: [], swapOut: estCollateralBaseUnits, swapOutMin: estCollateralBaseUnits, source: "same-mint" })
+    : withDeadline(buildLocalClmmPlan(), 2_000);
   // Fire-path trim: ATA existence (OUR hot ATAs — created once by liq-setup)
   // is cached process-lifetime once seen; a known-existing ATA needs NO
   // getAccountInfo round-trip. Only genuinely unknown states hit the RPC.
@@ -646,7 +658,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       }),
     );
   }
-  if (!collAtaState) {
+  if (!collAtaState && collAta !== debtAta) {
     setupInstructions.push(
       await createAtaInstruction({
         payer: signer,
@@ -684,14 +696,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   for (const borrow of obligation.getBorrows()) refreshAccounts.push({ address: borrow.reserveAddress, writable: true });
   const uniqueReserveAddresses = [...new Set(refreshAccounts.map((meta) => meta.address.toString()))];
   const preInstructions: Instruction[] = [];
-  // Scope RefreshPriceList warmups: a pure oracle refresh that does NOT need to
-  // be atomic with the sandwich. On the Sender lane they move to their own
-  // preceding transaction, submitted as an atomic bundle with the sandwich
-  // (bundles are ordered + atomic) — this keeps the account-heavy liquidation
-  // tx inside the 1232-byte packet. On the plain RPC lane they stay inline (no
-  // ordering guarantee). See the scope block below.
-  const warmupInstructions: Instruction[] = [];
-  const bundleWarmup = Boolean(senderLane);
+  // Keep oracle refreshes in the SAME transaction as liquidation. A standalone
+  // simulateTransaction cannot see a preceding bundle member's state changes.
   // Sender tip transfer rides the same sandwich (atomic with borrow/liquidate/
   // repay): it is rolled back if the liquidation reverts, so a rejected tx only
   // burns base + priority fee, not the tip.
@@ -721,8 +727,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       if (!tokenIds.length) continue;
       const refreshIx = await scope.refreshPriceListIx({ config: configPubkey as never }, tokenIds);
       if (refreshIx) {
-        if (bundleWarmup) warmupInstructions.push(refreshIx as Instruction);
-        else preInstructions.push(refreshIx as Instruction);
+        preInstructions.push(refreshIx as Instruction);
       }
     }
   } catch {
@@ -764,7 +769,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
         userSourceLiquidity: debtAta,
         userDestinationCollateral: cTokenAta,
         userDestinationLiquidity: collAta,
-        collateralTokenProgram: withdrawReserve.getLiquidityTokenProgram(),
+        collateralTokenProgram: TOKEN_PROGRAM_ADDRESS,
         repayLiquidityTokenProgram: repayReserve.getLiquidityTokenProgram(),
         withdrawLiquidityTokenProgram: withdrawReserve.getLiquidityTokenProgram(),
         instructionSysvarAccount: SYSVAR_INSTRUCTIONS_ADDRESS,
@@ -820,24 +825,6 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //   → FlashBorrow(debt) → RefreshReserve(debt AGAIN — clears flash's mark_stale)
   //   → Liquidate → Swap → FlashRepay
   // (the chain is assembled per-swap-plan inside buildSwapChain below)
-
-  // Bundle warmup: build the Scope refresh as its own signed transaction so the
-  // account-heavy sandwich tx shrinks below 1232 bytes. It needs no swap, so it
-  // rides OUR ALT only (which now holds the Scope config/oraclePrices/feeds).
-  let warmupTransaction: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | undefined;
-  if (bundleWarmup && warmupInstructions.length) {
-    const warmupBudget: Instruction[] = [getSetComputeUnitLimitInstruction({ units: 400_000 })];
-    if (priority.microlamportsPerCu > 0) {
-      warmupBudget.push(getSetComputeUnitPriceInstruction({ microLamports: BigInt(priority.microlamportsPerCu) }));
-    }
-    warmupTransaction = await buildTransaction(
-      rpc,
-      input.rpcUrl,
-      signer,
-      [...warmupBudget, ...warmupInstructions],
-      input.lookupTableAddresses ?? [],
-    );
-  }
 
   done = mark("assemble");
   const buildSwapChain = (plan: SwapPlan) =>
@@ -1047,7 +1034,6 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       ...(activePlan.source ? { swapSource: activePlan.source } : {}),
     },
     transaction: finalTransaction,
-    ...(warmupTransaction ? { warmupTransaction } : {}),
     signer,
     computeUnitsConsumed: consumedUnits,
     routeDiagnostics: [...quoteDiagnostics, ...routeFailures, ...packetSizes],
