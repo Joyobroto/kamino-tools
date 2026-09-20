@@ -6,7 +6,7 @@
  * the simulation. Everything else is the real code path:
  *
  *   hydrate (prehydrated) → health gate → pair selection → collateral estimate →
- *   swap quote (Jupiter via mocked fetch) → assemble 15-ix sandwich with the
+ *   swap quote (mocked local CLMM) → assemble 15-ix sandwich with the
  *   Sender tip → packet guard → simulation → profit guard → Sender cost gate →
  *   ready → broadcastLiquidation → Sender JSON-RPC → confirmation on data RPC.
  *
@@ -14,10 +14,12 @@
  * embeds the tip transfer, and that the broadcast router posts to the correct
  * Sender endpoint with skipPreflight/maxRetries=0 and confirms.
  */
+import { ClmmLocalQuoter } from "../src/strategies/liquidation/clmm.js";
+import { mock } from "node:test";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { Decimal } from "decimal.js";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budget";
 import {
   address,
@@ -53,10 +55,10 @@ const WITHDRAW_RESERVE = pk(12); // WSOL side
 const OBLIGATION = pk(100);
 const NULL_ORACLE = "11111111111111111111111111111111";
 const BLOCKHASH = "11111111111111111111111111111111";
-const JUPITER_V6 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const REPAY_AMOUNT_BASE_UNITS = 1_000_000_000n;
 
-// ── Mocked external HTTP: Jupiter quote/instructions + Sender submission ────────
+// ── Mocked external HTTP: Sender submission only ────────
 let quoteOutAmount = "1010000000";
 const senderRequests: Array<{ url: string; body: { method?: string; params: unknown[] } }> = [];
 const SENT_SIGNATURE = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
@@ -65,34 +67,27 @@ const jsonResponse = (payload: unknown): Response =>
 
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-  if (url.includes("jup.ag") && url.includes("/quote")) {
-    return jsonResponse({
-      inputMint: WSOL_MINT, outputMint: USDC_MINT, inAmount: "6666666666", outAmount: quoteOutAmount,
-      swapMode: "ExactIn", slippageBps: 50, routePlan: [{ swapInfo: { label: "Raydium" } }],
-    });
-  }
-  if (url.includes("jup.ag") && url.includes("swap-instructions")) {
-    return jsonResponse({
-      swapInstruction: {
-        programId: JUPITER_V6, data: "AQIDBA==",
-        accounts: [
-          { pubkey: WSOL_MINT, isSigner: false, isWritable: true },
-          { pubkey: USDC_MINT, isSigner: false, isWritable: true },
-          { pubkey: pk(9), isSigner: false, isWritable: false },
-        ],
-      },
-      setupInstructions: [], cleanupInstruction: null, otherInstructions: [],
-      computeBudgetInstructions: [], addressLookupTableAddresses: [],
-    });
-  }
   if (url.includes("sender.helius-rpc.com")) {
     senderRequests.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
     return jsonResponse({ jsonrpc: "2.0", id: "1", result: SENT_SIGNATURE });
   }
   if (url.endsWith("/ping")) return jsonResponse({});
-  // CLMM registry / KSwap / anything else: fail cleanly so the hedge routes drop out.
+  // Any aggregator request is unexpected in the CLMM-only executor.
   throw new Error(`unexpected fetch in E2E: ${url}`);
 }) as typeof fetch;
+
+mock.method(ClmmLocalQuoter.prototype, "quoteExactIn", async () => ({
+  allTradeConfirmed: () => true,
+  amountOutBigInt: () => BigInt(quoteOutAmount),
+  amountOutMinBigInt: () => BigInt(quoteOutAmount) * 9950n / 10000n,
+}));
+mock.method(ClmmLocalQuoter.prototype, "buildSwapInstruction", async () => ({
+  poolId: new PublicKey(pk(9)),
+  instruction: new TransactionInstruction({
+    programId: new PublicKey(CLMM_PROGRAM), data: Buffer.from([1, 2, 3, 4]),
+    keys: [WSOL_MINT, USDC_MINT].map(pubkey => ({ pubkey: new PublicKey(pubkey), isSigner: false, isWritable: true })),
+  }),
+}));
 
 // ── Mocked data RPC (blockhash, ATA reads, status polling) ─────────────────────
 const rpc = {
@@ -249,7 +244,7 @@ test("E2E: due obligation reaches ready and embeds the tip in the atomic sandwic
 
   // Flash borrow + liquidate program is present, and the swap backend resolved.
   assert.ok(instructions.some((ix) => String(ix.programAddress) === KLEND), "klend liquidation instructions missing");
-  assert.ok(outcome.plan.swapSource?.startsWith("jupiter"), `unexpected swap source ${outcome.plan.swapSource}`);
+  assert.ok(outcome.plan.swapSource?.startsWith("clmm-local/"), `unexpected swap source ${outcome.plan.swapSource}`);
   assert.equal(outcome.plan.repayReserveSymbol, "USDC");
   assert.equal(outcome.plan.withdrawReserveSymbol, "WSOL");
 });

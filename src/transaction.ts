@@ -6,7 +6,7 @@ import {
   getSignatureFromTransaction,
   pipe,
   sendAndConfirmTransactionFactory,
-  setTransactionMessageFeePayer,
+  setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   signTransactionMessageWithSigners,
   type Address,
@@ -25,7 +25,7 @@ export async function createSignedTransaction(rpc: Rpc<SolanaRpcApi>, signer: Tr
   const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
   const message = pipe(
     createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayer(signer.address, tx),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
     (tx) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
     (tx) => appendTransactionMessageInstructions(instructions, tx)
   );
@@ -67,7 +67,7 @@ export async function createSignedTransactionWithAlt(
   const { value: latestBlockhash } = await fetchLatestBlockhash(rpc);
   let message = pipe(
     createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayer(signer.address, tx),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
     (tx) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
     (tx) => appendTransactionMessageInstructions(instructions, tx)
   );

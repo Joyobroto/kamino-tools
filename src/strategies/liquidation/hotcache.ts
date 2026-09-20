@@ -1,5 +1,5 @@
 import { address, getBase64EncodedWireTransaction, type Address, type Instruction, type Rpc, type SolanaRpcApi, type TransactionSigner } from "@solana/kit";
-import { compressTransactionMessageUsingAddressLookupTables, appendTransactionMessageInstructions, createTransactionMessage, pipe, setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash, signTransactionMessageWithSigners } from "@solana/kit";
+import { compressTransactionMessageUsingAddressLookupTables, appendTransactionMessageInstructions, createTransactionMessage, pipe, setTransactionMessageFeePayerSigner, setTransactionMessageLifetimeUsingBlockhash, signTransactionMessageWithSigners } from "@solana/kit";
 
 /**
  * Hot-path caches for the liquidation executor (the LionX latency attack).
@@ -82,6 +82,13 @@ const ALT_MAX_AGE_MS = 10 * 60_000; // tables are append-only; 10 min is generou
 const altCache = new Map<string, CachedAlt>();
 const altInFlight = new Map<string, Promise<CachedAlt>>();
 
+/** Prime the ALT content cache with a candidate address list (validation /
+ * diag tooling): lets you measure packet sizes for an ALT that is planned but
+ * not yet on-chain. */
+export function primeAltCache(rpcUrl: string, tableAddress: string, addresses: Address[]): void {
+  altCache.set(`${rpcUrl}|${tableAddress}`, { addresses, fetchedAt: Date.now() });
+}
+
 /** Resolve tables through the same failover transport as execution. Never
  * silently omit a requested table: that misreports RPC outages as packet errors. */
 export async function getCachedAltAddresses(
@@ -136,6 +143,10 @@ export function selectLookupTables(instructions: readonly Instruction[], payer: 
     eligible.add(account.address);
   }
   for (const key of excluded) eligible.delete(key);
+  // The limit applies to accounts referenced by the MESSAGE, not the sum of
+  // stored addresses in its tables. Never truncate/reindex on-chain tables.
+  const allAccounts = new Set([...excluded, ...eligible]);
+  if (allAccounts.size > 256) throw new Error(`transaction references ${allAccounts.size} accounts; maximum is 256`);
   const selected: Record<string, Address[]> = {};
   const remaining = new Map(Object.entries(tables));
   for (;;) {
@@ -147,8 +158,10 @@ export function selectLookupTables(instructions: readonly Instruction[], payer: 
     }
     if (!best) break;
     const keys = remaining.get(best)!;
-    selected[best] = keys;
-    keys.forEach((key) => eligible.delete(key));
+    const used = keys.filter((key) => eligible.has(key));
+    if (!used.length) break;
+    selected[best] = keys; // Preserve the actual on-chain address indexes.
+    used.forEach((key) => eligible.delete(key));
     remaining.delete(best);
   }
   return { tables: selected, uncovered: [...eligible] };
@@ -171,9 +184,9 @@ export async function createSignedTransactionWithAltCached(
     getCachedBlockhash(rpc, rpcUrl),
     Promise.all(uniqueTables.map(async (table) => [table, await getCachedAltAddresses(rpcUrl, table, rpc)] as const)),
   ]);
-  let message = pipe(
+  const message = pipe(
     createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayer(signer.address, tx),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
     (tx) => setTransactionMessageLifetimeUsingBlockhash(
       { blockhash: latestBlockhash.blockhash as never, lastValidBlockHeight: latestBlockhash.lastValidBlockHeight },
       tx,
@@ -184,16 +197,13 @@ export async function createSignedTransactionWithAltCached(
   for (const [table, addresses] of altResults) if (addresses.length) tables[table] = addresses;
   const optimized = selectLookupTables(instructions, signer.address, tables);
   onCoverage?.(optimized.uncovered);
-  const candidates = [tables, optimized.tables];
-  let best: Awaited<ReturnType<typeof signTransactionMessageWithSigners>> | undefined;
-  let bestBytes = Infinity;
-  for (const coverage of candidates) {
-    const compressed = compressTransactionMessageUsingAddressLookupTables(message, coverage as never);
-    const signed = await signTransactionMessageWithSigners(compressed);
-    const bytes = Buffer.from(getBase64EncodedWireTransaction(signed), "base64").length;
-    if (bytes < bestBytes) { best = signed; bestBytes = bytes; }
-  }
-  return best!;
+  const compressed = compressTransactionMessageUsingAddressLookupTables(message, optimized.tables as never);
+  // Preserve encoder/signing errors instead of hiding the cause behind a generic
+  // "no encodable coverage" error.
+  const best = await signTransactionMessageWithSigners(compressed);
+  const bytes = Buffer.from(getBase64EncodedWireTransaction(best), "base64").length;
+  if (bytes > 1232) throw new Error(`tx exceeds 1232-byte packet with resolved LUTs (${bytes} bytes); uncovered=${optimized.uncovered.join(",")}; extend liquidation ALT coverage with liq-setup`);
+  return best;
 }
 
 // ─── Scope configuration cache ──────────────────────────────────────────────

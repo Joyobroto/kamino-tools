@@ -1,4 +1,4 @@
-import { firstUsable, withDeadline, validateRoutes } from "./pipeline.js";
+import { withDeadline, validateRoutes } from "./pipeline.js";
 import { isHealthyLiquidationVeto, isClmmRouteFailure } from "./simulation-error.js";
 /**
  * Kamino liquidation executor — builds the atomic flash-borrow liquidation
@@ -8,12 +8,12 @@ import { isHealthyLiquidationVeto, isClmmRouteFailure } from "./simulation-error
  *   refreshReserve(repay) + refreshReserve(withdraw) [+ any other obligation
  *     reserves] → refreshObligation → flashBorrow(debt asset) →
  *     LiquidateObligationAndRedeemReserveCollateralV2 (repays debt, redeems
- *     collateral to us) → Jupiter swap (collateral → debt asset) → flashRepay.
+ *     collateral to us) → local CLMM swap (collateral → debt asset) → flashRepay.
  *
  * Verdict chain (hard gates, same vocabulary as the LST executor):
  *   1. plan      — obligation must be DUE; repay amount sized to close factor;
  *                  flash borrow + swap must both be feasible
- *   2. assemble  — refresh + liquidate + Jupiter swap instructions embedded in
+ *   2. assemble  — refresh + liquidate + local CLMM swap instructions embedded in
  *                  the flash-loan sandwich
  *   3. simulate  — full mainnet simulation; flashRepay must succeed
  *   4. guards    — worst-case net profit (min-out floors) ≥ profit floor
@@ -66,11 +66,9 @@ import { createSignedTransactionWithAltCached, getCachedScopeConfigurations, get
 import { getClmmQuoter, web3InstructionToExternal } from "./clmm.js";
 import { PublicKey } from "@solana/web3.js";
 import BNImport from "bn.js";
-import { fetchKswapRoutes } from "./kswap.js";
 import { safeJsonStringify } from "../../ui.js";
 import { buildMarketReserveMap, dynamicLiquidationBonus, healthFactor, obligationToCandidate } from "./filters.js";
 import { hydrateShortlist, withBackoff } from "./screener.js";
-import { applySlippage, fetchRawQuote, fetchSwapInstructions } from "../arb/lst-arb.js";
 import { buildSenderTipInstruction, chooseSenderLane, FALLBACK_SOL_USD, priorityMicrolamports, type SenderConfig, type SenderLane, type SenderTier } from "./sender.js";
 
 const ATA_PROGRAM = "ATokenGPvbdgxrpT2sgsWoLtT8H9y6hktjssKpsrjqer";
@@ -100,7 +98,7 @@ type FarmAccounts = {
  * Resolve the farm accounts the liquidation V2 ix must carry — ZERO added fire
  * latency because it joins the existing paralel Promise.all (collateralForFarm
  * derivation is local math; only ONE batched getMultipleAccounts, kicked at the
- * same instant as the Jupiter quote).
+ * same instant as the CLMM quote).
  *
  * 6120/FarmAccountsMissing happens when an obligation JOINED a Kamino lending
  * farm for the repay/withdraw reserve (obligation-farm-user-state PDA exists
@@ -174,7 +172,7 @@ export interface LiquidationInput {
   lookupTableAddresses?: Address[];
   /** FAST mode: skip the second (CU-pinned re-sim) roundtrip to save ~1-2s in the
    *  hot path. The first simulation still gates the send; the CU limit falls back
-   *  to Jupiter's budget estimate + generous margin instead of sim-measured units. */
+   *  to the maximum compute budget instead of sim-measured units. */
   fast?: boolean;
   /** BLIND-FIRE mode (learning tuition, LionX same-slot shape): skip the
    *  simulation round-trip and return the assembled tx ready-to-broadcast.
@@ -230,10 +228,13 @@ type LiquidationOutcomeBody =
         senderCostUsd?: number;
         /** worstCaseProfitUsd − senderCostUsd — the number the fire gate uses. */
         netWorstCaseProfitUsd?: number;
-        /** Which swap backend produced the plan: clmm-local | jupiter | kswap/<router>. */
+        /** Which swap backend produced the plan: clmm-local. */
         swapSource?: string;
       };
       transaction: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>>;
+      /** Sender-bundle only: the Scope RefreshPriceList as a preceding tx in the
+       *  same atomic bundle, split out of the sandwich to stay under 1232 bytes. */
+      warmupTransaction?: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>>;
       signer: TransactionSigner;
       computeUnitsConsumed: bigint;
       instructions: number;
@@ -497,9 +498,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   if (estCollateralBaseUnits <= 0n) return { stage: "plan", passed: false, reason: "collateral estimate rounds to zero" , timings };
 
   // 4+5. Quote the collateral→debt swap AND derive/fetch the ATAs in PARALLEL —
-  //      KSwap (Kamino's official router, docs-blessed) serves quotes AND embeddable
-  //      swap instructions in ONE call; the three ATA state fetches are independent.
-  //      Jupiter quote+swap-instructions remains the fallback (2 sequential HTTP).
+  //      Local CLMM quoting overlaps the independent ATA state fetches.
   done = mark("quote");
   // Fire-path trim: the signer (private-key decode + ed25519 derive) is
   // process-immutable — the shared hot cache serves it with zero work.
@@ -557,56 +556,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     swapOutMin: bigint;
     source: string;
   }
-  // Primary: the Jupiter pair (measured ~165ms, +0.5% better price than KSwap).
-  // KSwap (Kamino's official router) is the FALLBACK — redundancy on the fire
-  // path: if Jupiter is down/slow mid-race we still quote via api.kamino.finance.
-  // A DIRECT-route variant is quoted in parallel: multi-hop routes stack 2+ swap
-  // ix (~80 accounts) and can bust the 1232-byte packet; the direct variant is
-  // the packet-safe fallback at a slightly worse price.
-  const buildJupiterPlan = async (onlyDirectRoutes: boolean, maxAccounts?: number): Promise<SwapPlan | null> => {
-    const quote = await fetchRawQuote({
-      inputMint: withdrawReserve.getLiquidityMint().toString(),
-      outputMint: repayReserve.getLiquidityMint().toString(),
-      amount: estCollateralBaseUnits.toString(),
-      slippageBps: input.slippageBps,
-      onlyDirectRoutes, ...(maxAccounts ? { maxAccounts } : {}),
-      signal: AbortSignal.timeout(2_000),
-      onDiagnostic: (message) => { quoteDiagnostics.push(`jupiter: ${message}`); },
-    });
-    if (!quote) return null;
-    const plan = await fetchSwapInstructions(quote, signer.address.toString(), undefined, { signal: AbortSignal.timeout(1_000), onDiagnostic: (message) => { quoteDiagnostics.push(`jupiter-swap: ${message}`); } });
-    if (!plan) return null;
-    return {
-      swapInstructions: plan.swapInstructions,
-      lookupTables: plan.addressLookupTableAddresses.map((a: string) => address(a)),
-      swapOut: BigInt(quote.outAmount),
-      swapOutMin: applySlippage(BigInt(quote.outAmount), input.slippageBps),
-      source: maxAccounts ? `jupiter-compact-${maxAccounts}` : onlyDirectRoutes ? "jupiter-direct" : "jupiter",
-    };
-  };
-  const buildKswapPlan = async (): Promise<SwapPlan | null> => {
-    const kswap = await fetchKswapRoutes({
-      rpcUrl: input.rpcUrl,
-      wsUrl: input.rpcUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:"),
-      tokenIn: withdrawReserve.getLiquidityMint(),
-      tokenOut: repayReserve.getLiquidityMint(),
-      amountBaseUnits: estCollateralBaseUnits,
-      slippageBps: input.slippageBps,
-      executor: signer.address,
-    });
-    if (!kswap?.best) { quoteDiagnostics.push("kswap: no usable response"); return null; }
-    return {
-      swapInstructions: kswap.best.swapInstructions.map((ix) => instructionToExternal(ix)),
-      lookupTables: kswap.best.lookupTableAddresses,
-      swapOut: kswap.best.amountOut,
-      swapOutMin: kswap.best.amountOutGuaranteed,
-      source: `kswap/${kswap.best.routerType}`,
-    };
-  };
-  // PRIMARY: the LOCAL Raydium CLMM quoter (phase 3) — zero HTTP on the fire path.
-  // Warm quote ~3-5ms vs Jupiter ~80-150ms; validated within 0.017% of Jupiter live
-  // and the instruction passes mainnet simulation. Falls back to Jupiter/KSwap when
-  // the pair has no CLMM pool or the cache is cold mid-race.
+  // One local CLMM engine: no HTTP aggregator races or multi-hop fallback.
   const buildLocalClmmPlan = async (): Promise<SwapPlan | null> => {
     try {
       // Static imports (top of file) — no dynamic import latency on the fire path.
@@ -644,27 +594,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     }
   };
   done();
-  // Start independent routes now; a warm local route never waits for Jupiter.
   done = mark("quoteWait");
-  const routePromises = [
-    withDeadline(buildLocalClmmPlan(), 350),
-    withDeadline(buildJupiterPlan(false), 2_000),
-    withDeadline(buildJupiterPlan(true), 2_000),
-  ];
-  let kswapPromise: Promise<SwapPlan | null> | undefined;
-  const kswapPlan = () => kswapPromise ??= withDeadline(buildKswapPlan(), 2_000);
-  // Hedge the slow/no-route case instead of waiting for all HTTP routes to
-  // time out before trying KSwap. The 250ms delay gives a warm local/Jupiter
-  // route first refusal, while shaving the long tail when those routes are
-  // unavailable. If a route already won, the hedge resolves without issuing
-  // another RPC request.
-  let routeSettled = false;
-  const kswapHedge = new Promise<SwapPlan | null>((resolve) => {
-    setTimeout(() => {
-      if (routeSettled) { resolve(null); return; }
-      void kswapPlan().then(resolve).catch(() => resolve(null));
-    }, 250);
-  });
+  const localPlan = withDeadline(buildLocalClmmPlan(), 2_000);
   // Fire-path trim: ATA existence (OUR hot ATAs — created once by liq-setup)
   // is cached process-lifetime once seen; a known-existing ATA needs NO
   // getAccountInfo round-trip. Only genuinely unknown states hit the RPC.
@@ -686,7 +617,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     });
   };
   const [firstPlan, debtAtaState, collAtaState, cTokenAtaState, farmAccounts] = await Promise.all([
-    firstUsable([...routePromises, kswapHedge]).finally(() => { routeSettled = true; }),
+    localPlan,
     fetchAtaWithCache(debtAta, repayReserve.getLiquidityMint(), repayReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(collAta, withdrawReserve.getLiquidityMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
     fetchAtaWithCache(cTokenAta, withdrawReserve.getCTokenMint(), withdrawReserve.getMintDecimals(), "ata fetch"),
@@ -697,12 +628,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     resolveFarmAccounts(rpc, repayReserve, withdrawReserve, obligationAddress),
   ]);
   done();
-  let swapPlan: SwapPlan | null = firstPlan;
-  if (!swapPlan) {
-    done = mark("kswapFallback");
-    swapPlan = await kswapPlan();
-    done();
-  }
+  const swapPlan = firstPlan;
   if (!swapPlan) return { stage: "plan", passed: false, reason: `route unavailable: ${withdrawReserve.getLiquidityMint()}→${repayReserve.getLiquidityMint()} amount=${estCollateralBaseUnits}; ${quoteDiagnostics.join("; ") || "backends returned no route or exceeded deadline"}` , timings };
   const activeSwapPlan: SwapPlan = swapPlan;
   const swapOut = activeSwapPlan.swapOut;
@@ -758,6 +684,14 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   for (const borrow of obligation.getBorrows()) refreshAccounts.push({ address: borrow.reserveAddress, writable: true });
   const uniqueReserveAddresses = [...new Set(refreshAccounts.map((meta) => meta.address.toString()))];
   const preInstructions: Instruction[] = [];
+  // Scope RefreshPriceList warmups: a pure oracle refresh that does NOT need to
+  // be atomic with the sandwich. On the Sender lane they move to their own
+  // preceding transaction, submitted as an atomic bundle with the sandwich
+  // (bundles are ordered + atomic) — this keeps the account-heavy liquidation
+  // tx inside the 1232-byte packet. On the plain RPC lane they stay inline (no
+  // ordering guarantee). See the scope block below.
+  const warmupInstructions: Instruction[] = [];
+  const bundleWarmup = Boolean(senderLane);
   // Sender tip transfer rides the same sandwich (atomic with borrow/liquidate/
   // repay): it is rolled back if the liquidation reverts, so a rejected tx only
   // burns base + priority fee, not the tip.
@@ -786,7 +720,10 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       const tokenIds = [...new Set(getTokenIdsForScopeRefresh(market, uniqueReserveAddresses.map((a) => address(a))).get(address(String(config.oraclePrices))) ?? [])];
       if (!tokenIds.length) continue;
       const refreshIx = await scope.refreshPriceListIx({ config: configPubkey as never }, tokenIds);
-      if (refreshIx) preInstructions.push(refreshIx as Instruction);
+      if (refreshIx) {
+        if (bundleWarmup) warmupInstructions.push(refreshIx as Instruction);
+        else preInstructions.push(refreshIx as Instruction);
+      }
     }
   } catch {
     // Scope refresh is best-effort: pyth/switchboard-priced paths don't need it.
@@ -851,8 +788,8 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   budgetMerged.unshift(instructionToExternal(cuLimitIx));
 
   // FASTLANE: bid the block space. Replaces/sets the CU price ix so the tx
-  // outbids base-fee traffic in the race for the next block. Jupiter's own
-  // price ix (if present) is dropped for the same discriminator to avoid doubles.
+  // outbids base-fee traffic in the race for the next block. Replace any
+  // existing price instruction with the same discriminator to avoid duplicates.
   // When Sender is enabled the Sender lane owns the prize-scaled bid (the SOL
   // tip) and the CU price is pinned to the tier minimum — paying two competing
   // bids would double-burn the reward.
@@ -872,7 +809,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
     const cuPriceIndex = budgetMerged.findIndex(
       (existing) => existing.programId === cuPriceExternal.programId && existing.data.slice(0, 8) === cuPriceExternal.data.slice(0, 8),
     );
-    if (cuPriceIndex >= 0) budgetMerged.splice(cuPriceIndex, 1); // drop Jupiter's
+    if (cuPriceIndex >= 0) budgetMerged.splice(cuPriceIndex, 1); // replace existing price
     budgetMerged.unshift(cuPriceExternal);
   }
   // CRITICAL ORDERING (learned the hard way — see klend source):
@@ -883,6 +820,24 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   //   → FlashBorrow(debt) → RefreshReserve(debt AGAIN — clears flash's mark_stale)
   //   → Liquidate → Swap → FlashRepay
   // (the chain is assembled per-swap-plan inside buildSwapChain below)
+
+  // Bundle warmup: build the Scope refresh as its own signed transaction so the
+  // account-heavy sandwich tx shrinks below 1232 bytes. It needs no swap, so it
+  // rides OUR ALT only (which now holds the Scope config/oraclePrices/feeds).
+  let warmupTransaction: Awaited<ReturnType<typeof createSignedTransactionWithAltCached>> | undefined;
+  if (bundleWarmup && warmupInstructions.length) {
+    const warmupBudget: Instruction[] = [getSetComputeUnitLimitInstruction({ units: 400_000 })];
+    if (priority.microlamportsPerCu > 0) {
+      warmupBudget.push(getSetComputeUnitPriceInstruction({ microLamports: BigInt(priority.microlamportsPerCu) }));
+    }
+    warmupTransaction = await buildTransaction(
+      rpc,
+      input.rpcUrl,
+      signer,
+      [...warmupBudget, ...warmupInstructions],
+      input.lookupTableAddresses ?? [],
+    );
+  }
 
   done = mark("assemble");
   const buildSwapChain = (plan: SwapPlan) =>
@@ -911,7 +866,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
   const selected = await validateRoutes({
     first: activeSwapPlan,
     budgetMs: 3_000,
-    alternatives: () => [...routePromises, kswapPlan(), buildJupiterPlan(true, 24)],
+    alternatives: () => [],
     validate: async (initialPlan) => {
       try {
         let plan = initialPlan;
@@ -1092,6 +1047,7 @@ export async function executeLiquidationOnce(input: LiquidationInput): Promise<L
       ...(activePlan.source ? { swapSource: activePlan.source } : {}),
     },
     transaction: finalTransaction,
+    ...(warmupTransaction ? { warmupTransaction } : {}),
     signer,
     computeUnitsConsumed: consumedUnits,
     routeDiagnostics: [...quoteDiagnostics, ...routeFailures, ...packetSizes],

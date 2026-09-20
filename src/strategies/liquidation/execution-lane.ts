@@ -32,16 +32,22 @@ export async function broadcastLiquidation(input: {
 }): Promise<string> {
   const { outcome, dataRpc, dataRpcUrl, sender } = input;
   const transaction = outcome.transaction as Parameters<typeof sendAndConfirm>[2];
+  const warmup = outcome.warmupTransaction as Parameters<typeof sendAndConfirm>[2] | undefined;
   const lane = outcome.sender;
   if (sender.enabled && lane) {
     const wire = wireTransaction(transaction);
     const signature = getSignatureFromTransaction(transaction);
+    // A warmup (Scope refresh) and its sandwich MUST land in order and together;
+    // only an atomic bundle guarantees that. When a warmup is present we submit
+    // both as a two-tx bundle even on the SWQOS lane (its tip already clears the
+    // Jito minimum). The tip transfer sits in the sandwich (last) tx, so a failed
+    // sim/execution reverts it — a miss costs nothing. Confirmation polls the
+    // data RPC on the sandwich signature.
+    const useBundle = lane.bundle || Boolean(warmup);
     try {
-      if (lane.bundle) {
-        // Atomic Sender Max bundle (routed through Jito + all pathways). The tip
-        // transfer is inside the bundle, so a failed sim/execution reverts it —
-        // a miss costs nothing. Confirmation still polls the data RPC.
-        await sendViaSenderBundle({ endpoint: sender.endpoint, transactions: [wire] });
+      if (useBundle) {
+        const transactions = warmup ? [wireTransaction(warmup), wire] : [wire];
+        await sendViaSenderBundle({ endpoint: sender.endpoint, transactions });
       } else {
         await sendViaSender({
           endpoint: sender.endpoint,
@@ -53,6 +59,16 @@ export async function broadcastLiquidation(input: {
       const message = error instanceof Error ? error.message : String(error);
       const label = `sender-${lane.tier}${lane.bundle ? "-bundle" : ""}`;
       console.log(color.yellow(`✗ ${label} submit failed (${message}) — falling back to direct RPC send`));
+      // The warmup must land before the sandwich (RefreshObligation inside it
+      // depends on the refreshed Scope prices), so send it first on fallback.
+      if (warmup) {
+        try {
+          await sendAndConfirm(dataRpcUrl, dataRpc, warmup);
+        } catch {
+          // Best-effort: a failed warmup just means the sandwich will re-sim
+          // ReserveStale and the caller retries on the next tick.
+        }
+      }
       return sendAndConfirm(dataRpcUrl, dataRpc, transaction);
     }
     await confirmSignature(dataRpc, signature, 60_000);

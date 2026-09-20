@@ -71,3 +71,44 @@ test("ALT selection avoids single-key overhead, duplicates, signers and program 
   assert.deepEqual(Object.keys(result.tables),["large"]);
   assert.deepEqual(result.uncovered,[c]);
 });
+
+import { PublicKey } from "@solana/web3.js";
+import { appendTransactionMessageInstructions, compressTransactionMessageUsingAddressLookupTables,
+  createTransactionMessage, setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash, blockhash, compileTransactionMessage } from "@solana/kit";
+
+test("compiled ALT indexes preserve on-chain positions across large companion tables", () => {
+  const key = (n: number) => address(new PublicKey(Uint8Array.from([n & 255, n >> 8, ...new Array(30).fill(7)])).toBase58());
+  const payer = key(1000), program = key(1001);
+  const tableA = key(1002), tableB = key(1003);
+  const keysA = Array.from({ length: 240 }, (_, i) => key(i));
+  const keysB = Array.from({ length: 240 }, (_, i) => key(i + 240));
+  const used = [keysA[210]!, keysA[239]!, keysB[170]!, keysB[239]!];
+  const ix: Instruction = { programAddress: program, accounts: used.map(address => ({ address, role: AccountRole.WRITABLE })) };
+  const selected = selectLookupTables([ix], payer, { [tableA]: keysA, [tableB]: keysB });
+  const message = appendTransactionMessageInstructions([ix], setTransactionMessageFeePayer(payer, createTransactionMessage({ version: 0 })));
+  const compiled = compileTransactionMessage(compressTransactionMessageUsingAddressLookupTables(
+    setTransactionMessageLifetimeUsingBlockhash({ blockhash: blockhash("11111111111111111111111111111111"), lastValidBlockHeight: 100n }, message), selected.tables));
+  const lookups = compiled.addressTableLookups!;
+  assert.equal(lookups.length, 2);
+  const original = { [tableA]: keysA, [tableB]: keysB };
+  const resolved = lookups.flatMap(lookup => Array.from(lookup.writableIndexes).map(index => original[lookup.lookupTableAddress]![index]));
+  assert.deepEqual(new Set(resolved), new Set(used));
+  assert.deepEqual(selected.uncovered, []);
+});
+
+import { createKeyPairSignerFromBytes, getBase64EncodedWireTransaction } from "@solana/kit";
+import { createSignedTransactionWithAltCached, primeAltCache } from "../src/strategies/liquidation/hotcache.js";
+
+test("real signed packet fits with ALT compression and rejects uncovered oversized packets", async () => {
+  const signer = await createKeyPairSignerFromBytes(new Uint8Array((await import("@solana/web3.js")).Keypair.fromSeed(new Uint8Array(32).fill(17)).secretKey));
+  const key = (n: number) => address(new PublicKey(Uint8Array.from([n, ...new Array(31).fill(9)])).toBase58());
+  const accounts = Array.from({ length: 45 }, (_, i) => key(i));
+  const lookup = key(200);
+  const rpc = { getLatestBlockhash: () => ({ send: async () => ({ value: { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 100n } }) }) } as unknown as Rpc<SolanaRpcApi>;
+  const ix: Instruction = { programAddress: key(201), accounts: accounts.map(address => ({ address, role: AccountRole.WRITABLE })), data: new Uint8Array(100) };
+  const url = "https://packet-regression.invalid";
+  primeAltCache(url, lookup, [key(100), ...accounts]);
+  const signed = await createSignedTransactionWithAltCached(rpc, url, signer, [ix], [lookup]);
+  assert.ok(Buffer.from(getBase64EncodedWireTransaction(signed), "base64").length < 1232);
+  await assert.rejects(createSignedTransactionWithAltCached(rpc, url, signer, [ix], []), /1232-byte packet.*uncovered=/);
+});

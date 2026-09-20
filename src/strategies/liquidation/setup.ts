@@ -3,13 +3,15 @@ import { address, type Address, type Instruction, type Rpc, type SolanaRpcApi, t
 import {
   createLookupTableIx,
   extendLookupTableIxs,
+  getTokenIdsForScopeRefresh,
   initLookupTableIx,
   type KaminoMarket,
   type KaminoReserve,
 } from "@kamino-finance/klend-sdk";
 import { SYSVAR_INSTRUCTIONS_ADDRESS } from "@solana/sysvars";
 import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
-import { deriveAssociatedTokenAccount, fetchTokenAccount, createAtaInstruction } from "../../kamino.js";
+import { deriveAssociatedTokenAccount, fetchTokenAccount, createAtaInstruction, rpcClient } from "../../kamino.js";
+import { getCachedScopeConfigurations } from "./hotcache.js";
 import { SENDER_TIP_ACCOUNTS } from "./sender.js";
 
 export const ALT_STATE_PATH = process.env.LIQ_ALT_STATE ?? "data/liq_alt.json";
@@ -23,13 +25,20 @@ export async function liquidationAltKeys(input: {
 }): Promise<Address[]> {
   const { market, reserves, authority } = input;
   const keys = new Map<string, Address>();
-  const put = (a: Address | string) => keys.set(String(a), address(String(a)));
+  const put = (a: Address | string | null | undefined) => {
+    if (!a) return;
+    keys.set(String(a), address(String(a)));
+  };
 
   put(authority);
   put(market.getAddress());
   put(market.programId);
   put(market.farmsProgramId);
   put(SYSVAR_INSTRUCTIONS_ADDRESS);
+  // The lending-market authority PDA is a writable account on every flash
+  // borrow/repay and Liquidate V2 — static per market, so ALT-compress it.
+  const lendingMarketAuthority = await market.getLendingMarketAuthority?.();
+  if (lendingMarketAuthority) put(lendingMarketAuthority);
 
   // Helius Sender tip accounts — when the Sender execution lane is enabled the
   // tip transfer adds one writable destination to every fire; compressing the
@@ -55,6 +64,15 @@ export async function liquidationAltKeys(input: {
     const sbTwap = tokenInfo.switchboardConfiguration?.twapAggregator;
     if (sbTwap && sbTwap !== "11111111111111111111111111111111") put(sbTwap);
 
+    // Reserve farm state — every liquidation tx that touches a farm-joined
+    // reserve (Liquidate V2 collateral/debt farms) references it inline; it is
+    // static per reserve, so it belongs in the ALT. The obligation-side farm
+    // PDA varies per obligation and stays inline (unavoidable).
+    const debtFarm = reserve.getDebtFarmAddress?.();
+    if (debtFarm?.__option === "Some") put(debtFarm.value);
+    const collateralFarm = reserve.getCollateralFarmAddress?.();
+    if (collateralFarm?.__option === "Some") put(collateralFarm.value);
+
     // Our ATAs (liquidity + cToken) — pre-created and ALT-compressed.
     put(
       await deriveAssociatedTokenAccount({
@@ -72,11 +90,49 @@ export async function liquidationAltKeys(input: {
     );
   }
 
+  // Scope oracle refresh — fires prepend a RefreshPriceList ix (mirroring the
+  // refresh-keeper pattern) whose account list carries the Scope program, the
+  // config, the oraclePrices account and one feed per token-chain. Those are
+  // governance-static and identical for every fire over the same reserves, yet
+  // were previously inlined, pushing multi-reserve sandwich txs past the
+  // 1232-byte packet. Enumerate them exactly as the executor does so the ALT
+  // covers them.
+  try {
+    const { Scope, SCOPE_PROGRAM_ADDRESS } = await import("@kamino-finance/scope-sdk");
+    const rpc = rpcClient(input.rpcUrl);
+    const scope = new Scope("mainnet-beta", rpc as never);
+    const reserveAddresses = reserves.map((r) => r.address);
+    const tokenIdsByPrices = getTokenIdsForScopeRefresh(market, reserveAddresses);
+    const feedsInPlay = new Set(
+      reserves
+        .map((r) => r.state.config.tokenInfo.scopeConfiguration.priceFeed)
+        .filter((feed): feed is Address => Boolean(feed) && feed !== "11111111111111111111111111111111")
+        .map((feed) => feed.toString()),
+    );
+    const scopeConfigurations = await getCachedScopeConfigurations(rpc);
+    put(SCOPE_PROGRAM_ADDRESS);
+    // The RefreshPriceList instruction embeds the config + oraclePrices accounts
+    // plus one feed per token-chain; the feeds themselves are already recorded
+    // per-reserve above, so we only need the governance-static config/prices
+    // accounts here. NOTE: do not build the market-wide ix to enumerate them —
+    // a full-market refresh carries >255 token ids and the SDK's u8 vec codec
+    // refuses it.
+    for (const [configPubkey, config] of scopeConfigurations) {
+      if (!feedsInPlay.has(String(config.oraclePrices))) continue;
+      const tokenIds = [...new Set(tokenIdsByPrices.get(address(String(config.oraclePrices))) ?? [])];
+      if (!tokenIds.length) continue;
+      put(configPubkey as string);
+      put(config.oraclePrices as string);
+    }
+  } catch {
+    // Scope keys are best-effort — pyth/switchboard-only markets don't use them.
+  }
+
   // Phase-3: CLMM pool accounts for the hot collateral↔debt mint pairs —
   // the local-CLMM swap backend's instructions compress against OUR ALT so
   // the liquidation tx stays inside the 1232-byte packet. Tick arrays drift
-  // with price; the executor's size guard falls back to Jupiter when the
-  // pool moves beyond the cached arrays, so staleness never breaks a fire.
+  // with price; rerun setup to extend coverage when the packet guard reports
+  // uncovered accounts. Cover every reserve pair, not an arbitrary first 21.
   try {
     const inputMints = new Set(reserves.map((r) => r.getLiquidityMint().toString()));
     const { clmmAltKeys } = await import("./clmm.js");
@@ -87,7 +143,7 @@ export async function liquidationAltKeys(input: {
       for (let j = i + 1; j < mintList.length; j++) pairs.push({ mintA: mintList[i]!, mintB: mintList[j]! });
     }
     if (pairs.length) {
-      const clmmKeys = await clmmAltKeys(input.rpcUrl, pairs.slice(0, 21));
+      const clmmKeys = await clmmAltKeys(input.rpcUrl, pairs);
       for (const key of clmmKeys) put(key);
     }
   } catch {
@@ -164,10 +220,8 @@ export async function buildLiquidationSetup(input: {
 }): Promise<{ transactions: Instruction[][]; lookupTable: Address; keyCount: number; complements: AltRef[]; kinds: string[] }> {
   const { rpc, market, reserves, signer } = input;
   let createIx: Instruction | null = null;
-  const lookupTable = input.existingLookupTable ?? (await createLookupTableIx(rpc, signer))[1];
-  if (!input.existingLookupTable) {
-    [createIx] = await createLookupTableIx(rpc, signer);
-  }
+  let lookupTable = input.existingLookupTable;
+  if (!lookupTable) [createIx, lookupTable] = await createLookupTableIx(rpc, signer);
 
   // Tx 1..n: create ALT (first tx) + pre-create ATAs in small batches (each
   // create-ATA ix carries ~7 accounts — keep every tx well under the packet size).
@@ -265,7 +319,7 @@ export async function buildLiquidationSetup(input: {
     let tableForGroup = tableGroup.table;
     if (tableForGroup.toString() === "11111111111111111111111111111111") {
       newCompanionNumber += 1;
-      const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot + BigInt(newCompanionNumber));
+      const [createCompanionIx, newTable] = await initLookupTableIx(signer, baseSlot - BigInt(newCompanionNumber));
       if (createCompanionIx) companionCreates.push([createCompanionIx]);
       tableForGroup = newTable;
       complements.push({ lookupTable: tableForGroup.toString(), keyCount: tableGroup.keys.length });
