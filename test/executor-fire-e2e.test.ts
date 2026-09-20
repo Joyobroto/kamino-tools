@@ -101,7 +101,7 @@ const rpc = {
 function makeReserve(input: {
   address: string; symbol: string; mint: string; decimals: number; priceUsd: number;
   tokenProgram?: string; nonce: number;
-}): Record<string, unknown> {
+}) {
   const price = new Decimal(input.priceUsd);
   return {
     address: address(input.address),
