@@ -126,12 +126,16 @@ export async function liquidationAltKeys(input: {
       const feed = config as { oracleMappings?: string; oracleTwaps?: string };
       put(feed.oracleMappings);
       put(feed.oracleTwaps);
-      // Enumerate the actual refresh accounts per reserve. Passing every token
-      // in the market to one instruction can overflow the SDK's u8 vector.
+      // Fetch mappings once per feed, then enumerate per-reserve accounts.
+      // Re-fetching config+mappings for every reserve exhausts fallback quotas.
+      const mappings = await scope.getOracleMappingsFromConfig({ config: configPubkey as never }, configPubkey as never, config as never);
+      const enumerated = new Set<string>();
       for (const reserve of reserves) {
         const ids = [...new Set(getTokenIdsForScopeRefresh(market, [reserve.address]).get(address(String(config.oraclePrices))) ?? [])];
-        if (!ids.length) continue;
-        const ix = await scope.refreshPriceListIx({ config: configPubkey as never }, ids);
+        const key = ids.join(",");
+        if (!ids.length || enumerated.has(key)) continue;
+        enumerated.add(key);
+        const ix = await scope.refreshPriceListIxWithAccounts(ids, config as never, mappings);
         if (ix) for (const account of ix.accounts ?? []) put(account.address);
       }
     }
