@@ -34,7 +34,7 @@ import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
 import { senderConfigFromEnv, warmSenderConnection } from "./strategies/liquidation/sender.js";
 import { broadcastLiquidation } from "./strategies/liquidation/execution-lane.js";
-import { subscribeLiquidationSlices, type LiquidationWsHandle } from "./strategies/liquidation/ws-realtime.js";
+import { subscribeTrackedObligations, type TrackedWsHandle } from "./strategies/liquidation/tracked-ws.js";
 import { altTableAddresses, buildLiquidationSetup, loadAltState, saveAltState, ALT_STATE_PATH } from "./strategies/liquidation/setup.js";
 import { deactivateLookupTableIx, closeLookupTableIx } from "@kamino-finance/klend-sdk";
 import { getCloseAccountInstruction, TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
@@ -1282,6 +1282,13 @@ program
     };
 
     const snapshots = new Map<string, StreamAccountSnapshot>();
+    let wsHandle: TrackedWsHandle | undefined;
+    const syncObligationSubscriptions = () => {
+      const accounts = tracker.hotObligations();
+      wsHandle?.setAccounts(accounts);
+      const desired = new Set(accounts);
+      for (const key of snapshots.keys()) if (!desired.has(key)) snapshots.delete(key);
+    };
     // Evict rows that went quiet (healed far above the band / closed) so the
     // board stays a live cohort, not a growing archive. Declared before the
     // scan loop that calls it.
@@ -1320,6 +1327,8 @@ program
           preloaded,
           pubkeys: hotAddresses.map((value) => address(value)),
           snapshots,
+          ...(lastOracleTrigger ? { valuationSnapshot: lastOracleTrigger } : {}),
+          isSubscribed: key => wsHandle?.isSubscribed(key) ?? false,
           ...(oracleTrigger ? { oracleTrigger } : {}),
           applyOraclePrices: (market) => oracleCache.refreshMarket(market),
         });
@@ -1341,6 +1350,7 @@ program
           });
         }
         const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString(), !oracleTrigger);
+        syncObligationSubscriptions();
         if (events.length) emitTrackerEvents(events, updates, Date.now(), oracleTrigger);
         // A still-DUE position needs a new attempt after a transient failure,
         // even if it never crossed back above one. Cooldown/busy guards bound this.
@@ -1515,6 +1525,7 @@ program
       boardSweep();
       // Feed the hot tracker: full scan acts as ground truth for tracked DUE positions
       const absorbEvents = tracker.absorb([...result.liquidatable, ...result.nearMiss], result.scannedAt);
+      syncObligationSubscriptions();
       if (absorbEvents.length) emitTrackerEvents(absorbEvents);
       // Register observed pairs without issuing requests. Prewarming is a
       // bounded, paced pass after this scan; fresh fire-path reads are on demand.
@@ -1711,12 +1722,15 @@ program
     // cleared by onError/subscribe-fail; a DOWN rail means the bot races blind
     // and the heartbeat must say so.
     let wsRailState: "connecting" | "live" | "down" = "connecting";
-    const wsRailAlive = (): boolean => wsRailState === "live";
+    const wsRailAlive = (): boolean => {
+      const stats = wsHandle?.stats();
+      return stats ? stats.active === stats.desired && (stats.desired > 0 || cycle > 0) : wsRailState === "live";
+    };
     let cycle = 0;
     let fullScanPromise: Promise<void> | null = null;
     let nextFullScan = 0;
     let nextHotTick = 0;
-    // ── Realtime detection rail: programNotifications on the obligation stream ──
+    // ── Realtime detection: exact accounts in the tracked watch/DUE cohort ──
     // WS deltas are the LOW-LATENCY path (per-account changes arrive within ~1 slot
     // vs the 10s hot loop / 60s full scan). A cached health < 1 here is a signal to
     // go straight to executeDue — every later stage (fresh hydration, guards, sim,
@@ -1730,21 +1744,17 @@ program
       ? undefined
       : [...new Set([wsUrl, fallbackWsUrl, "wss://api.mainnet-beta.solana.com"].filter(Boolean))];
     let activeWsEndpoint = "";
-    let wsHandle: LiquidationWsHandle | undefined;
-    let wsReadyPromise: Promise<void> | null = null;
     if (options.watch) {
       const wsLogged = new Map<string, number>();
-      // The raw subscription promise (handle intact) — the first-cycle gate and
-      // the wsHandle assignment both consume it.
-      const wsSubscription: Promise<LiquidationWsHandle> = subscribeLiquidationSlices({
+      wsHandle = subscribeTrackedObligations({
         wsUrl,
         ...(wsCandidates ? { wsCandidates } : {}),
-        marketAddress: options.market,
+        onInvalidate: (account) => { snapshots.delete(account); },
         onSlice: (slice) => {
           const obligation = slice.pubkey.toString();
           const previous = snapshots.get(obligation);
           if (previous?.slot !== undefined && slice.slot !== undefined && slice.slot < previous.slot) return;
-          if (watchboard.has(obligation) || slice.cachedHealth < 1.05) snapshots.set(obligation, slice);
+          snapshots.set(obligation, slice);
           // Feed every tracked-band slice to the board (WATCH ↔ UNHEALTHY
           // transitions), not just the <1.0 triggers.
           const health = slice.cachedHealth;
@@ -1781,29 +1791,21 @@ program
           wsRailState = "live";
           activeWsEndpoint = endpoint;
           const label = websocketEndpointLabel(endpoint, wsUrl, fallbackWsUrl);
-          if (!options.json) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] ws deltas live (${label})`));
+          if (!options.json && (wsHandle?.stats().active === 1)) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] tracked account WS live (${label})`));
         },
         onError: (error: unknown) => {
           if (wsRailState === "live") wsRailState = "down";
           if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
         },
       });
-      wsSubscription
-        .then((handle) => {
-          wsHandle = handle;
-        })
-        .catch((error: unknown) => {
-          wsRailState = "down";
-          if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws subscribe failed: ${error instanceof Error ? error.message : String(error)}`));
-        });
-      // Ordering: hold the FIRST scan until the WS rail announces itself (or
-      // 5s pass) so the startup log reads watching → telegram → ws deltas live
-      // → cycle #1 — instead of the first-scan line racing in between.
-      wsReadyPromise = Promise.race([
-        wsSubscription.then((handle) => handle.ready).catch(() => undefined),
-        new Promise<void>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
-      ]);
+      syncObligationSubscriptions();
+      // Discovery supplies the first account set; do not await subscriptions.
+
     }
+    setInterval(() => {
+      const stats = wsHandle?.stats();
+      if (stats && !options.json) console.log(color.dim(`[WS-USAGE] accounts=${stats.active}/${stats.desired} notifications=${stats.received} payloadMB=${(stats.payloadBytes / 1e6).toFixed(3)} duplicates=${stats.duplicates} reconnects=${stats.reconnects}`));
+    }, 60_000).unref();
     setInterval(() => {
       writeHeartbeat({ at: Date.now(), pid: process.pid, scanAt: lastScanCompletedAt,
         hotAt: lastHotCompletedAt, oracleAt: oracleCache.lastUpdateAt, oracleLive,
@@ -1814,11 +1816,6 @@ program
     while (true) {
       const now = Date.now();
       if (now >= nextFullScan && !fullScanPromise) {
-        if (wsReadyPromise) {
-          const hold = wsReadyPromise;
-          wsReadyPromise = null; // only gate the first cycle
-          await hold;
-        }
         cycle += 1;
         nextFullScan = now + intervalMs;
         nextHotTick = now + hotIntervalMs;

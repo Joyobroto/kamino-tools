@@ -55,3 +55,18 @@ test("failed oracle priming is cooled down across repeated reconnects", async (t
   await assert.rejects(cache.prime(rpc,market),/403/);
   assert.equal(calls,2);
 });
+
+test("live oracle WS updates avoid periodic HTTP priming, but a stale feed still reconciles", async t => {
+  let now = Date.now(), calls = 0; t.mock.method(Date, "now", () => now);
+  const oracle = address("So11111111111111111111111111111111111111112");
+  const cache = new OracleFeedCache();
+  const market = { getReserves: () => [{ state: { config: { tokenInfo: { pythConfiguration: { price: oracle } } } } }] } as any;
+  const rpc = { getMultipleAccounts: () => ({ send: async () => { calls++; return { context: { slot: 100n + BigInt(calls) }, value: [{ data: ["AQ==", "base64"], owner: feed, lamports: 1n, executable: false, space: 1n }] }; } }) };
+  await cache.prime(rpc, market);
+  for (let i = 0; i < 10; i++) {
+    now += 10_000; cache.update({ feed: oracle, slot: 200n + BigInt(i), receivedAt: now, data: Buffer.from([2]) });
+    await cache.prime(rpc, market);
+  }
+  assert.equal(calls, 1); assert.equal(cache.snapshotAgeMs, 0);
+  now += 25_000; await cache.prime(rpc, market); assert.equal(calls, 2);
+});

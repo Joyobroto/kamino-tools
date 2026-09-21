@@ -104,3 +104,29 @@ test("oracle bursts never fetch missing accounts or stale market snapshots", asy
   }
   assert.equal(rpcCalls,0);
 });
+
+test("healthy account subscriptions let hot ticks reuse snapshots instead of re-reading every account", async t => {
+  const market = { getAddress: () => key, getReserves: () => [], state: { liquidationMaxDebtCloseFactorPct: 10 } } as unknown as KaminoMarket;
+  const rpc = new Proxy({}, { get: () => { throw new Error("warm hot tick attempted RPC"); } }) as Rpc<SolanaRpcApi>;
+  let decoded = 0;
+  t.mock.method(KaminoObligation, "fromAccountData", () => { decoded++; return { obligationTag: 1, obligationAddress: key } as KaminoObligation; });
+  await refreshTrackedObligations({ rpc, preloaded: { market, marketAddress: key, marketReserves: new Map(), loadedAt: Date.now() },
+    pubkeys: [key], snapshots: new Map([[key, { pubkey: key, slot: 100n, receivedAt: Date.now() - 40_000, accountData: Buffer.alloc(3344) }]]),
+    valuationSnapshot: { pubkey: key, slot: 101n, receivedAt: Date.now() }, isSubscribed: () => true, applyOraclePrices: () => true,
+  });
+  assert.equal(decoded, 1);
+});
+
+test("disconnected or expired tracked snapshots reconcile over HTTP, never reuse silently", async t => {
+  const market = { getAddress: () => key, getReserves: () => [], state: { liquidationMaxDebtCloseFactorPct: 10 } } as unknown as KaminoMarket;
+  let reads = 0;
+  const rpc = { getMultipleAccounts: () => ({ send: async () => { reads++; return { value: [null] }; } }) } as unknown as Rpc<SolanaRpcApi>;
+  t.mock.method(KaminoObligation, "fromAccountData", () => { throw new Error("stale bytes were decoded"); });
+  for (const [age, live] of [[1_000, false], [60_001, true]] as const) {
+    await refreshTrackedObligations({ rpc, preloaded: { market, marketAddress: key, marketReserves: new Map(), loadedAt: Date.now() }, pubkeys: [key],
+      snapshots: new Map([[key, { pubkey: key, slot: 100n, receivedAt: Date.now() - age, accountData: Buffer.alloc(3344) }]]),
+      valuationSnapshot: { pubkey: key, slot: 101n, receivedAt: Date.now() }, isSubscribed: () => live, applyOraclePrices: () => true,
+    });
+  }
+  assert.equal(reads, 2);
+});

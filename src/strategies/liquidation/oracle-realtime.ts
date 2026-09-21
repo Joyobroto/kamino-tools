@@ -14,14 +14,15 @@ export class OracleFeedCache {
   private readonly values = new Map<string, OracleFeedUpdate>();
   private sdkAccounts: Awaited<ReturnType<typeof getAllOracleAccounts>> = new Map();
   private accountSlots = new Map<Address, bigint>();
+  private accountUpdatedAt = new Map<Address, number>();
 
-  private primedAt = 0;
   private primeInFlight: Promise<void> | undefined;
   private nextPrimeAt = 0;
 
   async prime(rpc: unknown, market: KaminoMarket): Promise<void> {
     if (this.primeInFlight) return this.primeInFlight;
     const started = Date.now();
+    if (this.sdkAccounts.size && this.snapshotAgeMs < 20_000) return;
     if (started < this.nextPrimeAt) return;
     this.nextPrimeAt = started + 10_000;
     this.primeInFlight = (async () => {
@@ -45,11 +46,11 @@ export class OracleFeedCache {
           if (result.context.slot < existingSlot) continue;
           this.sdkAccounts.set(key, { ...account, programAddress: account.owner, address: key });
           this.accountSlots.set(key, result.context.slot);
+          this.accountUpdatedAt.set(key, Date.now());
           // Slot ordering, not HTTP start time, resolves concurrent WS updates.
           if (update?.slot !== undefined && update.slot >= result.context.slot) this.apply(update);
         }
       }
-      this.primedAt = started;
     })().catch((error: unknown) => {
       this.nextPrimeAt = Date.now() + 30_000;
       throw error;
@@ -62,6 +63,7 @@ export class OracleFeedCache {
     if (previous) {
       this.sdkAccounts.set(value.feed, { ...previous, data: [value.data.toString("base64"), "base64"] as typeof previous.data });
       if (value.slot !== undefined) this.accountSlots.set(value.feed, value.slot);
+      this.accountUpdatedAt.set(value.feed, value.receivedAt);
     }
   }
 
@@ -76,16 +78,16 @@ export class OracleFeedCache {
     return true;
   }
 
-  get snapshotAgeMs(): number { return this.primedAt ? Date.now() - this.primedAt : Infinity; }
+  get snapshotAgeMs(): number {
+    if (!this.sdkAccounts.size) return Infinity;
+    return Math.max(...[...this.sdkAccounts.keys()].map(key => Date.now() - (this.accountUpdatedAt.get(key) ?? 0)));
+  }
   get lastUpdateAt(): number { return Math.max(0, ...[...this.values.values()].map((value) => value.receivedAt)); }
 
   /** Apply decoded feed prices to the already-loaded SDK reserve objects. */
   refreshMarket(market: KaminoMarket): boolean {
-    // The 15s gate was measured from the last RPC PRIME, but every WS
-    // notification overwrites the decoded account payload directly — so while
-    // the feed is live the data is fresh regardless of prime age. Use a wider
-    // budget so a slow/delayed prime does not silently disable the oracle-first
-    // rail (observed: ~half of oracle ticks no-op'ing at tracked=50).
+    // Every required account must have a recent HTTP or WS observation; one
+    // active feed must not hide another feed that stopped updating.
     if (!this.sdkAccounts.size || this.snapshotAgeMs > 30_000) return false;
     const reserves = market.getReserves().map((reserve) => ({ address: reserve.address, state: reserve.state }));
     for (const [reserve, price] of getTokenOracleDataSync(this.sdkAccounts, reserves)) {

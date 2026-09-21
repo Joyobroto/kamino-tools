@@ -200,6 +200,7 @@ const HOT_MARKET_CACHE_TTL_MS = MARKET_CACHE_TTL_MS;
  */
 export const ORACLE_MARKET_MAX_AGE_MS = 60_000;
 export const ORACLE_SNAPSHOT_MAX_AGE_MS = 45_000;
+export const SUBSCRIBED_SNAPSHOT_MAX_AGE_MS = 60_000;
 
 // Single-flight: every caller (scan cycle, hot tick, executeDue, executeLiquidationOnce)
 // hits preloadMarket whenever the 60s cache is stale; without dedup those concurrent loads
@@ -439,6 +440,8 @@ export async function refreshTrackedObligations(params: {
   streamSnapshot?: StreamAccountSnapshot;
   snapshots?: Map<string, StreamAccountSnapshot>;
   oracleTrigger?: StreamAccountSnapshot;
+  valuationSnapshot?: StreamAccountSnapshot;
+  isSubscribed?: (pubkey: string) => boolean;
   applyOraclePrices?: (market: KaminoMarket) => boolean;
 }): Promise<{ candidates: LiquidatableCandidate[]; obligations: Map<string, KaminoObligation>; market: KaminoMarket }> {
   const { rpc, preloaded, pubkeys } = params;
@@ -460,6 +463,7 @@ export async function refreshTrackedObligations(params: {
     ? preloaded
     : freshPreloaded(preloaded, maxAgeMs)
       ? preloaded : await preloadMarket(rpc, preloaded.marketAddress, maxAgeMs);
+  if (loaded !== preloaded) Object.assign(preloaded, loaded);
   const market = loaded.market;
   params.applyOraclePrices?.(market);
   let hydrated: KaminoObligation[] | undefined;
@@ -477,15 +481,18 @@ export async function refreshTrackedObligations(params: {
     } catch { /* unavailable slot time or incompatible data: use fresh RPC account */ }
   }
   if (!hydrated) {
-    const trigger = oracleTrigger;
+    const trigger = oracleTrigger ?? params.valuationSnapshot;
     const canRevalue = trigger?.slot !== undefined && params.applyOraclePrices?.(market);
     const instant = canRevalue ? streamLedgerInstant(trigger!) : await fetchLedgerInstant(rpc, "hot ledger instant");
     hydrated = [];
     const missing: Address[] = [];
     for (const pubkey of pubkeys) {
       const snapshot = params.snapshots?.get(pubkey);
+      const snapshotMaxAge = params.isSubscribed
+        ? (params.isSubscribed(pubkey) ? SUBSCRIBED_SNAPSHOT_MAX_AGE_MS : 0)
+        : (oracleTrigger ? ORACLE_SNAPSHOT_MAX_AGE_MS : 0);
       if (canRevalue && snapshot?.accountData && snapshot.receivedAt !== undefined
-        && Date.now() - snapshot.receivedAt < ORACLE_SNAPSHOT_MAX_AGE_MS && snapshot.slot !== undefined && snapshot.slot <= instant.slot) {
+        && Date.now() >= snapshot.receivedAt && Date.now() - snapshot.receivedAt < snapshotMaxAge && snapshot.slot !== undefined && snapshot.slot <= instant.slot) {
         try {
           const obligation = KaminoObligation.fromAccountData(new Map([[market.getAddress(), market]]), pubkey, snapshot.accountData, instant);
           if (obligation) { hydrated.push(obligation); continue; }
