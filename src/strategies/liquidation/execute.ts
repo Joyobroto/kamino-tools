@@ -68,7 +68,7 @@ import { getClmmQuoter, web3InstructionToExternal } from "./clmm.js";
 import { PublicKey } from "@solana/web3.js";
 import BNImport from "bn.js";
 import { safeJsonStringify } from "../../ui.js";
-import { buildMarketReserveMap, dynamicLiquidationBonus, healthFactor, obligationToCandidate } from "./filters.js";
+import { buildMarketReserveMap, dynamicLiquidationBonus, effectiveCloseFactorPct, healthFactor, obligationToCandidate, readMarketLevelInfo } from "./filters.js";
 import { hydrateShortlist, withBackoff } from "./screener.js";
 import { buildSenderTipInstruction, chooseSenderLane, FALLBACK_SOL_USD, priorityMicrolamports, type SenderConfig, type SenderLane, type SenderTier } from "./sender.js";
 
@@ -346,12 +346,22 @@ export function chooseRepayUsd(totalDebtUsd: number, largestDebtUsd: number, clo
  *
  * Above the threshold the program takes `min(close-factor share, our request)`,
  * so capping at the close factor and the reserve/collateral limits is correct.
+ *
+ * The close factor share itself is `min(total_obligation_debt × cf, this_borrow)`,
+ * NOT `this_borrow × cf`: `max_liquidatable_borrowed_amount` charges the close
+ * factor to the obligation's whole debt. On a one-borrow position the two agree;
+ * on a multi-borrow position the former lets us repay up to `total × cf` of any
+ * single borrow, and sizing the latter quietly forfeits quota the program already
+ * granted. `totalBorrowValueUsd` omitted → falls back to `this_borrow × cf`
+ * (callers without the total, unit tests).
  */
 export function chooseRepayBaseUnits(input: {
   /** Full borrow, base units. */
   borrowAmount: Decimal;
   /** Full borrow, USD. */
   borrowValueUsd: Decimal;
+  /** Sum of ALL the obligation's borrows, USD. */
+  totalBorrowValueUsd?: Decimal;
   closeFactorPct: number;
   fullLiquidationThresholdUsd: Decimal;
   debtReserveAvailable: Decimal;
@@ -370,8 +380,18 @@ export function chooseRepayBaseUnits(input: {
     }
     return { amount: BigInt(input.borrowAmount.floor().toFixed(0)), fullLiquidation: true };
   }
+  // Close-factor share of the borrow, expressed as a ratio so it can be applied in
+  // base units without a price: min(total × cf, this borrow) / this borrow. With no
+  // usable borrow value (zero-price input) fall back to the plain `borrow × cf`,
+  // which is also exactly what the ratio reduces to when the total equals the borrow.
+  const closeFactorRatio = (() => {
+    if (!input.borrowValueUsd.gt(0)) return new Decimal(input.closeFactorPct).div(100);
+    const totalUsd = Decimal.max(input.totalBorrowValueUsd ?? input.borrowValueUsd, input.borrowValueUsd);
+    const allowedUsd = Decimal.min(totalUsd.mul(input.closeFactorPct).div(100), input.borrowValueUsd);
+    return Decimal.min(new Decimal(1), allowedUsd.div(input.borrowValueUsd));
+  })();
   const amount = BigInt(Decimal.min(
-    input.borrowAmount.mul(input.closeFactorPct).div(100),
+    input.borrowAmount.mul(closeFactorRatio),
     input.debtReserveAvailable,
     input.maxRepayFromMarketCap,
     input.maxRepayFromCollateral,
@@ -474,7 +494,7 @@ async function executeLiquidationAttempt(input: LiquidationInput): Promise<Liqui
     return { stage: "plan", passed: false, reason: `health ${health.toFixed(4)} — not liquidatable right now` , timings };
   }
 
-  const marketReserves = buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100);
+  const marketReserves = buildMarketReserveMap(market, readMarketLevelInfo(market));
 
   // ── Pair selection (Kamino docs best practice) ──
   // The program ENFORCES priority rules: the target pair must be the
@@ -510,34 +530,47 @@ async function executeLiquidationAttempt(input: LiquidationInput): Promise<Liqui
   if (!debtPriceBase.isFinite() || debtPriceBase.lte(0)) return { stage: "plan", passed: false, reason: "repay reserve price invalid", timings };
 
   // 3. Estimate the collateral the program will redeem for us — the LIQUIDATION
-  //    BONUS comes from the WITHDRAW (collateral) reserve's config, not the debt
-  //    side (docs: the bonus is paid in extra collateral, so the collateral
-  //    reserve governs it; e.g. tBTC collateral = 5% min bonus vs 1% on majors).
-  //    Model Kamino's dynamic bonus from the live health factor. The program
-  //    applies min/max, solvency, and bad-debt caps on-chain; the estimate is
-  //    still only a quote input and the transaction is simulation-gated.
+  //    BONUS is paid in extra COLLATERAL, and `calculate_liquidation_bonus` derives
+  //    its bounds from BOTH the withdraw (collateral) and the repay (debt) reserve:
+  //    max/max for the regular min-max collar, min for the bad-debt bonus. Reading
+  //    only the collateral side under-quotes the prize whenever the debt reserve
+  //    carries the wider band. Model Kamino's dynamic bonus from the live health
+  //    factor; the program still applies its solvency/emode caps on-chain, and the
+  //    transaction is simulation-gated.
   const collPriceBase = usdPerBaseUnit(withdrawReserve);
   if (!collPriceBase.isFinite() || collPriceBase.lte(0)) return { stage: "plan", passed: false, reason: "collateral reserve price invalid", timings };
+  const withdrawCfg = withdrawReserve.state.config;
+  const repayCfg = repayReserve.state.config;
+  const badDebtWithdrawBps = withdrawCfg.badDebtLiquidationBonusBps;
+  const badDebtRepayBps = repayCfg.badDebtLiquidationBonusBps;
+  const badDebtBonusBps = badDebtWithdrawBps !== undefined && badDebtRepayBps !== undefined
+    ? Math.min(badDebtWithdrawBps, badDebtRepayBps)
+    : badDebtWithdrawBps ?? badDebtRepayBps;
   const bonus = dynamicLiquidationBonus({
     healthFactor: health,
-    liquidationThresholdPct: withdrawReserve.state.config.liquidationThresholdPct,
-    minBonus: Number(withdrawReserve.state.config.minLiquidationBonusBps) / 10_000,
-    maxBonus: Number(withdrawReserve.state.config.maxLiquidationBonusBps) / 10_000,
-    ...(withdrawReserve.state.config.badDebtLiquidationBonusBps !== undefined
-      ? { badDebtBonus: Number(withdrawReserve.state.config.badDebtLiquidationBonusBps) / 10_000 }
-      : {}),
+    liquidationThresholdPct: withdrawCfg.liquidationThresholdPct,
+    minBonus: Math.max(Number(withdrawCfg.minLiquidationBonusBps), Number(repayCfg.minLiquidationBonusBps)) / 10_000,
+    maxBonus: Math.max(Number(withdrawCfg.maxLiquidationBonusBps), Number(repayCfg.maxLiquidationBonusBps)) / 10_000,
+    ...(badDebtBonusBps !== undefined ? { badDebtBonus: badDebtBonusBps / 10_000 } : {}),
   });
   // Borrow only what this collateral position and both reserve vaults can
   // support. Over-borrowing can leave flash principal unpaid after a partial
   // liquidation, even if a quote for the assumed collateral looked profitable.
   const collateralUsd = Decimal.min(withdrawPick.deposit.marketValueRefreshed,
     withdrawReserve.getLiquidityAvailableAmount().mul(collPriceBase));
-  const maxBonus = Math.max(bonus, Number(withdrawReserve.state.config.maxLiquidationBonusBps) / 10_000);
+  const maxBonus = Math.max(bonus,
+    Number(withdrawCfg.maxLiquidationBonusBps) / 10_000,
+    Number(repayCfg.maxLiquidationBonusBps) / 10_000);
   const maxRepayFromCollateralUnits = collateralUsd.div(new Decimal(1).add(maxBonus)).div(debtPriceBase);
+  // `calculate_liquidation` raises the close factor to 100% while the obligation's
+  // LTV is past the market's insolvency line (live: 95%). Sizing with the nominal
+  // market close factor there under-repays a deeply-underwater position by up to 10×.
+  const sizedCloseFactorPct = effectiveCloseFactorPct(obligation, marketReserves);
   const sized = chooseRepayBaseUnits({
     borrowAmount: repayPick.borrow.amount,
     borrowValueUsd: repayPick.borrow.marketValueRefreshed,
-    closeFactorPct,
+    totalBorrowValueUsd: obligation.refreshedStats.userTotalBorrow,
+    closeFactorPct: sizedCloseFactorPct,
     fullLiquidationThresholdUsd: new Decimal(market.state.minFullLiquidationValueThreshold?.toString() ?? 0),
     debtReserveAvailable: repayReserve.getLiquidityAvailableAmount(),
     maxRepayFromCollateral: maxRepayFromCollateralUnits,

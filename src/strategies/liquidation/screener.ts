@@ -8,7 +8,7 @@ import {
   type LedgerInstant,
 } from "@kamino-finance/klend-sdk";
 import { address, getBase64Encoder, type Address, type Rpc, type SolanaRpcApi } from "@solana/kit";
-import { buildMarketReserveMap, filterLiquidatable, healthFactorFromSf, obligationToCandidate, type MarketReserveMap } from "./filters.js";
+import { buildMarketReserveMap, filterLiquidatable, healthFactorFromSf, obligationToCandidate, readMarketLevelInfo, type MarketReserveMap } from "./filters.js";
 import type { LiquidatableCandidate, ScanEvent, ScanOptions, ScanResult } from "./types.js";
 
 const OBLIGATION_ACCOUNT_SIZE = 3344;
@@ -348,7 +348,7 @@ export async function preloadMarket(rpc: Rpc<SolanaRpcApi>, marketAddress: strin
     try {
       const { loadMarket } = await import("../../kamino.js");
       const market = await withBackoff(() => loadMarket(rpc, marketAddress), "market load");
-      const loaded: PreloadedMarket = { market, marketAddress, marketReserves: buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100), loadedAt: Date.now() };
+      const loaded: PreloadedMarket = { market, marketAddress, marketReserves: buildMarketReserveMap(market, readMarketLevelInfo(market)), loadedAt: Date.now() };
       preloadCache.set(key, loaded);
       return loaded;
     } finally {
@@ -590,7 +590,7 @@ export async function refreshTrackedObligations(params: {
   const vanilla = hydrated.filter((obligation) => obligation.obligationTag === 0);
   const obligations = new Map(vanilla.map((obligation) => [obligation.obligationAddress.toString(), obligation]));
   const reserveMap = params.applyOraclePrices
-    ? buildMarketReserveMap(market, Number(market.state.liquidationMaxDebtCloseFactorPct) || 100) : loaded.marketReserves;
+    ? buildMarketReserveMap(market, readMarketLevelInfo(market)) : loaded.marketReserves;
   const candidates = vanilla.map((obligation) => {
     try { return obligationToCandidate(obligation, reserveMap); } catch { return null; }
   }).filter((candidate): candidate is LiquidatableCandidate => candidate !== null);

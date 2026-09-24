@@ -13,12 +13,15 @@ import {
 import {
   buildMarketReserveMap,
   dynamicLiquidationBonus,
+  effectiveCloseFactorPct,
   estimateLiquidationProfit,
   filterLiquidatable,
   healthFactor,
   healthFactorFromSf,
   isVanillaObligation,
+  maxRepayUsd,
   obligationToCandidate,
+  readMarketLevelInfo,
   sfToUsd,
   type MarketReserveMap,
 } from "../src/strategies/liquidation/filters.js";
@@ -426,8 +429,129 @@ test("candidate margin follows borrow-factor priority rather than largest debt",
   }),reserves);
   assert.equal(candidate.largestDebt.amountUsd,1000);
   assert.equal(candidate.repayDebt?.amountUsd,100);
-  assert.equal(candidate.estimatedRepayUsd,10);
-  assert.equal(candidate.estimatedProfitUsd,0.05);
+  // Repay is min(totalDebt × closeFactor, thisBorrow) = min(1100×10%, 100) = 100:
+  // the program charges the close factor to the WHOLE obligation, so the entire
+  // $100 SOL borrow can be taken while still inside the 10% quota.
+  assert.equal(candidate.estimatedRepayUsd,100);
+  // Bonus is unchanged (repay reserve IS the collateral reserve here): min 1%,
+  // protocol share 50% → 100 × 1% × 50% = 0.5.
+  assert.equal(candidate.estimatedProfitUsd,0.5);
+});
+
+// ── Repay sizing / prize — transcription of the official program ──
+
+test("maxRepayUsd charges the close factor to the TOTAL obligation debt", () => {
+  // One borrow: total == borrow, so it collapses to borrow × cf (the old formula).
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000, totalDebtUsd: 1000, closeFactorPct: 10 }), 100);
+  // Repay the SMALL borrow of a multi-borrow obligation: min(1100×10%, 100) = 100,
+  // not 10 — the whole SOL borrow is repayable and still 9.09% of total debt.
+  assert.equal(maxRepayUsd({ borrowValueUsd: 100, totalDebtUsd: 1100, closeFactorPct: 10 }), 100);
+  // Repay the BIG one: min(1100×10%, 1000) = 110.
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000, totalDebtUsd: 1100, closeFactorPct: 10 }), 110);
+  // Never more than the borrow itself; a total below the borrow is clamped up.
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000, totalDebtUsd: 10, closeFactorPct: 100 }), 1000);
+  // No market state at all → the caller's default (100%) still means "the borrow".
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000 }), 1000);
+});
+
+test("maxRepayUsd bypasses the close factor below the full-liquidation threshold", () => {
+  // Live market: min_full_liquidation_value_threshold = $2. Under it the program
+  // takes the whole borrowed_amount, so a $1.50 borrow is repaid at 100%, not 10%.
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1.5, totalDebtUsd: 1.5, closeFactorPct: 10, fullLiquidationThresholdUsd: 2 }), 1.5);
+  // At/above the threshold the close factor applies again.
+  assert.equal(maxRepayUsd({ borrowValueUsd: 2, totalDebtUsd: 2, closeFactorPct: 10, fullLiquidationThresholdUsd: 2 }), 0.2);
+  // A zero threshold disables the band — back to close-factor sizing.
+  assert.ok(Math.abs(maxRepayUsd({ borrowValueUsd: 1.5, closeFactorPct: 10, fullLiquidationThresholdUsd: 0 }) - 0.15) < 1e-12);
+});
+
+test("maxRepayUsd honours the market's max-liquidatable-at-once cap", () => {
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000, totalDebtUsd: 10_000, closeFactorPct: 100, maxAtOnceUsd: 500 }), 500);
+  // An unset/zero cap means NO cap, never "repay nothing".
+  assert.equal(maxRepayUsd({ borrowValueUsd: 1000, totalDebtUsd: 1000, closeFactorPct: 100, maxAtOnceUsd: 0 }), 1000);
+  // Non-finite inputs are ignored rather than poisoning the result.
+  assert.equal(maxRepayUsd({ borrowValueUsd: Number.POSITIVE_INFINITY, totalDebtUsd: 1000, closeFactorPct: 10 }), 0);
+});
+
+test("estimateLiquidationProfit scales with the multi-borrow quota", () => {
+  // Same $100 borrow, different obligation behind it: the allowed repay (and so
+  // the prize the floor is compared against) is 10× larger when the total debt is.
+  const single = estimateLiquidationProfit({ debtUsd: 100, totalDebtUsd: 100, liquidationBonus: 0.05, closeFactorPct: 10 });
+  const multi = estimateLiquidationProfit({ debtUsd: 100, totalDebtUsd: 1100, liquidationBonus: 0.05, closeFactorPct: 10 });
+  assert.equal(single, 0.5);
+  assert.equal(multi, 5);
+});
+
+test("effectiveCloseFactorPct jumps to 100% past the insolvency LTV", () => {
+  const reserves = fakeMarketReserveMap();
+  reserves.set("__market__", { __marketCloseFactorPct: 10, __marketInsolvencyLtvPct: 95 } as never);
+  // A fixture with no loanToValue() keeps the nominal factor rather than throwing.
+  const plain = fakeObligation({ collateralUsd: 1000, borrowedUsd: 900 });
+  assert.equal(effectiveCloseFactorPct(plain, reserves), 10);
+  // LTV past the market's 95% insolvency line → the program's full close factor.
+  const deep = fakeObligation({ collateralUsd: 1000, borrowedUsd: 960 });
+  (deep as unknown as { loanToValue: () => Decimal }).loanToValue = () => new Decimal(0.96);
+  assert.equal(effectiveCloseFactorPct(deep, reserves), 100);
+  // Below the line, the nominal factor stands.
+  (deep as unknown as { loanToValue: () => Decimal }).loanToValue = () => new Decimal(0.90);
+  assert.equal(effectiveCloseFactorPct(deep, reserves), 10);
+  // An implausible insolvency LTV is ignored rather than trusted (a bogus low
+  // value would otherwise hand out a 10× close factor to nearly everything).
+  reserves.set("__market__", { __marketCloseFactorPct: 10, __marketInsolvencyLtvPct: 5 } as never);
+  (deep as unknown as { loanToValue: () => Decimal }).loanToValue = () => new Decimal(0.96);
+  assert.equal(effectiveCloseFactorPct(deep, reserves), 10);
+});
+
+test("bad-debt band pays the bad-debt bonus as a FLOOR, not a cap", () => {
+  // health 80/99 → currentLtvBps = 9900, exactly the program's 0.99 no-bf-LTV line.
+  const atLine = dynamicLiquidationBonus({ healthFactor: 80 / 99, liquidationThresholdPct: 80, minBonus: 0.05, maxBonus: 0.1, badDebtBonus: 0.01 });
+  assert.equal(atLine, 0.01);
+  // Deeper breach: `max(bad_debt_bonus, 1 - ltv)`. The solvency term collapses to
+  // 0 here, and the old `min` handed out nothing — the program still pays 1%.
+  const deeper = dynamicLiquidationBonus({ healthFactor: 0.6, liquidationThresholdPct: 80, minBonus: 0.05, maxBonus: 0.1, badDebtBonus: 0.01 });
+  assert.equal(deeper, 0.01);
+  // Above the line the regular collar still governs, unaffected by this branch.
+  const healthySide = dynamicLiquidationBonus({ healthFactor: 0.9, liquidationThresholdPct: 80, minBonus: 0.05, maxBonus: 0.1, badDebtBonus: 0.01 });
+  assert.ok(healthySide > 0.01);
+});
+
+test("bonus bounds take the max across BOTH reserves (program pair rule)", () => {
+  // Collateral carries a 1% min bonus, the debt reserve a 5% one:
+  // `max(collateral.min, debt.min)` = 5%. Quoting off the collateral alone
+  // (what we did) under-quotes the prize by 5× here.
+  const reserves = fakeMarketReserveMap([
+    { address: RESERVE_USDC, symbol: "USDC", liquidationBonus: 0.05 },
+    { address: RESERVE_WSOL, symbol: "SOL", liquidationBonus: 0.01 },
+  ]);
+  reserves.set("__market__", { __marketCloseFactorPct: 10 } as never);
+  const candidate = obligationToCandidate(fakeObligation({
+    collateralUsd: 2000, borrowedUsd: 1100,
+    borrows: [{ reserve: RESERVE_USDC, symbol: "USDC", usd: 1100 }],
+    deposits: [{ reserve: RESERVE_WSOL, symbol: "SOL", usd: 2000 }],
+  }), reserves);
+  // health = 1600/1100 ≈ 1.4545 → LTV 55% is below the 80% threshold, so the MIN
+  // bonus governs. repay = min(1100×10%, 1100) = 110; profit = 110 × 5% = 5.5.
+  assert.equal(candidate.estimatedProfitUsd, 5.5);
+  assert.equal(candidate.estimatedRepayUsd, 110);
+});
+
+test("readMarketLevelInfo normalises the market knobs the prize math needs", () => {
+  const info = readMarketLevelInfo({ state: {
+    liquidationMaxDebtCloseFactorPct: 10,
+    insolvencyRiskUnhealthyLtvPct: 95,
+    minFullLiquidationValueThreshold: "2",
+    maxLiquidatableDebtMarketValueAtOnce: "2500000",
+  } });
+  assert.deepEqual(info, {
+    __marketCloseFactorPct: 10,
+    __marketInsolvencyLtvPct: 95,
+    __marketFullLiqThresholdUsd: 2,
+    __marketMaxAtOnceUsd: 2500000,
+  });
+  // A garbage close factor falls back to 100 (no discount) — never to 0, which
+  // would size every repay to zero and silently disable the bot.
+  const fallback = readMarketLevelInfo({ state: { liquidationMaxDebtCloseFactorPct: Number.NaN } });
+  assert.equal(fallback.__marketCloseFactorPct, 100);
+  assert.equal(fallback.__marketInsolvencyLtvPct, undefined);
 });
 
 // ── Oracle valuation cache ──

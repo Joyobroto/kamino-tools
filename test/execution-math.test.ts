@@ -122,3 +122,29 @@ test("protocol fee with zero bonus does not reduce principal", () => {
     precisionMarginBps: 0,
   }), 1_000_000n);
 });
+
+test("the close factor is charged to the WHOLE obligation, not to one borrow", () => {
+  // `max_liquidatable_borrowed_amount` = min(total_debt × cf, this_borrow). With
+  // no total supplied we keep the old `this_borrow × cf`, so existing callers and
+  // the one-borrow case are unchanged.
+  assert.equal(sizing().amount, 100n);
+
+  // $1100 obligation, $500 borrow, 10% close factor: allowed = min(110, 500) = 110,
+  // i.e. 22% of this borrow's 1000 units instead of 10%.
+  assert.equal(sizing({ totalBorrowValueUsd: new Decimal(1100) }).amount, 220n);
+
+  // When total × cf exceeds the borrow, the WHOLE borrow is repayable — the
+  // multi-borrow quota the old sizing silently threw away.
+  assert.equal(sizing({ totalBorrowValueUsd: new Decimal(100_000) }).amount, 1_000n);
+
+  // The collateral / vault caps still win over the bigger quota.
+  assert.equal(
+    sizing({ totalBorrowValueUsd: new Decimal(100_000), maxRepayFromCollateral: new Decimal(200) }).amount,
+    200n,
+  );
+
+  // The dust full-liquidation band is untouched by the obligation-wide total.
+  const dust = sizing({ borrowValueUsd: new Decimal("1.50"), totalBorrowValueUsd: new Decimal(1100) });
+  assert.equal(dust.fullLiquidation, true);
+  assert.equal(dust.amount, 1_000n);
+});
