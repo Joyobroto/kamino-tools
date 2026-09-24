@@ -27,7 +27,7 @@ loadEnv({ quiet: true });
 const RPC_URL = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 const MARKET = process.env.KAMINO_MARKET ?? "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
 const OBLIGATION = process.argv[2] ?? "FqrB7qvTuiEs54bdh3EaQXGxt29uRJDymCe1wS7JwzXU";
-const HEALTH_GATE_TOLERANCE = 0.02; // same as the watcher fire path
+const HEALTH_GATE_TOLERANCE = 0.001; // must match the watcher's --race-tolerance default
 
 const stamp = (label: string): string => `[${new Date().toISOString().slice(11, 23)}] ${label}`;
 

@@ -181,7 +181,13 @@ npm test
 ## 🔐 Konfigurasi `.env`
 
 ```dotenv
+# Primary data RPC — gunakan endpoint privat (Helius / Triton / QuickNode).
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+# Failover HARUS provider yang sama dengan primary (kunci kedua pada akun yang sama).
+# Jangan pernah menunjuk ke cluster publik: tanpa SLA, slot-nya tertinggal, dan
+# guard minContextSlot kita akan menolak balasannya.
+SOLANA_RPC_FALLBACK=
+
 KAMINO_MARKET=7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
 
 # Direkomendasikan: base58, JSON array 32/64 byte, atau comma-separated bytes.

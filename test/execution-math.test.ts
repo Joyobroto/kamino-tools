@@ -1,13 +1,68 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { Decimal } from "decimal.js";
-import { chooseRepayUsd, estimateCollateralForRepay, profitBaseUnitsToUsd } from "../src/strategies/liquidation/execute.js";
+import { chooseRepayBaseUnits, chooseRepayUsd, estimateCollateralForRepay, profitBaseUnitsToUsd } from "../src/strategies/liquidation/execute.js";
 
 test("chooseRepayUsd applies default close factor and caps at largest debt", () => {
   assert.equal(chooseRepayUsd(100, 60), 50);
   assert.equal(chooseRepayUsd(100, 40), 40);
   assert.equal(chooseRepayUsd(100, 100), 50);
   assert.equal(chooseRepayUsd(100, 40, 1), 40);
+});
+
+const sizing = (over: Partial<Parameters<typeof chooseRepayBaseUnits>[0]> = {}) =>
+  chooseRepayBaseUnits({
+    borrowAmount: new Decimal(1_000),
+    borrowValueUsd: new Decimal(500),
+    closeFactorPct: 10,
+    fullLiquidationThresholdUsd: new Decimal(2),
+    debtReserveAvailable: new Decimal(1_000_000),
+    maxRepayFromCollateral: new Decimal(1_000_000),
+    maxRepayFromMarketCap: new Decimal(1_000_000),
+    ...over,
+  });
+
+test("above the dust threshold the close factor sizes the repay", () => {
+  const sized = sizing();
+  assert.equal(sized.fullLiquidation, false);
+  assert.equal(sized.amount, 100n); // 10% of 1000
+  assert.equal(sized.infeasibleReason, undefined);
+});
+
+test("below min_full_liquidation_value_threshold the WHOLE borrow must be requested", () => {
+  // Program reverts RepayTooSmallForFullLiquidation for anything under 100% here,
+  // so the close factor must NOT be applied even though it would be smaller.
+  const sized = sizing({ borrowValueUsd: new Decimal("1.50") });
+  assert.equal(sized.fullLiquidation, true);
+  assert.equal(sized.amount, 1_000n);
+});
+
+test("a required full liquidation is refused rather than silently capped", () => {
+  const shortReserve = sizing({ borrowValueUsd: new Decimal(1), debtReserveAvailable: new Decimal(500) });
+  assert.equal(shortReserve.amount, 0n);
+  assert.match(shortReserve.infeasibleReason ?? "", /repay reserve only holds/);
+
+  const shortCollateral = sizing({ borrowValueUsd: new Decimal(1), maxRepayFromCollateral: new Decimal(500) });
+  assert.equal(shortCollateral.amount, 0n);
+  assert.match(shortCollateral.infeasibleReason ?? "", /seizable collateral only covers/);
+});
+
+test("threshold of 0 disables the dust band and leaves the close factor in charge", () => {
+  const sized = sizing({ borrowValueUsd: new Decimal("1.50"), fullLiquidationThresholdUsd: new Decimal(0) });
+  assert.equal(sized.fullLiquidation, false);
+  assert.equal(sized.amount, 100n);
+});
+
+test("a zero-value borrow never triggers the full-liquidation branch", () => {
+  const sized = sizing({ borrowValueUsd: new Decimal(0) });
+  assert.equal(sized.fullLiquidation, false);
+  assert.equal(sized.amount, 100n);
+});
+
+test("above the threshold the repay is capped by reserve liquidity", () => {
+  const sized = sizing({ debtReserveAvailable: new Decimal(42) });
+  assert.equal(sized.fullLiquidation, false);
+  assert.equal(sized.amount, 42n);
 });
 
 test("estimateCollateralForRepay applies bonus up and haircut down", () => {

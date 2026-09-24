@@ -334,6 +334,52 @@ export function chooseRepayUsd(totalDebtUsd: number, largestDebtUsd: number, clo
 }
 
 /**
+ * Repay sizing for the atomic liquidate instruction.
+ *
+ * Kamino's `calculate_liquidation` (state/liquidation_operations.rs) BYPASSES the
+ * close factor while the borrow's market value sits below the market's
+ * `min_full_liquidation_value_threshold` (raw USD; $2 by default): it takes the
+ * whole `borrowed_amount` and reverts with `RepayTooSmallForFullLiquidation` if
+ * the liquidator asked for less. So in that band the only safe move is to request
+ * 100% — and if a vault/collateral cap would force us below it, we must refuse
+ * rather than quietly under-request (which is a guaranteed revert, not a saving).
+ *
+ * Above the threshold the program takes `min(close-factor share, our request)`,
+ * so capping at the close factor and the reserve/collateral limits is correct.
+ */
+export function chooseRepayBaseUnits(input: {
+  /** Full borrow, base units. */
+  borrowAmount: Decimal;
+  /** Full borrow, USD. */
+  borrowValueUsd: Decimal;
+  closeFactorPct: number;
+  fullLiquidationThresholdUsd: Decimal;
+  debtReserveAvailable: Decimal;
+  maxRepayFromCollateral: Decimal;
+  maxRepayFromMarketCap: Decimal;
+}): { amount: bigint; fullLiquidation: boolean; infeasibleReason?: string } {
+  const dustFullLiquidation = input.fullLiquidationThresholdUsd.gt(0)
+    && input.borrowValueUsd.gt(0)
+    && input.borrowValueUsd.lt(input.fullLiquidationThresholdUsd);
+  if (dustFullLiquidation) {
+    if (input.borrowAmount.gt(input.debtReserveAvailable)) {
+      return { amount: 0n, fullLiquidation: true, infeasibleReason: `dust borrow of $${input.borrowValueUsd.toFixed(4)} must be liquidated in full but the repay reserve only holds ${input.debtReserveAvailable.toFixed(4)} units` };
+    }
+    if (input.maxRepayFromCollateral.lt(input.borrowAmount)) {
+      return { amount: 0n, fullLiquidation: true, infeasibleReason: `dust borrow of $${input.borrowValueUsd.toFixed(4)} must be liquidated in full but seizable collateral only covers ${input.maxRepayFromCollateral.toFixed(4)} debt units` };
+    }
+    return { amount: BigInt(input.borrowAmount.floor().toFixed(0)), fullLiquidation: true };
+  }
+  const amount = BigInt(Decimal.min(
+    input.borrowAmount.mul(input.closeFactorPct).div(100),
+    input.debtReserveAvailable,
+    input.maxRepayFromMarketCap,
+    input.maxRepayFromCollateral,
+  ).floor().toFixed(0));
+  return { amount, fullLiquidation: false };
+}
+
+/**
  * FASTLANE priority-fee sizing — race economics in one place.
  *
  * - "off": base fee (current behavior; lands whenever the block has room).
@@ -487,12 +533,18 @@ async function executeLiquidationAttempt(input: LiquidationInput): Promise<Liqui
   const collateralUsd = Decimal.min(withdrawPick.deposit.marketValueRefreshed,
     withdrawReserve.getLiquidityAvailableAmount().mul(collPriceBase));
   const maxBonus = Math.max(bonus, Number(withdrawReserve.state.config.maxLiquidationBonusBps) / 10_000);
-  const repayAmountBaseUnits = BigInt(Decimal.min(
-    repayPick.borrow.amount.mul(closeFactorPct).div(100),
-    repayReserve.getLiquidityAvailableAmount(),
-    new Decimal(market.state.maxLiquidatableDebtMarketValueAtOnce?.toString() ?? Infinity).div(debtPriceBase),
-    collateralUsd.div(new Decimal(1).add(maxBonus)).div(debtPriceBase),
-  ).floor().toFixed(0));
+  const maxRepayFromCollateralUnits = collateralUsd.div(new Decimal(1).add(maxBonus)).div(debtPriceBase);
+  const sized = chooseRepayBaseUnits({
+    borrowAmount: repayPick.borrow.amount,
+    borrowValueUsd: repayPick.borrow.marketValueRefreshed,
+    closeFactorPct,
+    fullLiquidationThresholdUsd: new Decimal(market.state.minFullLiquidationValueThreshold?.toString() ?? 0),
+    debtReserveAvailable: repayReserve.getLiquidityAvailableAmount(),
+    maxRepayFromCollateral: maxRepayFromCollateralUnits,
+    maxRepayFromMarketCap: new Decimal(market.state.maxLiquidatableDebtMarketValueAtOnce?.toString() ?? Infinity).div(debtPriceBase),
+  });
+  if (sized.infeasibleReason) return { stage: "plan", passed: false, reason: sized.infeasibleReason, timings };
+  const repayAmountBaseUnits = sized.amount;
   if (repayAmountBaseUnits <= 0n) return { stage: "plan", passed: false, reason: "repay amount rounds to zero or collateral liquidity unavailable", timings };
   const repayUsd = Number(new Decimal(repayAmountBaseUnits.toString()).mul(debtPriceBase).toFixed(4));
 

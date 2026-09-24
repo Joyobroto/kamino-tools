@@ -204,6 +204,7 @@ export async function buildFlashLoan(params: {
     tokenProgram: reserve.getLiquidityTokenProgram(),
   };
   const amount = new BN(amountBaseUnits.toString());
+  if (process.env.LIQ_DIAG) console.log("[buildFlashLoan] strategy pre=", strategy.preInstructions?.length, "ix=", strategy.instructions?.length, "setup=", setupInstructions.length);
   const borrowInstructionIndex = strategy.preInstructions.length + setupInstructions.length;
   const borrow = flashBorrowReserveLiquidity(
     { liquidityAmount: amount },

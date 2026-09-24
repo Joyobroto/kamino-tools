@@ -2,6 +2,14 @@ import { Buffer } from "node:buffer";
 import { createSolanaRpcSubscriptions, type Address, type Rpc, type SolanaRpcApi } from "@solana/kit";
 import { getAllOracleAccounts, getTokenOracleDataSync, type KaminoMarket } from "@kamino-finance/klend-sdk";
 
+/** A node rejected our minContextSlot hint (-32016 "Node is behind"/ContextSlot). */
+function isContextSlotError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: unknown; message?: unknown };
+  const message = typeof err.message === "string" ? err.message : "";
+  return err.code === -32016 || /context ?slot|node is behind/i.test(message);
+}
+
 export interface OracleFeedUpdate {
   feed: Address;
   data: Buffer;
@@ -34,9 +42,23 @@ export class OracleFeedCache {
           const current = this.values.get(key)?.slot ?? this.accountSlots.get(key) ?? 0n;
           return current > slot ? current : slot;
         }, 0n);
-        const result = await client.getMultipleAccounts(keys, {
-          encoding: "base64", commitment: "processed", minContextSlot: minSlot,
-        }).send({ abortSignal: AbortSignal.timeout(5_000) });
+        // minContextSlot is an OPTIMIZATION ("don't give me a node that hasn't
+        // caught up to the last slot I saw"), not a correctness requirement — the
+        // cache below already rejects regressions via `result.context.slot < existingSlot`.
+        // A fallback node a few slots behind turns it into a hard -32016 ContextSlot
+        // failure for the whole batch (observed 12x). Retry once without the hint
+        // rather than discarding otherwise-good oracle data.
+        let result;
+        try {
+          result = await client.getMultipleAccounts(keys, {
+            encoding: "base64", commitment: "processed", minContextSlot: minSlot,
+          }).send({ abortSignal: AbortSignal.timeout(5_000) });
+        } catch (error) {
+          if (!isContextSlotError(error) || minSlot === 0n) throw error;
+          result = await client.getMultipleAccounts(keys, {
+            encoding: "base64", commitment: "processed",
+          }).send({ abortSignal: AbortSignal.timeout(5_000) });
+        }
         for (let i = 0; i < keys.length; i++) {
           const key = keys[i]!;
           const account = result.value[i];

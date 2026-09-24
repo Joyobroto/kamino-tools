@@ -9,6 +9,9 @@ import {
 } from "@solana/kit";
 
 export const MAIN_MARKET = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
+// Last-resort primary for dev runs with no .env — NEVER used as a failover target.
+// Production must set SOLANA_RPC_URL to a private endpoint; the public cluster
+// rate-limits getProgramAccounts and lags slots enough to starve the scan.
 export const DEFAULT_RPC = "https://api.mainnet-beta.solana.com";
 
 export function configuredValue(value: string | undefined): string | undefined {

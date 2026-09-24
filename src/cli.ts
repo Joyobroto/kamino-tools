@@ -353,13 +353,19 @@ function safeWebsocketHost(wsUrl: string): string {
   }
 }
 
-function websocketEndpointLabel(wsUrl: string, primaryUrl: string, fallbackUrl: string): string {
-  const host = safeWebsocketHost(wsUrl);
+/** "primary" | "fallback" | "public" | "custom" for a websocket endpoint. */
+function websocketRole(endpoint: string, primaryUrl: string, fallbackUrl: string): string {
+  const host = safeWebsocketHost(endpoint);
   if (!host) return "unknown";
   const primaryHost = safeWebsocketHost(primaryUrl);
   const fallbackHost = safeWebsocketHost(fallbackUrl);
-  const role = host === primaryHost ? "primary" : host === fallbackHost ? "fallback" : host === "api.mainnet-beta.solana.com" ? "public" : "custom";
-  return `${host} / ${role}`;
+  return host === primaryHost ? "primary" : host === fallbackHost ? "fallback" : host === "api.mainnet-beta.solana.com" ? "public" : "custom";
+}
+
+function websocketEndpointLabel(wsUrl: string, primaryUrl: string, fallbackUrl: string): string {
+  const host = safeWebsocketHost(wsUrl);
+  if (!host) return "unknown";
+  return `${host} / ${websocketRole(wsUrl, primaryUrl, fallbackUrl)}`;
 }
 
 function compactNumber(value: string): string {
@@ -621,7 +627,7 @@ program
   .option("--market <address>", "Kamino lending market", process.env.KAMINO_MARKET || MAIN_MARKET)
   .option("--min-debt <usd>", "minimum largest-debt USD (0 disables the band — full-market research mode)", "0")
   .option("--max-debt <usd>", "maximum largest-debt USD (0 disables the band)", "0")
-  .option("--profit-floor <usd>", "minimum estimated gross profit in USD", "0.5")
+  .option("--profit-floor <usd>", "minimum estimated gross profit in USD. Applied by the scanner AND by the fire path, so sub-floor dust never reaches assembly", "0.5")
   .option("--health-watch <ratio>", "hydrate obligations with cached health below this ratio", "1.5")
   .option("--near-miss <ratio>", "report obligations below this health ratio as near-miss", "1.1")
   .option("--watch", "keep scanning in a loop", false)
@@ -635,7 +641,7 @@ program
   .option("--execute", "arm the in-process executor: DUE positions spotted by this scan (or the hot loop) are attempted immediately (shadow unless --broadcast)", false)
   .option("--broadcast", "actually send liquidation transactions (default: shadow — plan+simulate only)", false)
   .option("--min-profit <usd>", "minimum worst-case net profit in USD for the executor to fire (close factor 10% makes plays smaller)", "0.05")
-  .option("--min-prize <usd>", "minimum estimated prize before the executor spends any RPC (0 disables — learning mode: every DUE attempt is worth the ~$0.001 fee if the net-profit guard below still passes)", "0")
+  .option("--min-prize <usd>", "extra prize floor applied BEFORE the executor spends any hydration/assembly RPC. The fire path always enforces at least --profit-floor and --min-profit, so 0 means 'add no extra bar' rather than 'no bar at all'", "0")
   .option("--slippage-bps <n>", "slippage tolerance on the executor's collateral→debt swap", "50")
   .option("--max-attempts-per-day <n>", "executor broadcast attempt budget (rolling day)", "12")
   .option("--max-loss-per-day <usd>", "executor fee-burn budget per rolling day", "1.5")
@@ -644,7 +650,7 @@ program
   .option("--fast", "FAST mode: single simulation, skip the CU-pinned re-sim roundtrip (~1-2s faster)", false)
   .option("--priority-mode <mode>", "FASTLANE priority fee: off | fixed | auto (auto scales the bid with the prize, capped at 2% of worst-case profit)", "auto")
   .option("--ws <url>", "WebSocket endpoint for real-time obligation deltas (default: derived from --rpc)", "")
-  .option("--race-tolerance <ratio>", "health band ABOVE 1.0 still routed into the pipeline (sim arbitrates) — how aggressively to race marginal positions (default 0.02)", "0.02")
+  .option("--race-tolerance <ratio>", "health band ABOVE 1.0 still routed into the pipeline so SIM can arbitrate a position sitting on the boundary. Keep this tiny: the program's threshold is the hard wall, so every unit above 1.0 is a bet against it. 0.02 admitted health 1.00–1.02, a band where 100% of attempts reverted 6016 ObligationHealthy.", "0.001")
   .option("--sender-endpoint <url>", "Helius Sender execution endpoint (execution-only; scanning/oracle keep --rpc)", process.env.HELIUS_SENDER_ENDPOINT || process.env.LIQ_SENDER_ENDPOINT || "")
   .option("--no-sender", "disable Helius Sender and broadcast directly on --rpc")
   .option("--sender-max-prize <usd>", "prize at/above which Sender Max is used (below it: SWQOS-only)", process.env.LIQ_SENDER_MAX_PRIZE_USD || "5")
@@ -914,7 +920,9 @@ program
           return;
         }
         enqueueForensics(async () => {
-          const fate = await resolveVetoFate({ rpcUrl: "https://api.mainnet-beta.solana.com", obligation, triggeredAtMs });
+          // Forensics reads ride the configured data RPC, not the public cluster —
+          // a 429 here silently drops the race-loss verdict and undercounts losses.
+          const fate = await resolveVetoFate({ rpcUrl: options.rpc, obligation, triggeredAtMs });
           logLedgerEntry(executorAutoOptions.ledgerPath, {
             at: new Date().toISOString(),
             type: "vetoed",
@@ -1031,14 +1039,21 @@ program
             logVeto("hydration returned no candidate (closed or unparseable)", {});
             return;
           }
-          // Client-side live gate — SCAN/HOT rails only. The WS race rail skips
-          // this entirely (healthGateTolerance 1.5 below) and lets the tx's own
-          // RefreshObligation + simulate() arbitrate on fresh prices.
-          if (!raceRail && candidate.healthFactor >= 1 + HEALTH_GATE_TOLERANCE) {
+          // Client-side live gate — EVERY rail (ws / oracle / scan / hot).
+          //
+          // Kamino's own test is `borrow_factor_adjusted_debt >= unhealthy_borrow_value`,
+          // i.e. health <= 1 (docs: "Current LTV >= Health limit"). The program
+          // re-runs exactly that after RefreshObligation, so firing above this band
+          // cannot succeed: it reverts 6016 ObligationHealthy. This gate used to be
+          // skipped entirely for the ws/oracle rail, and 111 of 111 recorded 6016
+          // failures came from that rail — the tx was built for a position the
+          // client already knew was healthy. SIM arbitrates races that are AT the
+          // boundary, not races we have already lost on paper.
+          if (candidate.healthFactor >= 1 + HEALTH_GATE_TOLERANCE && !opts.bypassHealth) {
             logVeto(`live health ${candidate.healthFactor.toFixed(4)} ≥ ${(1 + HEALTH_GATE_TOLERANCE).toFixed(2)} (client gate declined)`, { liveHealth: candidate.healthFactor, prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0), forensics: true });
             return;
           }
-          const marginalBand = !raceRail && candidate.healthFactor >= 1;
+          const marginalBand = candidate.healthFactor >= 1;
           if (!raceRail) {
             boardUpdate(obligation, {
               status: "EXECUTOR",
@@ -1050,17 +1065,23 @@ program
           }
           // (position-age guard: hydration above IS the freshness guarantee — the
           // candidate data was fetched seconds ago, never stale cached state)
-          // The prize drives the FASTLANE bid (auto mode) — worst-case profit on the table.
+          // ── Fire-path floors ──
+          // refreshTrackedObligations returns RAW tracked accounts: no debt band,
+          // no profit floor, no health filter (unlike scanOnce -> filterLiquidatable).
+          // A ws/oracle trigger therefore hands the executor whatever the tracker is
+          // holding — which was sub-dollar dust ($0.00-$0.77 debts) that cannot clear
+          // min-profit under this market's 10% close factor. Observed prizes:
+          // $0.0022-$0.0245 against a $0.05 floor. Apply the SAME floors the scanner
+          // applies so we stop burning hydration + a 30s cooldown discovering it.
+          // The prize is also the worst-case profit on the table, which drives the
+          // FASTLANE bid in auto mode.
           const prizeUsd = Math.max(0, candidate.estimatedProfitUsd ?? 0);
-          // Prize firewall ONLY when configured (>0). Default 0 = learning
-          // mode: dust DUE attempts proceed into the pipeline — the sim +
-          // net-profit guard (worst-case ≥ min-profit AFTER flash fee and
-          // slippage) are the real "never lose money" arbiters, and each
-          // attempt's fee burn is the measured cost of finding our position.
           const scanMinPrize = executorAutoOptions.minPrizeUsd ?? 0;
-          if (scanMinPrize > 0 && prizeUsd < scanMinPrize) {
+          const fireFloorUsd = Math.max(scanMinPrize, scanConfig.profitFloorUsd, executorAutoOptions.minProfitUsd ?? 0);
+          const debtUsd = Math.max(candidate.repayDebt?.amountUsd ?? 0, candidate.largestDebt.amountUsd);
+          if (prizeUsd < fireFloorUsd) {
             executorFailStreak.delete(obligation);
-            logVeto(`prize $${prizeUsd.toFixed(2)} < min-prize $${scanMinPrize.toFixed(2)} (dust firewall)`, { liveHealth: candidate.healthFactor, prizeUsd });
+            logVeto(`prize $${prizeUsd.toFixed(4)} < floor $${fireFloorUsd.toFixed(2)} on $${debtUsd.toFixed(2)} debt (dust firewall — 10% close factor cannot clear it)`, { liveHealth: candidate.healthFactor, prizeUsd });
             return;
           }
           const runExecutor = () =>
@@ -1395,7 +1416,10 @@ program
       });
       const oracleWs = await subscribeOracleFeeds({
         wsUrl: oracleFeedWsUrl,
-        ...(!options.ws ? { wsCandidates: [oracleFeedWsUrl, oracleFallbackWsUrl, "wss://api.mainnet-beta.solana.com"].filter(Boolean) } : {}),
+        // Same-provider rotation ONLY: primary → SOLANA_RPC_FALLBACK. The public
+        // Solana cluster is never a candidate — no SLA, shared connection budget,
+        // and it lags so far behind that minContextSlot primes come back -32016.
+        ...(!options.ws ? { wsCandidates: [oracleFeedWsUrl, oracleFallbackWsUrl].filter(Boolean) } : {}),
         feeds: oracleFeeds,
         cache: oracleCache,
         onReady: async (endpoint) => {
@@ -1712,7 +1736,13 @@ program
             mode: options.broadcast ? "live" : "shadow",
             wsLive: wsRailAlive(),
             wsActive: websocketEndpointLabel(activeWsEndpoint, wsUrl, fallbackWsUrl),
-            rpcOnFallback: failoverHealth({ primaryUrl: options.rpc, fallbackUrl: process.env.SOLANA_RPC_FALLBACK ?? "" }).onFallback,
+            // Failover telemetry must cover BOTH transports. The HTTP failover is a
+            // separate code path (createFailoverRpc) from the wsCandidates rotation,
+            // so a bot whose WS had rotated to the fallback provider still reported
+            // `onFallback: false` — 40h of logs contained ZERO `rpc-failover` lines
+            // while the WS rail was demonstrably serving from the fallback.
+            rpcOnFallback: failoverHealth({ primaryUrl: options.rpc, fallbackUrl: process.env.SOLANA_RPC_FALLBACK ?? "" }).onFallback
+              || websocketRole(activeWsEndpoint, wsUrl, fallbackWsUrl) === "fallback",
             ...(executorStats.lastFailure ? { lastFailure: executorStats.lastFailure } : {}),
           }));
         })();
@@ -1736,13 +1766,17 @@ program
     // go straight to executeDue — every later stage (fresh hydration, guards, sim,
     // broadcast) is owned by the executor, so we never execute on stale slate.
     const wsUrl = options.ws || options.rpc.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-    // Auto-fallback WS rotation: primary → SOLANA_RPC_FALLBACK wss → Solana public
-    // wss. ws-realtime advances one spot per failed attempt, so a dead primary
-    // falls through by itself. An explicit --ws override pins a single endpoint.
+    // Auto-fallback WS rotation: primary → SOLANA_RPC_FALLBACK wss, both on our
+    // own provider. ws-realtime advances one spot per failed attempt, so a dead
+    // primary falls through by itself. An explicit --ws override pins a single
+    // endpoint. The public Solana cluster is deliberately NOT a candidate: it has
+    // no SLA, shares one connection budget with the whole network, and sits far
+    // enough behind that our minContextSlot guards reject its responses — a
+    // rotation onto it looked "healthy" while silently starving the rails.
     const fallbackWsUrl = (process.env.SOLANA_RPC_FALLBACK ?? "").replace(/^http:/, "ws:").replace(/^https:/, "wss:");
     const wsCandidates = options.ws
       ? undefined
-      : [...new Set([wsUrl, fallbackWsUrl, "wss://api.mainnet-beta.solana.com"].filter(Boolean))];
+      : [...new Set([wsUrl, fallbackWsUrl].filter(Boolean))];
     let activeWsEndpoint = "";
     if (options.watch) {
       const wsLogged = new Map<string, number>();
