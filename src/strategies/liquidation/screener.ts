@@ -100,6 +100,46 @@ export async function fetchCachedSnapshot(params: {
   return snapshot;
 }
 
+/**
+ * Full obligation payloads kept from the last scan, bounded to the LOWEST-health N.
+ *
+ * The scan already pays to hydrate ~14.5k accounts (health < --health-watch) and
+ * then discards the payloads. Those are exactly the positions one price move away
+ * from crossing, so the oracle rail revalues them here at ZERO RPC on every price
+ * tick — `calculatePositions(market, …)` recomputes stats from the market's fresh
+ * prices, which is what makes a stale payload still detect a fresh crossing.
+ *
+ * Bounded because oracle ticks are frequent: N × fromAccountData is CPU on the
+ * race critical path. The tracker itself only holds `maxWatch` (60) rows, so this
+ * is strictly a widening of DETECTION — nothing here can fire; executeDue still
+ * rehydrates live and the simulator still arbitrates.
+ */
+const VALUATION_CACHE_MAX = 400;
+const valuationCache = new Map<string, StreamAccountSnapshot>();
+
+/**
+ * Pubkeys whose payloads the last scan retained — the lowest-health N as a SET.
+ * Iteration order follows hydration arrival, so callers must not rely on it being
+ * health-sorted; every consumer just unions these into a revaluation batch.
+ */
+export function valuationSnapshotKeys(): string[] {
+  return [...valuationCache.keys()];
+}
+
+/**
+ * Seed revaluation payloads into a snapshot map WITHOUT overwriting fresher ones.
+ * WS account notifications are authoritative; these are only the fallback for
+ * accounts we have never subscribed to.
+ */
+export function seedValuationSnapshots(
+  into: Map<string, StreamAccountSnapshot>,
+  cache: ReadonlyMap<string, StreamAccountSnapshot> = valuationCache,
+): void {
+  // Never clobber: a WS account notification is strictly fresher than a payload the
+  // scan picked up, and dropping it would swap live data for stale data.
+  for (const [key, value] of cache) if (!into.has(key)) into.set(key, value);
+}
+
 function sliceNeedsHydration(entry: { debtSf: bigint; unhealthySf: bigint }, options: ScanOptions): boolean {
   const cachedDebtUsd = Number(entry.debtSf) / 1e18;
   // Cached values only underestimate live debt (interest accrues since last refresh),
@@ -201,6 +241,24 @@ const HOT_MARKET_CACHE_TTL_MS = MARKET_CACHE_TTL_MS;
 export const ORACLE_MARKET_MAX_AGE_MS = 60_000;
 export const ORACLE_SNAPSHOT_MAX_AGE_MS = 45_000;
 export const SUBSCRIBED_SNAPSHOT_MAX_AGE_MS = 60_000;
+/**
+ * Age budget for the scan's valuation-cache payloads, which are NOT WS-subscribed
+ * and therefore only refreshed by the full scan.
+ *
+ * This must exceed (WATCH_INTERVAL + one scan duration) or the widening develops a
+ * DEAD WINDOW: the cache is only replaced by the NEXT completed scan, so payloads
+ * captured early in a cycle keep ageing while their replacement is still ~2 minutes
+ * away. Measured against the deployed config (interval 120s, scan ~100s → ~220s of
+ * residence) a 150s budget dropped `revalued` 393 → 50 for ~70s of every cycle.
+ * Raise this if you raise --interval.
+ *
+ * The payload's account amounts only move on an account write, while the PRICE — the
+ * thing that actually flips health — is applied fresh on every tick; and a false
+ * positive here is harmless (executeDue rehydrates live and the health gate vetoes),
+ * whereas a false negative is a lost race. The cap exists only to expire a cache
+ * whose scans have stopped succeeding.
+ */
+export const VALUATION_SNAPSHOT_MAX_AGE_MS = 300_000;
 
 // Single-flight: every caller (scan cycle, hot tick, executeDue, executeLiquidationOnce)
 // hits preloadMarket whenever the 60s cache is stale; without dedup those concurrent loads
@@ -325,13 +383,28 @@ export async function scanOnce(params: ScreenerDeps & {
     .sort((a, b) => healthFactorFromSf(a.debtSf, a.unhealthySf) - healthFactorFromSf(b.debtSf, b.unhealthySf));
 
   const ledgerInstant = await fetchLedgerInstant(rpc, "ledger instant");
+  // Retain only the LOWEST-health payloads for oracle revaluation. Selection is by
+  // rank in `needsHydration` (already sorted ascending by stored health) rather than
+  // by arrival order — hydrateShortlist fans batches across parallel workers, so the
+  // first onSnapshot callbacks to fire are NOT necessarily the healthiest. The scan
+  // already pays for all ~14.5k payloads; only these are worth keeping.
+  const valuationRank = new Map(needsHydration.map((entry, index) => [entry.pubkey.toString(), index]));
+  const captured = new Map<string, StreamAccountSnapshot>();
   const hydrated = await hydrateShortlist({
     rpc,
     market,
     ledgerInstant,
     pubkeys: needsHydration.map((entry) => entry.pubkey),
     onProgress: params.onProgress ?? (() => {}),
+    onSnapshot: (account) => {
+      if ((valuationRank.get(account.pubkey.toString()) ?? Number.MAX_SAFE_INTEGER) >= VALUATION_CACHE_MAX) return;
+      captured.set(account.pubkey.toString(), account);
+    },
   });
+  if (captured.size) {
+    valuationCache.clear();
+    for (const [key, value] of captured) valuationCache.set(key, value);
+  }
 
   // Pass the program's stored scaled-factor health through for DUE gating (see filters.ts).
   const storedHealthByPubkey = new Map<string, number>();
@@ -488,8 +561,14 @@ export async function refreshTrackedObligations(params: {
     const missing: Address[] = [];
     for (const pubkey of pubkeys) {
       const snapshot = params.snapshots?.get(pubkey);
+      // On an oracle tick we deliberately accept a cached payload for accounts we
+      // are NOT subscribed to: the scan's valuation cache covers them, prices are
+      // fresh (that is what makes the tick worth running), and execution still
+      // rehydrates live before anything is broadcast. Without this they would carry
+      // maxAge 0 and every out-of-tracker crossing would stay invisible until the
+      // next 120s scan. On non-oracle (RPC) paths the old strictness still applies.
       const snapshotMaxAge = params.isSubscribed
-        ? (params.isSubscribed(pubkey) ? SUBSCRIBED_SNAPSHOT_MAX_AGE_MS : 0)
+        ? (params.isSubscribed(pubkey) ? SUBSCRIBED_SNAPSHOT_MAX_AGE_MS : (oracleTrigger ? VALUATION_SNAPSHOT_MAX_AGE_MS : 0))
         : (oracleTrigger ? ORACLE_SNAPSHOT_MAX_AGE_MS : 0);
       if (canRevalue && snapshot?.accountData && snapshot.receivedAt !== undefined
         && Date.now() >= snapshot.receivedAt && Date.now() - snapshot.receivedAt < snapshotMaxAge && snapshot.slot !== undefined && snapshot.slot <= instant.slot) {

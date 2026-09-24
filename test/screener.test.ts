@@ -5,6 +5,12 @@ import { ObligationTypeTag } from "@kamino-finance/klend-sdk";
 import { parseObligationSlice } from "../src/strategies/liquidation/screener.js";
 import { isRateLimitError } from "../src/strategies/liquidation/screener.js";
 import {
+  seedValuationSnapshots,
+  VALUATION_SNAPSHOT_MAX_AGE_MS,
+  SUBSCRIBED_SNAPSHOT_MAX_AGE_MS,
+  type StreamAccountSnapshot,
+} from "../src/strategies/liquidation/screener.js";
+import {
   buildMarketReserveMap,
   dynamicLiquidationBonus,
   estimateLiquidationProfit,
@@ -422,4 +428,43 @@ test("candidate margin follows borrow-factor priority rather than largest debt",
   assert.equal(candidate.repayDebt?.amountUsd,100);
   assert.equal(candidate.estimatedRepayUsd,10);
   assert.equal(candidate.estimatedProfitUsd,0.05);
+});
+
+// ── Oracle valuation cache ──
+// The cache is what lets an oracle tick detect a crossing for positions OUTSIDE the
+// tracker's 60-row watch tier without paying an RPC. Both properties below fail
+// SILENTLY: a clobbered payload swaps live WS state for a scan snapshot, and an age
+// budget shorter than the scan cadence makes the entire widening dead code.
+
+const snapshot = (slot: bigint, receivedAt: number): StreamAccountSnapshot =>
+  ({ pubkey: "TestObligation1111111111111111111111111111" as never, accountData: Buffer.alloc(8), slot, receivedAt });
+
+test("valuation cache seeds unsubscribed positions without clobbering live WS state", () => {
+  const unsubscribed = "ObUnsubscribed11111111111111111111111111";
+  const subscribed = "ObSubscribed111111111111111111111111111111";
+  const cached = snapshot(100n, 1_000);
+  const live = snapshot(900n, 9_000);
+  const into = new Map<string, StreamAccountSnapshot>([[subscribed, live]]);
+
+  seedValuationSnapshots(into, new Map([[unsubscribed, cached], [subscribed, cached]]));
+
+  assert.equal(into.get(unsubscribed), cached, "positions we never subscribed to must join the revaluation set");
+  assert.equal(into.get(subscribed), live, "a WS account notification always outranks a scan payload");
+  assert.equal(into.size, 2);
+});
+
+test("seed with an empty cache (first boot, pre-scan) changes nothing", () => {
+  const into = new Map<string, StreamAccountSnapshot>();
+  seedValuationSnapshots(into, new Map());
+  assert.equal(into.size, 0);
+});
+
+test("valuation payloads must outlive the whole scan cycle that produced them", () => {
+  // The cache is replaced only by the NEXT completed scan, so a payload's residence
+  // is (WATCH_INTERVAL + scan duration) ≈ 120s + ~100s = ~220s for the deployed
+  // config. A budget below that opens a dead window right after expiry where the
+  // detection widening silently stops widening (observed: 150s → revalued 393→50).
+  // The subscribed path's 60s budget would be too short for exactly this reason.
+  assert.ok(VALUATION_SNAPSHOT_MAX_AGE_MS >= 240_000, "must exceed interval + scan duration");
+  assert.ok(VALUATION_SNAPSHOT_MAX_AGE_MS > SUBSCRIBED_SNAPSHOT_MAX_AGE_MS);
 });

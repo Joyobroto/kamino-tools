@@ -29,7 +29,7 @@ import {
 } from "./kamino.js";
 import { instructionSummary, loadStrategy, externalInstructionsToStrategy } from "./strategy.js";
 import { createSignedTransaction, createSignedTransactionWithAlt, sendAndConfirm, sendAndConfirmPoll, simulate, transactionReceipt } from "./transaction.js";
-import { scanOnce, preloadMarket, refreshTrackedObligations, type PreloadedMarket, type StreamAccountSnapshot } from "./strategies/liquidation/screener.js";
+import { scanOnce, preloadMarket, refreshTrackedObligations, valuationSnapshotKeys, seedValuationSnapshots, type PreloadedMarket, type StreamAccountSnapshot } from "./strategies/liquidation/screener.js";
 import { HotTracker, type TrackerEvent } from "./strategies/liquidation/tracker.js";
 import { executeLiquidationOnce } from "./strategies/liquidation/execute.js";
 import { senderConfigFromEnv, warmSenderConnection } from "./strategies/liquidation/sender.js";
@@ -746,14 +746,16 @@ program
     const executorRecentlyTried = new Map<string, number>();
     // Bounded-concurrency fire lanes: LionX's census shows they fire PARALLEL txs
     // (3 liquidations in the same slot, one per obligation). Keep exactly three
-    // lanes, but reserve one for WS race triggers so a scan burst cannot occupy
-    // every slot. Both queues are priority ordered; fresher/prepared candidates
-    // jump ahead without increasing RPC concurrency or recreating the 429 storm.
+    // lanes so RPC concurrency (and the 429 storm) is unchanged, but split them in
+    // FAVOUR of the race rails: the measured queue wait was p90 1131ms because a
+    // single reserved lane serialized every WS trigger, and a scan burst could
+    // otherwise occupy both general slots. Races get two lanes; scan/hot gets one.
     const MAX_FIRE_LANES = 3;
-    const enqueueWsFire = createTaskQueue(1, (error) => {
-      console.error(`ws executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
+    const RACE_FIRE_LANES = 2;
+    const enqueueWsFire = createTaskQueue(RACE_FIRE_LANES, (error) => {
+      console.error(`race executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
     });
-    const enqueueGeneralFire = createTaskQueue(MAX_FIRE_LANES - 1, (error) => {
+    const enqueueGeneralFire = createTaskQueue(MAX_FIRE_LANES - RACE_FIRE_LANES, (error) => {
       console.error(`executor lane failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     const enqueueForensics = createTaskQueue(1, () => {});
@@ -962,10 +964,16 @@ program
       // WS gets its reserved lane; scan/hot work uses the other two. Priority
       // is stable FIFO for equal scores, with fresh/prepared race candidates
       // ahead of older queued work.
+      //
+      // This score was previously computed and then DISCARDED — `enqueueFire` was
+      // called with no priority, so every task ran plain FIFO and a fresh race
+      // trigger sat behind older scan work. It is now actually passed through.
       const queuePriority = (opts.streamSnapshot?.receivedAt !== undefined
         ? Math.max(0, 2_000 - (Date.now() - opts.streamSnapshot.receivedAt))
         : 0) + Math.max(0, opts.prepared?.candidates[0]?.estimatedProfitUsd ?? 0);
-      const enqueueFire = rail === "ws" ? enqueueWsFire : enqueueGeneralFire;
+      // The oracle rail is a RACE rail (it is the fast detection path), so it shares
+      // the reserved lanes with the WS rail instead of queueing behind scan work.
+      const enqueueFire = rail === "ws" || rail === "oracle" ? enqueueWsFire : enqueueGeneralFire;
       enqueueFire(async () => {
         try {
           const guards = evaluateFireGuards(executorAutoOptions, loadLedger(executorAutoOptions.ledgerPath), Date.now(), existsSync(executorAutoOptions.stopFilePath));
@@ -1263,7 +1271,7 @@ program
         } finally {
           executorBusy.delete(obligation);
         }
-      });
+      }, queuePriority);
     };
 
     const emitTrackerEvents = (events: TrackerEvent[], prepared?: Awaited<ReturnType<typeof refreshTrackedObligations>>, preparedAt?: number, oracleTrigger?: StreamAccountSnapshot) => {
@@ -1325,7 +1333,7 @@ program
     // Oracle-first observability: how many tracked positions were revalued from
     // the oracle tick (and how many came out DUE) — the numbers the race audit
     // needs to prove the oracle rail fires BEFORE the obligation mutation.
-    let lastOracleRevalue: { revalued: number; due: number; at: number } | undefined;
+    let lastOracleRevalue: { revalued: number; due: number; at: number; trackedPassMs?: number } | undefined;
     let pendingOracle = false;
     let adaptiveBand = scanConfig.healthWatch;
     let surgeActive = false;
@@ -1341,48 +1349,90 @@ program
       hotTickRunning = true;
       try {
         if (!preloaded) return;
-        const hotAddresses = tracker.hotObligations();
-        if (!hotAddresses.length) return;
-        const updates = await refreshTrackedObligations({
-          rpc: scanRpc,
-          preloaded,
-          pubkeys: hotAddresses.map((value) => address(value)),
-          snapshots,
-          ...(lastOracleTrigger ? { valuationSnapshot: lastOracleTrigger } : {}),
-          isSubscribed: key => wsHandle?.isSubscribed(key) ?? false,
-          ...(oracleTrigger ? { oracleTrigger } : {}),
-          applyOraclePrices: (market) => oracleCache.refreshMarket(market),
-        });
-        // Watchboard ingest: hot-tick refreshes carry the freshest per-position
-        // health of the tracked cohort — update rows without changing status.
-        if (oracleTrigger) lastOracleRevalue = {
-          revalued: updates.candidates.length,
-          due: updates.candidates.filter((candidate) => candidate.healthFactor < 1).length,
-          at: Date.now(),
+        // Narrow once: the captured `preloaded` is a mutable binding, so TS cannot
+        // keep the guard's narrowing inside the closure below.
+        const loadedMarket = preloaded;
+        // Refresh a cohort and consume the result (board + tracker + fire) as ONE
+        // unit, so the race rail can run it as TWO passes.
+        //
+        // Why two: executeDue only fires once a pass completes, so revaluing all 393
+        // in a single batch made the most-endangered (tracked) positions wait the
+        // full ~350ms instead of ~74ms — the widening would have taxed exactly the
+        // cohort that matters most. Two passes cost ~74ms of duplicated fixed
+        // overhead in total while letting the DUE tier fire ~276ms earlier.
+        //
+        // syncObligationSubscriptions is deliberately OUTSIDE this helper: it evicts
+        // any snapshot whose pubkey is not tracked, so it must not run between
+        // seeding the valuation cache and the valuation pass reading it.
+        const refreshAndConsume = async (addresses: string[]): Promise<{ revalued: number; due: number }> => {
+          if (!addresses.length) return { revalued: 0, due: 0 };
+          const updates = await refreshTrackedObligations({
+            rpc: scanRpc,
+            preloaded: loadedMarket,
+            pubkeys: addresses.map((value) => address(value)),
+            snapshots,
+            ...(lastOracleTrigger ? { valuationSnapshot: lastOracleTrigger } : {}),
+            isSubscribed: key => wsHandle?.isSubscribed(key) ?? false,
+            ...(oracleTrigger ? { oracleTrigger } : {}),
+            applyOraclePrices: (market) => oracleCache.refreshMarket(market),
+          });
+          // Watchboard ingest: hot-tick refreshes carry the freshest per-position
+          // health of the tracked cohort — update rows without changing status.
+          // The widened valuation set is a DETECTION net, not a display cohort:
+          // refresh rows that already exist, and let a genuinely DUE position earn a
+          // new row — but never let ~340 healthy cache entries flood the board.
+          const boardTracked = new Set(tracker.hotObligations());
+          for (const candidate of updates.candidates) {
+            if (!watchboard.has(candidate.obligation)
+              && candidate.healthFactor >= 1
+              && !boardTracked.has(candidate.obligation)) continue;
+            boardUpdate(candidate.obligation, {
+              health: candidate.healthFactor,
+              healthSource: "hot",
+              debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
+              debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
+              prizeUsd: candidate.estimatedProfitUsd ?? 0,
+              ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
+            });
+          }
+          const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString(), !oracleTrigger);
+          if (events.length) emitTrackerEvents(events, updates, Date.now(), oracleTrigger);
+          // A still-DUE position needs a new attempt after a transient failure,
+          // even if it never crossed back above one. Cooldown/busy guards bound this.
+          const emitted = new Set(events.filter((event) => event.type === "promoted" || event.type === "spotted")
+            .map((event) => event.candidate.obligation));
+          for (const candidate of updates.candidates) {
+            if (candidate.healthFactor < 1 && !emitted.has(candidate.obligation)) executeDue(candidate.obligation, {
+              rail: oracleTrigger ? "oracle" : "hot", ...(oracleTrigger ? { oracleTrigger } : {}),
+              prepared: { ...updates, candidates: [candidate] }, preparedAt: Date.now(),
+            });
+          }
+          return {
+            revalued: updates.candidates.length,
+            due: updates.candidates.filter((candidate) => candidate.healthFactor < 1).length,
+          };
         };
-        for (const candidate of updates.candidates) {
-          boardUpdate(candidate.obligation, {
-            health: candidate.healthFactor,
-            healthSource: "hot",
-            debtSymbol: (candidate.repayDebt ?? candidate.largestDebt).symbol,
-            debtUsd: (candidate.repayDebt ?? candidate.largestDebt).amountUsd,
-            prizeUsd: candidate.estimatedProfitUsd ?? 0,
-            ...(candidate.healthFactor < 1 ? { status: "UNHEALTHY" } : {}),
-          });
+        const trackedKeys = tracker.hotObligations();
+        let revalued = 0;
+        let due = 0;
+        const accumulate = ({ revalued: batchRevalued, due: batchDue }: { revalued: number; due: number }) => {
+          revalued += batchRevalued;
+          due += batchDue;
+        };
+        // Pass 1 — the tracked cohort (DUE + watch tier): the race-critical set.
+        const trackedPassStartedAt = Date.now();
+        accumulate(await refreshAndConsume(trackedKeys));
+        const trackedPassMs = Date.now() - trackedPassStartedAt;
+        // Pass 2 — the widened valuation net. Overlaps with the tracker (the tracked
+        // rows are themselves the lowest-health ones), so filter them out: they were
+        // just refreshed a moment ago and must not be fired twice.
+        if (oracleTrigger) {
+          seedValuationSnapshots(snapshots);
+          const trackedSet = new Set(trackedKeys);
+          accumulate(await refreshAndConsume(valuationSnapshotKeys().filter((key) => !trackedSet.has(key))));
+          lastOracleRevalue = { revalued, due, at: Date.now(), trackedPassMs };
         }
-        const events = tracker.applyHotUpdate(updates.candidates, new Date().toISOString(), !oracleTrigger);
         syncObligationSubscriptions();
-        if (events.length) emitTrackerEvents(events, updates, Date.now(), oracleTrigger);
-        // A still-DUE position needs a new attempt after a transient failure,
-        // even if it never crossed back above one. Cooldown/busy guards bound this.
-        const emitted = new Set(events.filter((event) => event.type === "promoted" || event.type === "spotted")
-          .map((event) => event.candidate.obligation));
-        for (const candidate of updates.candidates) {
-          if (candidate.healthFactor < 1 && !emitted.has(candidate.obligation)) executeDue(candidate.obligation, {
-            rail: oracleTrigger ? "oracle" : "hot", ...(oracleTrigger ? { oracleTrigger } : {}),
-            prepared: { ...updates, candidates: [candidate] }, preparedAt: Date.now(),
-          });
-        }
         lastHotCompletedAt = Date.now();
       } catch (error) {
         if (!oracleTrigger) nextHotRpcAt = Date.now() + 30_000;
@@ -1459,7 +1509,7 @@ program
                     `[${localTimestamp(new Date().toISOString())}] oracle benchmark: updates=${oracleUpdateCount} ` +
                     `update->hot=${Math.max(0, hotStartedAt - oracleUpdateAt)}ms ` +
                     `hot=${finishedAt - hotStartedAt}ms tracked=${tracker.hotObligations().length}` +
-                    `${lastOracleRevalue ? ` revalued=${lastOracleRevalue.revalued} due=${lastOracleRevalue.due}` : ""}`,
+                    `${lastOracleRevalue ? ` revalued=${lastOracleRevalue.revalued} due=${lastOracleRevalue.due} pass1=${lastOracleRevalue.trackedPassMs ?? "?"}ms` : ""}`,
                   ));
                 }
               })
