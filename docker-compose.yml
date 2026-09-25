@@ -16,6 +16,11 @@ services:
     volumes:
       # Persist JSONL event log across container restarts/rebuilds
       - ./data:/data
+    # --min-debt: sub-$100 positions all carry a prize at or below the fire floor,
+    # and they occupy the 400 valuation slots the oracle rail re-values every ~500ms
+    # — seeded with dust, that net only re-reads what we cannot win.
+    # NOTE: annotations go HERE. The folded scalar below treats '#' as literal
+    # command text, so an in-block comment would be passed to the CLI as arguments.
     command: >
       node --disable-warning=ExperimentalWarning --import tsx src/cli.ts scan
       --watch
@@ -26,6 +31,7 @@ services:
       --stop-file /data/liq_autofire.stop
       --min-profit ${LIQ_MIN_PROFIT:-0.05}
       --min-prize ${LIQ_MIN_PRIZE:-0}
+      --min-debt ${LIQ_MIN_DEBT:-100}
       --slippage-bps ${LIQ_SLIPPAGE_BPS:-50}
       --priority-mode ${LIQ_PRIORITY_MODE:-auto}
       --fast
