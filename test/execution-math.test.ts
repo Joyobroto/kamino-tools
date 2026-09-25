@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { Decimal } from "decimal.js";
-import { chooseRepayBaseUnits, chooseRepayUsd, estimateCollateralForRepay, profitBaseUnitsToUsd } from "../src/strategies/liquidation/execute.js";
+import { address, type Address, type Instruction } from "@solana/kit";
+import { chooseRepayBaseUnits, chooseRepayUsd, estimateCollateralForRepay, orderOraclePreInstructions, profitBaseUnitsToUsd } from "../src/strategies/liquidation/execute.js";
 
 test("chooseRepayUsd applies default close factor and caps at largest debt", () => {
   assert.equal(chooseRepayUsd(100, 60), 50);
@@ -147,4 +148,37 @@ test("the close factor is charged to the WHOLE obligation, not to one borrow", (
   const dust = sizing({ borrowValueUsd: new Decimal("1.50"), totalBorrowValueUsd: new Decimal(1100) });
   assert.equal(dust.fullLiquidation, true);
   assert.equal(dust.amount, 1_000n);
+});
+
+// scope's handler_refresh_prices rejects a RefreshPriceList preceded by anything
+// other than ComputeBudget ("RefreshWithUnexpectedIxs", error 6014). The sender tip
+// is a SystemProgram transfer, so leading with it reverted every sender-lane
+// transaction before the liquidation — and its ObligationHealthy health check —
+// ever ran, while lane-less attempts died at the sender cost gate instead.
+const SCOPE = address("HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ");
+const KLEND = address("KLend2g3cP87ff48J2MVsRBF4mLNVhqEHFDuL6nEaZE");
+const SYSTEM = address("11111111111111111111111111111111");
+const ix = (programAddress: Address): Instruction => ({ programAddress, accounts: [] });
+
+test("sender tip never precedes a Scope RefreshPriceList", () => {
+  const scopeA = ix(SCOPE);
+  const scopeB = ix(SCOPE);
+  const reserve = ix(KLEND);
+  const tip = ix(SYSTEM);
+  const ordered = orderOraclePreInstructions({ scopeRefreshes: [scopeA, scopeB], reserveRefreshes: [reserve], senderTip: tip });
+  assert.deepEqual(ordered, [scopeA, scopeB, reserve, tip]);
+  assert.ok(!ordered.slice(0, 2).includes(tip), "SystemProgram tip ahead of RefreshPriceList reverts 6014");
+});
+
+test("without a sender lane the tip is omitted and scope still leads", () => {
+  const scope = ix(SCOPE);
+  const reserve = ix(KLEND);
+  assert.deepEqual(orderOraclePreInstructions({ scopeRefreshes: [scope], reserveRefreshes: [reserve] }), [scope, reserve]);
+});
+
+test("a skipped Scope refresh leaves the reserve order and optional tip intact", () => {
+  const reserve = ix(KLEND);
+  const tip = ix(SYSTEM);
+  assert.deepEqual(orderOraclePreInstructions({ scopeRefreshes: [], reserveRefreshes: [reserve], senderTip: tip }), [reserve, tip]);
+  assert.deepEqual(orderOraclePreInstructions({ scopeRefreshes: [], reserveRefreshes: [reserve] }), [reserve]);
 });

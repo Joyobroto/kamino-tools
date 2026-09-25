@@ -450,6 +450,32 @@ export function choosePriorityFee(params: {
   return { microlamportsPerCu: micro, tipUsd: cappedBid, lane: `${bucket.label} (~$${cappedBid.toFixed(2)})` };
 }
 
+/**
+ * Composes the pre-liquidation instructions in the only order Scope accepts.
+ *
+ * `handler_refresh_prices` rejects a `RefreshPriceList` preceded by anything other
+ * than ComputeBudget — "RefreshWithUnexpectedIxs" (error 6014). The sender tip is a
+ * SystemProgram transfer, so leading with it made every sender-lane transaction revert
+ * at instruction 3, *before* the liquidation (and its ObligationHealthy health check)
+ * could run; lane-less attempts died at the sender cost gate instead, so no sender-lane
+ * transaction could ever succeed. The tip only has to share the transaction.
+ *
+ * Regression-covered because the failure is invisible in unit-less builds: it only
+ * surfaces on-chain. A/B verified with `liq-execute <obligation> --bypass-health`
+ * against a live Scope-priced reserve, with and without `--no-sender`.
+ */
+export function orderOraclePreInstructions(groups: {
+  scopeRefreshes: readonly Instruction[];
+  reserveRefreshes: readonly Instruction[];
+  senderTip?: Instruction;
+}): Instruction[] {
+  return [
+    ...groups.scopeRefreshes,
+    ...groups.reserveRefreshes,
+    ...(groups.senderTip ? [groups.senderTip] : []),
+  ];
+}
+
 export function executeLiquidationOnce(input: LiquidationInput): Promise<LiquidationOutcome> {
   // Planning never submits transactions. Late read/sign work cannot broadcast,
   // and a hung provider must release the caller's execution slot.
@@ -780,18 +806,14 @@ async function executeLiquidationAttempt(input: LiquidationInput): Promise<Liqui
   for (const deposit of obligation.getDeposits()) refreshAccounts.push({ address: deposit.reserveAddress, writable: true });
   for (const borrow of obligation.getBorrows()) refreshAccounts.push({ address: borrow.reserveAddress, writable: true });
   const uniqueReserveAddresses = [...new Set(refreshAccounts.map((meta) => meta.address.toString()))];
-  const preInstructions: Instruction[] = [];
   // Keep oracle refreshes in the SAME transaction as liquidation. A standalone
   // simulateTransaction cannot see a preceding bundle member's state changes.
-  // Sender tip transfer rides the same sandwich (atomic with borrow/liquidate/
-  // repay): it is rolled back if the liquidation reverts, so a rejected tx only
-  // burns base + priority fee, not the tip.
-  if (senderLane) preInstructions.push(buildSenderTipInstruction({ signer, lamports: senderLane.tipLamports }));
-
+  //
   // Scope-priced reserves read a price feed that must itself be refreshed earlier
   // in the SAME transaction — otherwise refreshObligation fails with ReserveStale
   // (price_status 63). Mirror the SDK/refresh-keeper pattern: RefreshPriceList
   // first, covering every chain id the touched reserves reference.
+  const scopeRefreshes: Instruction[] = [];
   try {
     // scope-sdk v13 bundles its own kit v7 types; our kit 2.3 RPC is runtime-compatible
     // (verified on mainnet) — the cast bridges the brand-type gap.
@@ -812,17 +834,30 @@ async function executeLiquidationAttempt(input: LiquidationInput): Promise<Liqui
       if (!tokenIds.length) continue;
       const refreshIx = await scope.refreshPriceListIx({ config: configPubkey as never }, tokenIds);
       if (refreshIx) {
-        preInstructions.push(refreshIx as Instruction);
+        scopeRefreshes.push(refreshIx as Instruction);
       }
     }
   } catch {
     // Scope refresh is best-effort: pyth/switchboard-priced paths don't need it.
   }
 
+  const reserveRefreshes: Instruction[] = [];
   for (const reserveAddress of uniqueReserveAddresses) {
     const reserve = market.getReserveByAddress(address(reserveAddress));
-    if (reserve) preInstructions.push(buildRefreshReserveIx(market, reserve));
+    if (reserve) reserveRefreshes.push(buildRefreshReserveIx(market, reserve));
   }
+
+  // Sender tip transfer rides the same sandwich (atomic with borrow/liquidate/
+  // repay): it is rolled back if the liquidation reverts, so a rejected tx only
+  // burns base + priority fee, not the tip. It must share the transaction but must
+  // NOT lead it — orderOraclePreInstructions pins it after the Scope refreshes
+  // (see that function for the 6014 RefreshWithUnexpectedIxs forensics).
+  const preInstructions = orderOraclePreInstructions({
+    scopeRefreshes,
+    reserveRefreshes,
+    ...(senderLane ? { senderTip: buildSenderTipInstruction({ signer, lamports: senderLane.tipLamports }) } : {}),
+  });
+
   const refreshObligationIx = refreshObligation(
     { lendingMarket: market.getAddress(), obligation: obligationAddress },
     refreshAccounts.map((meta) => ({ address: meta.address, role: AccountRole.WRITABLE })),
