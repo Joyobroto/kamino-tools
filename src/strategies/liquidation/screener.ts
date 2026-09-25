@@ -470,6 +470,15 @@ export interface StreamAccountSnapshot {
   accountData?: Buffer;
   slot?: bigint;
   receivedAt?: number;
+  /**
+   * Health the TRIGGER saw, i.e. unhealthySf/debtSf as stored on the obligation
+   * by its last on-chain refresh (WS notifications carry it; scan/hot producers
+   * omit it). It is a signal, never proof: the stored scaled factors go stale as
+   * prices move, so the executor's live recompute is what decides. Logging both
+   * numbers on a veto is the only way to tell a genuinely-healed position from a
+   * stale-trigger false alarm.
+   */
+  cachedHealth?: number;
 }
 
 const slotInstants = new WeakMap<object, Map<bigint, Promise<LedgerInstant>>>();

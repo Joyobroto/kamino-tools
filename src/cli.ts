@@ -902,8 +902,20 @@ program
       // Forensics is a getSignatures+getTransaction burst: dust/hydration
       // vetoes log WITHOUT it (40+ dust vetoes per surge cycle used to
       // self-inflict a 429 storm exactly when the race lanes needed the key).
-      const logVeto = (reason: string, detail: { liveHealth?: number; prizeUsd?: number; forensics?: boolean }): void => {
+      const logVeto = (reason: string, detail: { liveHealth?: number; prizeUsd?: number; forensics?: boolean; triggerHealth?: number }): void => {
         const latencyMs = Date.now() - triggeredAtMs;
+        // Which rail fired, how old the oracle snapshot was, and the health the
+        // trigger saw versus the live recompute that declined it. Without that
+        // delta a health-gate veto is indistinguishable from a stale-trigger
+        // false alarm — the 2026-09-24 batch could only be diagnosed by scraping
+        // console output, because the ledger recorded only the live side.
+        const vetoBase = {
+          rail,
+          oracleSnapshotAgeMs: oracleCache.snapshotAgeMs,
+          ...(detail.liveHealth !== undefined ? { liveHealth: detail.liveHealth } : {}),
+          ...(detail.triggerHealth !== undefined ? { triggerHealth: detail.triggerHealth } : {}),
+          ...(detail.prizeUsd !== undefined ? { prizeUsd: detail.prizeUsd } : {}),
+        };
         const runForensics = detail.forensics ?? false;
         // Real counters for the heartbeat: every veto class is distinguishable
         // (dust vs health-gate vs hydration noise) instead of one opaque "0".
@@ -916,8 +928,7 @@ program
             obligation,
             reason,
             latencyMs,
-            ...(detail.liveHealth !== undefined ? { liveHealth: detail.liveHealth } : {}),
-            ...(detail.prizeUsd !== undefined ? { prizeUsd: detail.prizeUsd } : {}),
+            ...vetoBase,
           });
           return;
         }
@@ -931,6 +942,10 @@ program
             obligation,
             reason,
             outcome: fate.outcome,
+            // 6 of the 9 vetoes on 2026-09-24 landed in "unknown" with no
+            // explanation recorded — the reader cannot tell a genuine
+            // no-liquidation from an RPC that gave up mid-scan.
+            ...(fate.reason ? { vetoFate: fate.reason } : {}),
             ...(fate.slot !== undefined && opts.streamSnapshot?.slot !== undefined ? {
               triggerSlot: opts.streamSnapshot.slot.toString(),
               postLiquidationNotification: BigInt(fate.slot) <= opts.streamSnapshot.slot,
@@ -942,8 +957,7 @@ program
             ...(fate.raceLostAfterMs !== undefined ? { raceLostAfterMs: fate.raceLostAfterMs } : {}),
             triggeredAt: new Date(triggeredAtMs).toISOString(),
             latencyMs,
-            ...(detail.liveHealth !== undefined ? { liveHealth: detail.liveHealth } : {}),
-            ...(detail.prizeUsd !== undefined ? { prizeUsd: detail.prizeUsd } : {}),
+            ...vetoBase,
           });
           if (options.json) return;
           if (fate.outcome === "lost-race") {
@@ -1021,6 +1035,11 @@ program
               }
             }
           }
+          // The health the TRIGGER saw (WS stored scaled factors, or the scan/hot
+          // candidate) as opposed to the live recompute that follows. Their delta
+          // is what the gate is actually rejecting, and it is the only way to tell
+          // a position that healed from one the trigger read stale.
+          const triggerHealth = opts.streamSnapshot?.cachedHealth ?? opts.prepared?.candidates[0]?.healthFactor;
           if (raceRail) {
             const raceCandidate = hydrated.candidates[0];
             // Prize firewall ONLY when configured (>0). Default 0 = learning
@@ -1029,7 +1048,7 @@ program
             // attempt is measured cost (fee burn) against measured learning.
             const raceMinPrize = executorAutoOptions.minPrizeUsd ?? 0;
             if (raceCandidate && raceMinPrize > 0 && (raceCandidate.estimatedProfitUsd ?? 0) < raceMinPrize) {
-              logVeto(`WS race: prize $${(raceCandidate.estimatedProfitUsd ?? 0).toFixed(2)} < min-prize $${raceMinPrize.toFixed(2)} (dust firewall)`, { liveHealth: raceCandidate.healthFactor, prizeUsd: raceCandidate.estimatedProfitUsd ?? 0 });
+              logVeto(`WS race: prize $${(raceCandidate.estimatedProfitUsd ?? 0).toFixed(2)} < min-prize $${raceMinPrize.toFixed(2)} (dust firewall)`, { liveHealth: raceCandidate.healthFactor, prizeUsd: raceCandidate.estimatedProfitUsd ?? 0, ...(triggerHealth !== undefined ? { triggerHealth } : {}) });
               return;
             }
             boardUpdate(obligation, {
@@ -1058,7 +1077,7 @@ program
           // client already knew was healthy. SIM arbitrates races that are AT the
           // boundary, not races we have already lost on paper.
           if (candidate.healthFactor >= 1 + HEALTH_GATE_TOLERANCE && !opts.bypassHealth) {
-            logVeto(`live health ${candidate.healthFactor.toFixed(4)} ≥ ${(1 + HEALTH_GATE_TOLERANCE).toFixed(2)} (client gate declined)`, { liveHealth: candidate.healthFactor, prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0), forensics: true });
+            logVeto(`live health ${candidate.healthFactor.toFixed(4)} ≥ ${(1 + HEALTH_GATE_TOLERANCE).toFixed(2)} (client gate declined)`, { liveHealth: candidate.healthFactor, prizeUsd: Math.max(0, candidate.estimatedProfitUsd ?? 0), forensics: true, ...(triggerHealth !== undefined ? { triggerHealth } : {}) });
             return;
           }
           const marginalBand = candidate.healthFactor >= 1;
