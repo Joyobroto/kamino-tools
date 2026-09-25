@@ -43,6 +43,7 @@ export type TelegramAlertKind =
   | "near-miss"
   | "treasure"
   | "blocked"
+  | "rail"
   | "digest";
 
 export interface TelegramAlert {
@@ -393,6 +394,56 @@ export function budgetPausedAlert(params: { dailyLossUsd: number; capUsd: number
  *  vetoes by class, attempts, fires, and deduped race losses (tracker +
  *  forensics detection merged). Rail/provider health included because a dead
  *  WS rail means the bot is racing blind while the heartbeat still says 0. */
+/**
+ * The obligation WS rail dropped — or came back.
+ *
+ * A down rail is worse than a slow one: the bot keeps scanning, but it stops
+ * receiving per-account writes, so a health cross is only discovered on the next
+ * 10s hot tick. By then the incumbent bot has already landed the liquidation, so
+ * every second spent blind is a race we hand away.
+ *
+ * Sampled on a timer rather than fired from the error handler: a provider
+ * recycling its socket takes every subscription down and brings them all back
+ * within ~1-2s, and paging on that would bury the real outages.
+ */
+export function wsRailAlert(params: {
+  live: boolean;
+  /** endpoint/role label — the rail we were serving from when it broke */
+  endpoint: string;
+  active?: number;
+  desired?: number;
+  downForMs?: number;
+}): TelegramAlert {
+  const known = params.active !== undefined && params.desired !== undefined;
+  const subscriptions = known ? `${params.active}/${params.desired} subscriptions live` : "subscription count unavailable";
+  if (params.live) {
+    const downSec = Math.max(0, Math.round((params.downForMs ?? 0) / 1000));
+    const duration = downSec >= 60 ? `${Math.floor(downSec / 60)}m ${downSec % 60}s` : `${downSec}s`;
+    return {
+      kind: "rail",
+      title: "🟢 OBLIGATION WS RESTORED",
+      lines: [
+        `Blind for ${duration}; ${subscriptions}.`,
+        `Endpoint: ${params.endpoint}`,
+      ],
+    };
+  }
+  // A partial rail is degraded, not dead — say which, because "54/54 down" and
+  // "1 account never reconnected" are different bugs with different owners.
+  const partial = known && (params.active ?? 0) > 0;
+  return {
+    kind: "rail",
+    title: partial ? "🟠 OBLIGATION WS DEGRADED" : "🔴 OBLIGATION WS DOWN",
+    lines: [
+      `${subscriptions} — no obligation writes are arriving.`,
+      partial
+        ? "Detection keeps running on the accounts that reconnected; the silent ones only surface on the 10s hot tick."
+        : "Detection falls back to the 10s hot tick, which loses races against bots on the notification path.",
+      `Endpoint: ${params.endpoint}`,
+    ],
+  };
+}
+
 export function heartbeatAlert(params: {
   uptimeMinutes: number;
   cycles: number;

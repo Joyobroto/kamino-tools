@@ -10,6 +10,7 @@ import {
   executionAlert,
   profitAlert,
   nearMissDigestAlert,
+  wsRailAlert,
   TelegramAlerter,
 } from "../src/alerts/telegram.js";
 
@@ -130,4 +131,25 @@ test("near-miss digest ranks by estimated profit and formats", () => {
   assert.ok(digest.lines[0]!.includes("484"));
   assert.ok(digest.lines[1]!.includes("#2"));
   assert.ok(digest.lines[2]!.includes("#3"));
+});
+
+test("ws rail alert distinguishes a dead rail from a degraded one", () => {
+  const dead = wsRailAlert({ live: false, endpoint: "mainnet.helius-rpc.com / primary", active: 0, desired: 54 });
+  assert.equal(dead.kind, "rail");
+  assert.equal(dead.title, "🔴 OBLIGATION WS DOWN");
+  // The whole point of the alert: say that detection just got slower, so a
+  // blind window is never mistaken for "the bot is fine, nothing is due".
+  assert.ok(dead.lines.some((l) => l.includes("10s hot tick")));
+
+  const degraded = wsRailAlert({ live: false, endpoint: "mainnet.helius-rpc.com / primary", active: 53, desired: 54 });
+  assert.equal(degraded.title, "🟠 OBLIGATION WS DEGRADED");
+  assert.ok(degraded.lines.some((l) => l.includes("53/54")));
+});
+
+test("ws rail recovery reports how long the bot was blind", () => {
+  const restored = wsRailAlert({ live: true, endpoint: "mainnet.helius-rpc.com / primary", active: 54, desired: 54, downForMs: 125_000 });
+  assert.equal(restored.title, "🟢 OBLIGATION WS RESTORED");
+  assert.ok(restored.lines.some((l) => l.includes("Blind for 2m 5s")));
+  const quick = wsRailAlert({ live: true, endpoint: "x / primary", downForMs: 4_000 });
+  assert.ok(quick.lines.some((l) => l.includes("Blind for 4s")));
 });

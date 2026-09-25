@@ -49,13 +49,18 @@ test("tracked WS drops duplicate and older-slot payloads before emitting a signa
   assert.ok(handle.stats().payloadBytes > 0);
 });
 test("stream failure invalidates cached state and reconnects on fallback", async t => {
-  const endpoints: string[] = []; let s!: ReturnType<typeof stream>; const invalidated: string[] = [];
+  const endpoints: string[] = []; const failures: Array<[string, string]> = []; let s!: ReturnType<typeof stream>; const invalidated: string[] = [];
   const handle = subscribeTrackedObligations({ wsUrl: "wss://primary.invalid", wsCandidates: ["wss://fallback.invalid"], startIntervalMs: 1, retryMs: 1,
     onSlice: () => {}, onInvalidate: key => invalidated.push(key),
+    onError: (error, endpoint) => failures.push([endpoint, error instanceof Error ? error.message : String(error)]),
     subscribe: async (endpoint, _, signal) => { endpoints.push(endpoint); s = stream(signal); return s; },
   }); t.after(() => handle.abort()); handle.setAccounts([a]); await handle.ready;
   s.end(); await until(() => endpoints.length === 2 && handle.isSubscribed(a));
   assert.deepEqual(endpoints, ["wss://primary.invalid", "wss://fallback.invalid"]); assert.ok(invalidated.includes(a));
+  // The rail name must ride along with the error: with ~55 accounts sharing one
+  // socket, "which endpoint died" is the only thing that tells a provider
+  // recycle apart from a rotation bug once the failures are collapsed into one line.
+  assert.deepEqual(failures, [["wss://primary.invalid", "obligation account stream ended"]]);
   await pause(25); assert.equal(endpoints.length, 2, "quiet accounts must not reconnect");
 });
 test("closed accounts invalidate snapshots and abort stops all subscriptions", async () => {

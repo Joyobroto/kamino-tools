@@ -10,7 +10,9 @@ export interface TrackedWsOptions {
   wsCandidates?: string[];
   onSlice: (slice: WsObligationSlice) => void;
   onReady?: (endpoint: string) => void;
-  onError?: (error: unknown) => void;
+  /** `endpoint` is the candidate the failure happened ON — it is what the sticky rotation below
+   *  moves off, so callers collapsing concurrent failures need it to name the dead rail. */
+  onError?: (error: unknown, endpoint: string) => void;
   /** A gap, removal or close invalidates cached account bytes. */
   onInvalidate?: (account: Address) => void;
   subscribe?: Subscribe;
@@ -85,7 +87,7 @@ export function subscribeTrackedObligations(options: TrackedWsOptions) {
         // All accounts on a failed provider share one sticky fallback choice.
         // A flurry of failures must not rotate straight back to the bad endpoint.
         if (preferred === index) preferred = (index + 1) % candidates.length;
-        options.onError?.(error);
+        options.onError?.(error, activeEndpoint);
         attempt.abort();
         await wait(retry, entry.control.signal);
         retry = Math.min(retry * 2, 15_000);
@@ -95,7 +97,7 @@ export function subscribeTrackedObligations(options: TrackedWsOptions) {
   // Pace initial additions. Existing streams survive set changes unchanged.
   const timer = setInterval(() => {
     const next = [...entries.values()].find(entry => !entry.running);
-    if (next) { next.running = true; void run(next).catch(error => options.onError?.(error)); }
+    if (next) { next.running = true; void run(next).catch(error => options.onError?.(error, endpoint)); }
   }, options.startIntervalMs ?? 100);
   return {
     ready,

@@ -55,6 +55,7 @@ import {
   liquidationFailedAlert,
   budgetPausedAlert,
   heartbeatAlert,
+  wsRailAlert,
   dueAttemptAlert,
 } from "./alerts/telegram.js";
 import { DEFAULT_AUTOFIRE_OPTIONS, evaluateFireGuards, loadLedger, logLedgerEntry, type AutofireOptions } from "./strategies/arb/autofire.js";
@@ -1848,6 +1849,88 @@ program
       : [...new Set([wsUrl, fallbackWsUrl].filter(Boolean))];
     let activeWsEndpoint = "";
     if (options.watch) {
+      // ── WS rail observability ──
+      // Every tracked account shares ONE socket, so the provider recycling that
+      // socket takes all ~55 subscriptions down inside the same tick. Logging each
+      // failure separately produced 440+ near-identical lines in 12h and still never
+      // said whether the WHOLE rail had dropped — the one fact that separates a
+      // harmless socket recycle from "we are racing blind". Consecutive failures
+      // inside WS_ERROR_BURST_GAP_MS collapse into a single line carrying the rail
+      // size at the moment it broke plus the endpoint it broke on.
+      const WS_ERROR_BURST_GAP_MS = 3_000;
+      const WS_RAIL_SAMPLE_MS = 10_000;
+      const WS_RAIL_DOWN_ALERT_AFTER_MS = 30_000;
+      const WS_RAIL_ALERT_COOLDOWN_MS = 15 * 60_000;
+      // Deploy grace: subscriptions are paced one every startIntervalMs (100ms), so
+      // the rail reads "down" for the first few seconds of every clean boot.
+      const WS_RAIL_GRACE_MS = 60_000;
+      const railSamplerStartedAt = Date.now();
+      let wsErrBurst = 0, wsErrFirstAt = 0, wsErrLastAt = 0;
+      let wsErrEndpoint = "", wsErrMessage = "";
+      let wsErrRailAtStart: { active: number; desired: number } | undefined;
+      let wsDownSince: number | null = null;
+      let wsDownAlerted = false;
+      let wsLastDownAlertAt = 0;
+
+      const endpointLabelFor = (endpoint: string): string => websocketEndpointLabel(endpoint, wsUrl, fallbackWsUrl);
+
+      const flushWsErrorBurst = (): void => {
+        if (!wsErrBurst) return;
+        const count = wsErrBurst;
+        const span = Math.max(0, wsErrLastAt - wsErrFirstAt);
+        const endpoint = wsErrEndpoint;
+        const message = wsErrMessage;
+        const railAtStart = wsErrRailAtStart;
+        wsErrBurst = 0; wsErrFirstAt = 0; wsErrLastAt = 0; wsErrRailAtStart = undefined;
+        if (options.json) return;
+        const rail = railAtStart ? `${railAtStart.active}/${railAtStart.desired} live` : "no subscriptions yet";
+        console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${count} subscription failure${count === 1 ? "" : "s"} in ${span}ms — ${rail} — ${endpointLabelFor(endpoint)} — ${message}`));
+      };
+
+      const onWsRailError = (error: unknown, failedEndpoint: string): void => {
+        const now = Date.now();
+        if (wsErrBurst && now - wsErrLastAt > WS_ERROR_BURST_GAP_MS) flushWsErrorBurst();
+        if (!wsErrBurst) {
+          wsErrFirstAt = now;
+          wsErrRailAtStart = wsHandle?.stats();
+        }
+        wsErrLastAt = now;
+        wsErrBurst += 1;
+        wsErrEndpoint = failedEndpoint;
+        wsErrMessage = (error instanceof Error ? error.message : String(error)).slice(0, 160);
+        if (wsRailState === "live") wsRailState = "down";
+      };
+
+      // Sampled rather than fired from onError: a socket recycle drops and restores
+      // every subscription within ~1-2s, and we saw ~8 of those per 12h. Firing on the
+      // event would page for each one and bury a real outage; sampling debounces the
+      // recycles to nothing while still catching an outage that outlives them.
+      const sampleWsRail = (): void => {
+        const now = Date.now();
+        const stats = wsHandle?.stats();
+        const label = endpointLabelFor(activeWsEndpoint || wsUrl);
+        if (wsRailAlive()) {
+          if (wsDownSince === null) return;
+          const downForMs = now - wsDownSince;
+          wsDownSince = null;
+          if (wsDownAlerted) {
+            wsDownAlerted = false;
+            alerter.push(wsRailAlert({ live: true, endpoint: label, downForMs, ...(stats ? { active: stats.active, desired: stats.desired } : {}) }));
+          }
+          return;
+        }
+        if (wsDownSince === null) wsDownSince = now;
+        if (now - railSamplerStartedAt < WS_RAIL_GRACE_MS) return;
+        if (wsDownAlerted || now - wsDownSince < WS_RAIL_DOWN_ALERT_AFTER_MS) return;
+        if (now - wsLastDownAlertAt < WS_RAIL_ALERT_COOLDOWN_MS) return;
+        wsDownAlerted = true;
+        wsLastDownAlertAt = now;
+        alerter.push(wsRailAlert({ live: false, endpoint: label, ...(stats ? { active: stats.active, desired: stats.desired } : {}) }));
+      };
+
+      setInterval(() => { if (wsErrBurst && Date.now() - wsErrLastAt >= 1_000) flushWsErrorBurst(); }, 2_000).unref();
+      setInterval(sampleWsRail, WS_RAIL_SAMPLE_MS).unref();
+
       const wsLogged = new Map<string, number>();
       wsHandle = subscribeTrackedObligations({
         wsUrl,
@@ -1893,13 +1976,13 @@ program
         onReady: (endpoint: string) => {
           wsRailState = "live";
           activeWsEndpoint = endpoint;
-          const label = websocketEndpointLabel(endpoint, wsUrl, fallbackWsUrl);
+          // Close out the failure burst this recovery belongs to, so the summary
+          // lands now instead of waiting on the 2s flush timer.
+          flushWsErrorBurst();
+          const label = endpointLabelFor(endpoint);
           if (!options.json && (wsHandle?.stats().active === 1)) console.log(color.dim(`[${localTimestamp(new Date().toISOString())}] tracked account WS live (${label})`));
         },
-        onError: (error: unknown) => {
-          if (wsRailState === "live") wsRailState = "down";
-          if (!options.json) console.warn(color.yellow(`[${localTimestamp(new Date().toISOString())}] ws rail: ${error instanceof Error ? error.message : String(error)}`));
-        },
+        onError: onWsRailError,
       });
       syncObligationSubscriptions();
       // Discovery supplies the first account set; do not await subscriptions.
